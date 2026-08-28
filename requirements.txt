@@ -1,0 +1,25 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic>=2
+python-dotenv
+loguru
+google-genai
+faster-whisper
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+
+# SenseVoice — chạy CPU (bản torch CUDA mặc định bị lỗi access-violation/OOM đã gặp trên máy dev)
+torch
+torchaudio
+funasr>=1.3.26
+
+# TTS (capcut-tts-api) — không có trên PyPI, cài từ vendor/, xem README
+requests
+
+# Tách nhạc nền/SFX khỏi thoại gốc trước khi ráp CapCut
+demucs
+
+# Ráp draft CapCut — pip name "pycapcut" (github.com/GuanYixuan/pycapcut)
+pycapcut

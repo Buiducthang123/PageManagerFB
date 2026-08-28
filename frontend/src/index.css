@@ -1,0 +1,235 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+/* ── Nocturne — theme tối duy nhất của app (không còn light mode) ──────────
+   Token lấy từ mockup thiết kế (claude.ai/design, "OddlyLab Studio").
+   Đợt cải tiến UI (xem ui-improvements.md): primary chuyển sang nền đặc,
+   thêm token danger đầy đủ cho trạng thái lỗi, transition + animation dùng
+   chung, scrollbar/skeleton/empty-state mới. */
+@theme {
+  --color-bg: #161826;
+  --color-surface: #232532;
+  --color-text: #e9e9ed;
+  --color-divider: color-mix(in srgb, #e9e9ed 16%, transparent);
+
+  --color-accent: #9184d9;
+  --color-accent-100: #f5f4ff;
+  --color-accent-200: #e7e5fe;
+  --color-accent-300: #d2cefd;
+  --color-accent-400: #b5abfc;
+  --color-accent-500: #968ae0;
+  --color-accent-600: #796cbf;
+  --color-accent-700: #5d5294;
+  --color-accent-800: #423a6a;
+  --color-accent-900: #2b2741;
+
+  --color-neutral-100: #f3f5fe;
+  --color-neutral-200: #e4e7f5;
+  --color-neutral-300: #cfd3e5;
+  --color-neutral-400: #b2b6ca;
+  --color-neutral-500: #9397ab;
+  --color-neutral-600: #75798c;
+  --color-neutral-700: #595d6c;
+  --color-neutral-800: #3f424d;
+  --color-neutral-900: #292b31;
+
+  /* Trạng thái lỗi/hành động phá hoại — đỏ trầm cùng độ sáng ramp accent,
+     dùng cho cả nút xoá LẪN badge/bar "failed" (trước đây failed chỉ viền
+     neutral, chìm nghỉm — lỗi phải nhìn thấy ngay). */
+  --color-danger: #d17a76;
+  --color-danger-100: #fdf1f0;
+  --color-danger-300: #e8a5a2;
+  --color-danger-800: #4d2f2d;
+  --color-danger-900: #3a2422;
+
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+
+  --shadow-sm: 0 0 0 1px #3f424d;
+  --shadow-md: 0 0 0 1px #595d6c, 0 6px 18px rgba(0,0,0,0.55);
+  --shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0,0,0,0.65);
+}
+
+html { color-scheme: dark; }
+body { margin: 0; background: var(--color-bg); color: var(--color-text); font-family: var(--font-body); }
+h1, h2, h3, h4 { font-family: var(--font-heading); font-weight: 500; letter-spacing: -0.015em; }
+
+@keyframes noct-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+@keyframes noct-dialog-in {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes noct-backdrop-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes noct-shimmer { from { background-position: -200% 0 } to { background-position: 200% 0 } }
+
+/* ── Scrollbar tối — scrollbar trắng mặc định của Windows chói trên nền tối */
+* { scrollbar-width: thin; scrollbar-color: var(--color-neutral-800) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-800); border-radius: 6px;
+  border: 2px solid var(--color-bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-neutral-700); }
+
+/* ══════════════════ Component classes ═════ */
+
+.hr {
+  height: 1px; border: 0; margin: 11.2px 0;
+  background: linear-gradient(to right,
+    transparent, var(--color-divider) 48px,
+    var(--color-divider) calc(100% - 48px), transparent);
+}
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  cursor: pointer; text-decoration: none;
+  font-family: var(--font-heading); font-weight: 500;
+  font-size: 14px; line-height: 1.2; color: var(--color-text);
+  background: transparent; border: 1px solid transparent;
+  padding: 5.6px 10px; border-radius: var(--radius-md);
+  transition: background-color 150ms ease, border-color 150ms ease,
+              color 150ms ease, box-shadow 150ms ease, transform 100ms ease;
+}
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Primary = NỀN ĐẶC accent, chữ nền tối — hành động chính phải nổi hẳn so
+   với secondary (trước đây cả 2 đều chỉ là viền, ngang cơ nhau). */
+.btn-primary {
+  color: #14121f; background: var(--color-accent);
+  border-color: var(--color-accent); font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-400); border-color: var(--color-accent-400);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--color-accent) 35%, transparent);
+}
+.btn-primary:active:not(:disabled) { background: var(--color-accent-500); }
+
+.btn-secondary { border-color: var(--color-divider); }
+.btn-secondary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-text) 7%, transparent);
+  border-color: color-mix(in srgb, var(--color-text) 30%, transparent);
+}
+.btn-secondary:active:not(:disabled) { background: color-mix(in srgb, var(--color-text) 14%, transparent); }
+.btn-ghost { color: var(--color-accent-300); padding-inline: 2.8px; }
+.btn-ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.btn-danger { color: var(--color-danger); border-color: var(--color-danger); }
+.btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--color-danger) 14%, transparent); }
+/* Nút xác nhận phá hoại trong dialog — nền đặc để "đây là hành động thật" */
+.btn-danger-solid {
+  color: var(--color-danger-100); background: color-mix(in srgb, var(--color-danger) 80%, #000);
+  border-color: transparent; font-weight: 600;
+}
+.btn-danger-solid:hover:not(:disabled) { background: var(--color-danger); }
+.btn-sm { font-size: 12px; padding: 3px 8px; }
+
+.field > label {
+  display: block; font-size: 12px; margin-bottom: 5px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.input {
+  width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
+  font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.input:hover { border-color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+.input:focus-visible { border-color: var(--color-accent); outline: 2px solid var(--color-accent); outline-offset: 0; }
+textarea.input { min-height: 90px; resize: vertical; line-height: 1.6; }
+.mono { font-family: var(--font-mono); }
+
+.card {
+  display: flex; flex-direction: column; gap: 5.6px;
+  padding: 8.4px; border-radius: var(--radius-md); background: var(--color-surface);
+  transition: box-shadow 150ms ease;
+}
+
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px;
+  letter-spacing: 0.02em; padding: 3px 10px; border-radius: 6px;
+}
+.tag-accent { background: var(--color-accent-800); color: var(--color-accent-100); }
+.tag-neutral { background: var(--color-neutral-800); color: var(--color-neutral-100); }
+.tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent-300); }
+.tag-danger { background: var(--color-danger-800); color: var(--color-danger-100); }
+
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 68%, transparent);
+  padding: 8px 12px;
+}
+.table td { padding: 10px 12px; }
+.table thead tr {
+  background: linear-gradient(to right,
+    transparent, var(--color-divider) 32px,
+    var(--color-divider) calc(100% - 32px), transparent) no-repeat bottom / 100% 1px;
+}
+.table tbody tr {
+  background: linear-gradient(to right,
+    transparent, color-mix(in srgb, var(--color-text) 8%, transparent) 32px,
+    color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 32px), transparent) no-repeat bottom / 100% 1px;
+  transition: background-color 120ms ease;
+}
+.table tbody tr:hover {
+  background:
+    linear-gradient(color-mix(in srgb, var(--color-text) 4%, transparent),
+                    color-mix(in srgb, var(--color-text) 4%, transparent)) no-repeat 0 0 / 100% 100%,
+    linear-gradient(to right,
+      transparent, color-mix(in srgb, var(--color-text) 8%, transparent) 32px,
+      color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 32px), transparent) no-repeat bottom / 100% 1px;
+}
+/* Action trong row (đổi tên/xoá) ẩn cho tới khi hover — bảng sạch hơn.
+   Vẫn hiện khi focus bàn phím để không mất accessibility. */
+.row-actions { opacity: 0; transition: opacity 120ms ease; }
+tr:hover .row-actions, .row-actions:focus-within { opacity: 1; }
+
+.dialog-backdrop {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, #000 55%, transparent);
+  backdrop-filter: blur(3px);
+  animation: noct-backdrop-in 150ms ease-out;
+}
+.dialog {
+  width: min(440px, 100%); display: flex; flex-direction: column; gap: 12px;
+  padding: 20px; border-radius: var(--radius-lg);
+  background: var(--color-surface); box-shadow: var(--shadow-lg);
+  animation: noct-dialog-in 180ms ease-out;
+}
+.dialog-title { font-family: var(--font-heading); font-weight: 500; font-size: 18px; }
+.dialog-body { font-size: 14px; color: color-mix(in srgb, var(--color-text) 80%, transparent); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+/* Skeleton loading — thay chữ "Đang tải..." trần */
+.skeleton {
+  border-radius: var(--radius-md);
+  background: linear-gradient(90deg,
+    var(--color-surface) 25%,
+    color-mix(in srgb, var(--color-text) 6%, var(--color-surface)) 50%,
+    var(--color-surface) 75%);
+  background-size: 200% 100%;
+  animation: noct-shimmer 1.4s linear infinite;
+}
+
+/* Empty state — khối định hướng thay cho 1 dòng chữ xám lửng lơ */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 28px 16px; text-align: center;
+  border: 1px dashed color-mix(in srgb, var(--color-text) 22%, transparent);
+  border-radius: var(--radius-lg);
+  color: var(--color-neutral-500); font-size: 13px;
+}
+.empty-state .empty-icon { font-size: 22px; opacity: .6; }
+
+a { color: var(--color-accent-300); text-decoration: none; transition: color 120ms ease; }
+a:hover { color: var(--color-accent-200); }
+::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
