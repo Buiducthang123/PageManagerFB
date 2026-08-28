@@ -26,6 +26,8 @@ export default function ProjectDetail() {
   const [voice, setVoice] = useState('')
   const [previewVoice, setPreviewVoice] = useState<string | null>(null)
   const [previewNonce, setPreviewNonce] = useState(0)
+  const [editingCueId, setEditingCueId] = useState<number | null>(null)
+  const [draftText, setDraftText] = useState('')
 
   const detailQuery = useQuery({
     queryKey: ['project', projectId],
@@ -89,6 +91,24 @@ export default function ProjectDetail() {
     },
   })
 
+  const updateCueMutation = useMutation({
+    mutationFn: ({ cueId, text }: { cueId: number; text: string }) => api.updateCue(projectId, cueId, text),
+    onSuccess: () => {
+      setEditingCueId(null)
+      refresh()
+    },
+  })
+
+  const retranslateCueMutation = useMutation({
+    mutationFn: (cueId: number) => api.retranslateCue(projectId, cueId),
+    onSuccess: () => refresh(),
+  })
+
+  const ttsCueMutation = useMutation({
+    mutationFn: (cueId: number) => api.ttsCue(projectId, cueId, selectedVoice),
+    onSuccess: () => refresh(),
+  })
+
   if (detailQuery.isLoading) return <div className="skeleton h-64 max-w-5xl" />
   if (detailQuery.error) {
     return (
@@ -113,6 +133,7 @@ export default function ProjectDetail() {
   const busyAny = busyWhisper || busyGemini || busyTTS || busyAssemble
   const voiceOptions = settingsQuery.data?.tts_voices ?? []
   const selectedVoice = voice || voiceOptions[0]?.id || ''
+  const manifestById = new Map(tts_manifest.map((m) => [m.id, m]))
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -366,19 +387,114 @@ export default function ProjectDetail() {
                     <th>Time</th>
                     <th>中文</th>
                     <th>Tiếng Việt</th>
+                    <th>Thao tác</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {cues.map((c) => (
-                    <tr key={c.id}>
-                      <td className="mono text-xs text-neutral-500">{c.id}</td>
-                      <td className="mono text-xs text-neutral-400">
-                        {c.start} → {c.end}
-                      </td>
-                      <td className="text-sm">{c.text}</td>
-                      <td className="text-sm text-accent-200">{c.text_vi ?? '—'}</td>
-                    </tr>
-                  ))}
+                  {cues.map((c) => {
+                    const manifestEntry = manifestById.get(c.id)
+                    const isEditing = editingCueId === c.id
+                    const isStale =
+                      Boolean(manifestEntry?.path) &&
+                      manifestEntry?.text !== undefined &&
+                      manifestEntry.text !== (c.text_vi ?? '')
+                    const rowBusyRetranslate = retranslateCueMutation.isPending && retranslateCueMutation.variables === c.id
+                    const rowBusyTTS = ttsCueMutation.isPending && ttsCueMutation.variables === c.id
+                    const rowBusySave = updateCueMutation.isPending && updateCueMutation.variables?.cueId === c.id
+                    const rowBusy = rowBusyRetranslate || rowBusyTTS || rowBusySave
+                    const actionsDisabled = translate.status !== 'done' || busyAny || rowBusy
+                    return (
+                      <tr key={c.id}>
+                        <td className="mono text-xs text-neutral-500">{c.id}</td>
+                        <td className="mono text-xs text-neutral-400">
+                          {c.start} → {c.end}
+                        </td>
+                        <td className="text-sm">{c.text}</td>
+                        <td className="text-sm text-accent-200">
+                          {isEditing ? (
+                            <div className="flex flex-col gap-1.5">
+                              <textarea
+                                className={`${inputClass} min-h-0`}
+                                rows={2}
+                                autoFocus
+                                value={draftText}
+                                onChange={(e) => setDraftText(e.target.value)}
+                              />
+                              <div className="flex gap-1.5">
+                                <button
+                                  type="button"
+                                  className={secondaryButtonClass}
+                                  disabled={rowBusySave}
+                                  onClick={() => updateCueMutation.mutate({ cueId: c.id, text: draftText })}
+                                >
+                                  {rowBusySave ? 'Đang lưu...' : 'Lưu'}
+                                </button>
+                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingCueId(null)}>
+                                  Huỷ
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex items-start gap-2">
+                              <span>{c.text_vi ?? '—'}</span>
+                              {isStale && (
+                                <span className="mt-0.5 inline-block shrink-0 rounded-md bg-danger-800 px-1.5 py-0.5 font-mono text-[10px] whitespace-nowrap text-danger-100">
+                                  cần đọc lại
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <div className="flex flex-col items-start gap-1.5">
+                            <div className="flex flex-wrap gap-1.5">
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm"
+                                disabled={actionsDisabled || isEditing}
+                                onClick={() => {
+                                  setEditingCueId(c.id)
+                                  setDraftText(c.text_vi ?? '')
+                                }}
+                              >
+                                Sửa
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm"
+                                disabled={actionsDisabled}
+                                onClick={() => retranslateCueMutation.mutate(c.id)}
+                              >
+                                {rowBusyRetranslate ? 'Đang dịch...' : 'Dịch lại'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm"
+                                disabled={actionsDisabled}
+                                onClick={() => ttsCueMutation.mutate(c.id)}
+                              >
+                                {rowBusyTTS ? 'Đang đọc...' : 'Đọc lại'}
+                              </button>
+                            </div>
+                            {manifestEntry?.path && (
+                              <audio
+                                className="h-7 w-full max-w-55"
+                                controls
+                                preload="none"
+                                src={`/api/projects/${projectId}/assets/audio/${manifestEntry.path}`}
+                              />
+                            )}
+                            {retranslateCueMutation.isError && retranslateCueMutation.variables === c.id && (
+                              <p className="text-xs text-danger">{(retranslateCueMutation.error as Error).message}</p>
+                            )}
+                            {ttsCueMutation.isError && ttsCueMutation.variables === c.id && (
+                              <p className="text-xs text-danger">{(ttsCueMutation.error as Error).message}</p>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

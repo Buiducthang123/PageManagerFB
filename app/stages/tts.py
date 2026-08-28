@@ -154,7 +154,7 @@ def _synthesize_cues(
 
     for i, cue in enumerate(cues, 1):
         text = (cue.text or "").strip()
-        entry = {"id": cue.id, "start": cue.start, "end": cue.end, "path": None, "duration_ms": 0}
+        entry = {"id": cue.id, "start": cue.start, "end": cue.end, "path": None, "duration_ms": 0, "text": text}
         if not text:
             manifest.append(entry)
             if on_progress:
@@ -203,6 +203,7 @@ def retry_failed_segments(
             out_path.write_bytes(audio_bytes)
             entry["path"] = out_path.name
             entry["duration_ms"] = duration_ms
+            entry["text"] = cue.text.strip()
             entry.pop("error", None)
         except TTSError as err:
             logger.warning("Retry TTS câu {} vẫn lỗi: {}", cue.id, err)
@@ -213,6 +214,49 @@ def retry_failed_segments(
 
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     return manifest_path, manifest
+
+
+def tts_single_segment(
+    project_root: Path,
+    cue_id: int,
+    voice: str = DEFAULT_VOICE,
+) -> dict:
+    """Đọc lại đúng 1 câu (vd. sau khi sửa/dịch lại câu đó) — chỉ ghi đè
+    segment_NNN.mp3 + entry tương ứng trong manifest.json, không đụng các câu
+    khác."""
+    vi_cues = {c.id: c for c in load_srt(project_root / "sub_vi.srt")}
+    cue = vi_cues.get(cue_id)
+    if cue is None:
+        raise TTSError(f"Không tìm thấy câu #{cue_id} trong sub_vi.srt")
+
+    audio_dir = project_root / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = audio_dir / "manifest.json"
+    manifest: list[dict] = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
+    )
+    by_id = {m["id"]: m for m in manifest}
+
+    text = (cue.text or "").strip()
+    entry = by_id.get(cue_id) or {"id": cue.id, "start": cue.start, "end": cue.end, "path": None, "duration_ms": 0}
+    entry["start"], entry["end"] = cue.start, cue.end
+    entry["text"] = text
+    entry.pop("error", None)
+
+    if not text:
+        entry["path"] = None
+        entry["duration_ms"] = 0
+    else:
+        audio_bytes, duration_ms = _synthesize_with_retry(text, voice)
+        out_path = audio_dir / f"segment_{cue.id:03d}.mp3"
+        out_path.write_bytes(audio_bytes)
+        entry["path"] = out_path.name
+        entry["duration_ms"] = duration_ms
+
+    by_id[cue.id] = entry
+    manifest = sorted(by_id.values(), key=lambda m: m["id"])
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return entry
 
 
 def tts_project(

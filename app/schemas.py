@@ -24,6 +24,14 @@ class StartTTSRequest(BaseModel):
     retry_failed_only: bool = False  # True = chỉ tạo lại câu lỗi/rỗng lần trước
 
 
+class UpdateCueRequest(BaseModel):
+    text_vi: str
+
+
+class TTSCueRequest(BaseModel):
+    voice: str = ""  # rỗng = dùng mặc định server-side
+
+
 class ProjectSummary(BaseModel):
     project_id: str
     title: str
@@ -85,6 +93,16 @@ class UpdateAppSettingsRequest(BaseModel):
     whisper_model: Optional[str] = None
     whisper_device: Optional[str] = None
     whisper_language: Optional[str] = None
+
+
+class TTSManifestEntryResponse(BaseModel):
+    id: int
+    start: str
+    end: str
+    path: Optional[str] = None
+    duration_ms: int = 0
+    error: Optional[str] = None
+    text: Optional[str] = None
 
 
 class LogEntry(BaseModel):

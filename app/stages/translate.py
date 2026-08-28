@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional
 from loguru import logger
 
 from .. import config
-from ..utils.srt import Cue, load_srt, write_srt
+from ..utils.srt import Cue, load_srt, update_cue_text, write_srt
 
 FULL_SCHEMA = {
     "type": "object",
@@ -241,6 +241,51 @@ def process_llm(
     if on_progress:
         on_progress(len(cues), len(cues), "xong")
     return out, entity_dict
+
+
+SINGLE_SCHEMA = {
+    "type": "object",
+    "properties": {"text_vi": {"type": "string"}},
+    "required": ["text_vi"],
+}
+
+
+def _load_entity_dict(project_root: Path) -> dict[str, str]:
+    dict_path = project_root / "entity_dict.json"
+    if not dict_path.exists():
+        return {}
+    raw = json.loads(dict_path.read_text(encoding="utf-8"))
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+def retranslate_cue(project_root: Path, cue_id: int) -> str:
+    """Dịch lại đúng 1 câu — dùng lại entity_dict đã có, chỉ ghi đè câu đó
+    trong sub_vi.srt, không đụng các câu khác (đỡ tốn quota Gemini)."""
+    zh_cues = {c.id: c for c in load_srt(project_root / "sub_zh.srt")}
+    cue = zh_cues.get(cue_id)
+    if cue is None:
+        raise ValueError(f"Không tìm thấy câu #{cue_id} trong sub_zh.srt")
+
+    entity_dict = _load_entity_dict(project_root)
+    prompt = f"""Bạn là dịch giả chuyên nghiệp zh→vi cho video reup. Bản dịch sẽ được đọc thành
+giọng nói (TTS) — văn phong phải TỰ NHIÊN khi đọc to, không dịch máy móc từng chữ.
+
+Entity dict — áp dụng nhất quán nếu câu có nhắc tên riêng liên quan:
+{json.dumps(entity_dict, ensure_ascii=False)}
+
+Dịch + clean câu nguồn sau (bỏ filler, sửa lỗi nghe nhầm rõ ràng nếu có):
+{cue.text}
+
+Trả về: {{"text_vi":"..."}}"""
+    data = _generate(prompt, schema=SINGLE_SCHEMA)
+    if not isinstance(data, dict) or not data.get("text_vi"):
+        raise ValueError("Gemini không trả về text_vi")
+    text_vi = str(data["text_vi"]).strip()
+
+    vi_path = project_root / "sub_vi.srt"
+    if load_srt(vi_path):
+        update_cue_text(vi_path, cue_id, text_vi)
+    return text_vi
 
 
 def translate_project(

@@ -71,3 +71,14 @@ def load_srt(path: Path) -> list[Cue]:
     if not path.exists():
         return []
     return parse_srt(path.read_text(encoding="utf-8"))
+
+
+def update_cue_text(path: Path, cue_id: int, text: str) -> list[Cue]:
+    """Sửa text của đúng 1 cue trong file .srt, giữ nguyên mọi cue khác."""
+    cues = load_srt(path)
+    for cue in cues:
+        if cue.id == cue_id:
+            cue.text = text.strip()
+            write_srt(path, cues)
+            return cues
+    raise ValueError(f"Không tìm thấy câu #{cue_id} trong {path.name}")

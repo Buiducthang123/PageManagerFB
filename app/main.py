@@ -25,7 +25,10 @@ from .schemas import (
     SrtCue,
     StartTranscribeRequest,
     StartTTSRequest,
+    TTSCueRequest,
+    TTSManifestEntryResponse,
     UpdateAppSettingsRequest,
+    UpdateCueRequest,
 )
 from .stages import assemble as assemble_stage
 from .stages import dub_audio as dub_audio_stage
@@ -34,7 +37,7 @@ from .stages import transcribe as transcribe_stage
 from .stages import transcribe_sensevoice as sensevoice_stage
 from .stages import translate as translate_stage
 from .stages import tts as tts_stage
-from .utils.srt import load_srt
+from .utils.srt import load_srt, update_cue_text
 
 load_dotenv()
 
@@ -331,6 +334,72 @@ def start_translate(project_id: str):
     if job is None:
         raise HTTPException(status_code=409, detail="Gemini đang chạy cho dự án này")
     return {"status": "started"}
+
+
+# ------------------------------------------------------------------ Per-cue edit / retranslate / re-TTS
+
+
+def _cue_response(root: Path, cue_id: int) -> SrtCue:
+    zh = next((c for c in load_srt(root / "sub_zh.srt") if c.id == cue_id), None)
+    vi = next((c for c in load_srt(root / "sub_vi.srt") if c.id == cue_id), None)
+    if zh is None and vi is None:
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy câu #{cue_id}")
+    base = zh or vi
+    return SrtCue(id=cue_id, start=base.start, end=base.end, text=zh.text if zh else "", text_vi=vi.text if vi else None)
+
+
+def _reject_if_busy(project_id: str) -> None:
+    if jobs.is_job_running(f"{project_id}:translate") or jobs.is_job_running(f"{project_id}:tts"):
+        raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
+
+
+@app.patch("/api/projects/{project_id}/cues/{cue_id}", response_model=SrtCue)
+def update_cue_route(project_id: str, cue_id: int, body: UpdateCueRequest):
+    state = pj.load_project(project_id)
+    _require_done(state, "translate", "Chưa có bản dịch — chạy Gemini trước")
+    _reject_if_busy(project_id)
+    root = pj.project_dir(project_id)
+    try:
+        update_cue_text(root / "sub_vi.srt", cue_id, body.text_vi)
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    pj.append_log(project_id, "translate", f"Sửa tay câu #{cue_id}")
+    return _cue_response(root, cue_id)
+
+
+@app.post("/api/projects/{project_id}/cues/{cue_id}/retranslate", response_model=SrtCue)
+def retranslate_cue_route(project_id: str, cue_id: int):
+    state = pj.load_project(project_id)
+    _require_done(state, "translate", "Chưa có bản dịch — chạy Gemini trước")
+    _reject_if_busy(project_id)
+    root = pj.project_dir(project_id)
+    try:
+        text_vi = translate_stage.retranslate_cue(root, cue_id)
+    except translate_stage.LLMNotConfigured as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    except translate_stage.GeminiQuotaError as err:
+        raise HTTPException(status_code=429, detail=str(err)) from err
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    pj.append_log(project_id, "translate", f"Dịch lại câu #{cue_id}: {text_vi[:60]}")
+    return _cue_response(root, cue_id)
+
+
+@app.post("/api/projects/{project_id}/cues/{cue_id}/tts", response_model=TTSManifestEntryResponse)
+def tts_cue_route(project_id: str, cue_id: int, body: TTSCueRequest | None = None):
+    state = pj.load_project(project_id)
+    _require_done(state, "translate", "Chưa có bản dịch — chạy Gemini trước")
+    _reject_if_busy(project_id)
+    root = pj.project_dir(project_id)
+    voice = body.voice if body and body.voice else ""
+    if voice not in {v["id"] for v in tts_stage.VOICES}:
+        voice = tts_stage.DEFAULT_VOICE
+    try:
+        entry = tts_stage.tts_single_segment(root, cue_id, voice=voice)
+    except tts_stage.TTSError as err:
+        raise HTTPException(status_code=502, detail=str(err)) from err
+    pj.append_log(project_id, "tts", f"Đọc lại câu #{cue_id}")
+    return TTSManifestEntryResponse(**entry)
 
 
 @app.get("/api/tts/preview")

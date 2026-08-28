@@ -60,6 +60,7 @@ export interface TTSManifestEntry {
   path: string | null
   duration_ms: number
   error?: string
+  text?: string
 }
 
 export interface ProjectDetail {
@@ -157,6 +158,12 @@ export const api = {
   retryTTS: (id: string, voice: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/tts`, { voice, retry_failed_only: true }),
   previewVoiceUrl: (voice: string) => `/api/tts/preview?voice=${encodeURIComponent(voice)}`,
+  updateCue: (id: string, cueId: number, text_vi: string) =>
+    request<SrtCue>(`/api/projects/${id}/cues/${cueId}`, { method: 'PATCH', body: JSON.stringify({ text_vi }) }),
+  retranslateCue: (id: string, cueId: number) =>
+    postJson<SrtCue>(`/api/projects/${id}/cues/${cueId}/retranslate`),
+  ttsCue: (id: string, cueId: number, voice: string) =>
+    postJson<TTSManifestEntry>(`/api/projects/${id}/cues/${cueId}/tts`, { voice }),
   startAssemble: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/assemble`),
   jobStatus: (id: string, stage: 'transcribe' | 'translate' | 'tts' | 'assemble') =>
     request<JobStatus>(`/api/projects/${id}/jobs/${stage}`),
