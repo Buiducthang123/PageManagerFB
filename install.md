@@ -9,8 +9,9 @@ Hướng dẫn cài đặt môi trường lần đầu. Xem [run.md](run.md) đ�
 | OS | Windows |
 | Python | 3.9+ (máy đang dùng 3.13, xem `.venv`) |
 | Node.js | 18+ (khuyến nghị 20+, để chạy Vite 8 / React 19) |
-| FFmpeg | Bắt buộc — `ffprobe` dùng để đo thời lượng video khi upload |
-| GPU (tuỳ chọn) | NVIDIA, 4GB+ VRAM — tăng tốc Whisper. Không có GPU vẫn chạy được bằng CPU |
+| FFmpeg | Bắt buộc — `ffprobe`/`ffmpeg` dùng để đo thời lượng video và tách audio (Stage Assemble) |
+| GPU (tuỳ chọn) | NVIDIA, 4GB+ VRAM — tăng tốc Whisper. Không có GPU vẫn chạy được bằng CPU (Whisper fallback CPU, SenseVoice/Demucs mặc định đã chạy CPU) |
+| Mạng | Cần internet khi chạy: dịch Gemini (Stage 3), TTS qua CapCut API (Stage 4), và lần đầu tải model Whisper/SenseVoice/Demucs |
 
 Cài FFmpeg và đảm bảo `ffprobe`/`ffmpeg` có trong PATH:
 
@@ -32,16 +33,24 @@ Thư mục gốc dự án đã có sẵn virtualenv `.venv/` với các gói c�
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install -e workspace/vendor/capcut-tts-api
 ```
 
 Gói chính trong [requirements.txt](requirements.txt):
 
 - `fastapi`, `uvicorn[standard]` — API server
-- `faster-whisper` — nhận diện giọng nói tiếng Trung
-- `google-genai` — dịch zh→vi qua Gemini
+- `faster-whisper` — nhận diện giọng nói tiếng Trung (Stage 2, engine mặc định)
+- `funasr`, `torch`, `torchaudio` — engine STT thay thế SenseVoice (Stage 2, chạy CPU — bản torch CUDA từng bị lỗi access-violation/OOM trên máy dev)
+- `google-genai` — dịch zh→vi qua Gemini (Stage 3)
+- `demucs` — tách nhạc nền/SFX khỏi thoại gốc trước khi ráp CapCut (Stage Assemble)
+- `pycapcut` — ráp draft CapCut từ video + phụ đề + audio TTS (Stage Assemble)
 - `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cuda-nvrtc-cu12` — DLL CUDA cho `faster-whisper` chạy GPU (không cần cài CUDA Toolkit riêng)
 
 > Nếu máy không có GPU NVIDIA, Whisper sẽ tự fallback sang CPU (chậm hơn nhưng vẫn chạy).
+
+### capcut-tts-api (Stage 4 — TTS)
+
+Package dùng để đọc phụ đề tiếng Việt thành giọng nói qua API CapCut **không có trên PyPI**, đã vendor sẵn tại [workspace/vendor/capcut-tts-api/](workspace/vendor/capcut-tts-api/) và cài editable như lệnh ở trên (`pip install -e workspace/vendor/capcut-tts-api`). Xem chi tiết SDK/CLI trong [workspace/vendor/capcut-tts-api/README.md](workspace/vendor/capcut-tts-api/README.md). Không cần API key riêng — client tự ký request bằng RSA/AWS SigV4 giả lập thiết bị CapCut.
 
 ## 3. Frontend (Node)
 
@@ -65,22 +74,27 @@ GEMINI_API_KEY=<key lấy từ https://aistudio.google.com/apikey>
 GEMINI_MODEL=gemini-3.5-flash-lite
 WHISPER_MODEL=medium
 WHISPER_DEVICE=auto
+WHISPER_LANGUAGE=zh
 ```
 
 Ghi chú:
 
 - **GEMINI_API_KEY** — bắt buộc để chạy bước dịch (Stage 3). Free tier ~1500 req/ngày.
-- **WORKSPACE_DIR** (tuỳ chọn) — nơi lưu dữ liệu dự án (video, srt, log). Để trống thì mặc định là `./workspace` cạnh code.
+- **WORKSPACE_DIR** (tuỳ chọn) — nơi lưu dữ liệu dự án (video, srt, log, model cache). Để trống thì mặc định là `./workspace` cạnh code.
 - **WHISPER_MODEL** — `tiny`/`base`/`small`/`medium`/`large-v3`. `medium` là khuyến nghị cho GPU 4GB VRAM.
 - **WHISPER_DEVICE** — `auto` (thử CUDA trước, tự rơi về CPU nếu lỗi) / `cuda` / `cpu`.
+- **WHISPER_LANGUAGE** — ngôn ngữ nhận diện: `zh` (mặc định)/`en`/`yue`/`ja`/`ko`/`vi`/`auto`.
 - **WHISPER_CACHE_DIR** (tuỳ chọn) — nơi cache model Whisper tải về từ HuggingFace. Mặc định `workspace/models/whisper` — hữu ích nếu ổ C ít dung lượng.
+- **SENSEVOICE_DEVICE** (tuỳ chọn, mặc định `cpu`) — engine STT thay thế Whisper, chọn ở Stage 2 trên giao diện.
+- **SENSEVOICE_CACHE_DIR** (tuỳ chọn) — mặc định `workspace/models/sensevoice`.
+- **CAPCUT_DRAFTS_DIR** (tuỳ chọn) — thư mục draft CapCut thật trên máy (vd `D:\Capcut Data\CapCut Drafts`) để Stage Assemble ghi thẳng vào, mở CapCut lên là thấy ngay. Để trống thì ghi vào `workspace/capcut_drafts` (phải tự copy qua tay).
 
-Các giá trị này cũng có thể chỉnh lại sau trong giao diện web, ở phần Settings — sẽ tự ghi đè vào `.env`.
+Các giá trị GEMINI_API_KEY/GEMINI_MODEL/WHISPER_MODEL/WHISPER_DEVICE/WHISPER_LANGUAGE cũng có thể chỉnh lại sau trong giao diện web, ở phần Settings — sẽ tự ghi đè vào `.env`.
 
 ## 5. Kiểm tra cài đặt xong
 
 ```powershell
-.venv\Scripts\python.exe -c "import fastapi, faster_whisper, google.genai; print('OK')"
+.venv\Scripts\python.exe -c "import fastapi, faster_whisper, google.genai, funasr, torch, demucs, pycapcut, capcut_tts_api; print('OK')"
 ```
 
 Nếu in ra `OK` là backend sẵn sàng. Bước tiếp theo: xem [run.md](run.md).
