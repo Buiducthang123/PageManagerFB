@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: #08070d;
+}
+
+.neon-border {
+  box-shadow:
+    0 0 0 1px rgba(192, 38, 211, 0.25),
+    0 0 18px rgba(192, 38, 211, 0.12);
+}
+
+.neon-border-hover:hover {
+  box-shadow:
+    0 0 0 1px rgba(217, 70, 239, 0.55),
+    0 0 24px rgba(217, 70, 239, 0.25);
+}
