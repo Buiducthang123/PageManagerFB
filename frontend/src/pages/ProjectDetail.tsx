@@ -21,6 +21,8 @@ export default function ProjectDetail() {
   const queryClient = useQueryClient()
   const fileRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
+  const [ingestTab, setIngestTab] = useState<'file' | 'url'>('file')
+  const [shareUrl, setShareUrl] = useState('')
   const [tab, setTab] = useState<'table' | 'zh' | 'vi' | 'entity'>('table')
   const [engine, setEngine] = useState<TranscribeEngine>('whisper')
   const [voice, setVoice] = useState('')
@@ -37,6 +39,7 @@ export default function ProjectDetail() {
 
   const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: api.getSettings })
 
+  const ingestJob = useJobStatus(projectId, 'ingest')
   const transcribeJob = useJobStatus(projectId, 'transcribe')
   const translateJob = useJobStatus(projectId, 'translate')
   const ttsJob = useJobStatus(projectId, 'tts')
@@ -53,6 +56,21 @@ export default function ProjectDetail() {
       setFile(null)
       if (fileRef.current) fileRef.current.value = ''
       refresh()
+    },
+  })
+
+  const revealVideoMutation = useMutation({
+    mutationFn: () => api.revealVideo(projectId),
+  })
+
+  const ingestUrlMutation = useMutation({
+    mutationFn: () => {
+      if (!shareUrl.trim()) throw new Error('Chưa dán link')
+      return api.ingestUrl(projectId, shareUrl.trim())
+    },
+    onSuccess: () => {
+      setShareUrl('')
+      queryClient.invalidateQueries({ queryKey: ['job', projectId, 'ingest'] })
     },
   })
 
@@ -126,11 +144,12 @@ export default function ProjectDetail() {
   const translate = project.stages.translate
   const tts = project.stages.tts
   const assemble = project.stages.assemble
+  const busyIngest = ingest.status === 'running' || ingestJob.data?.status === 'running'
   const busyWhisper = transcribe.status === 'running' || transcribeJob.data?.status === 'running'
   const busyGemini = translate.status === 'running' || translateJob.data?.status === 'running'
   const busyTTS = tts.status === 'running' || ttsJob.data?.status === 'running'
   const busyAssemble = assemble.status === 'running' || assembleJob.data?.status === 'running'
-  const busyAny = busyWhisper || busyGemini || busyTTS || busyAssemble
+  const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || busyAssemble
   const voiceOptions = settingsQuery.data?.tts_voices ?? []
   const selectedVoice = voice || voiceOptions[0]?.id || ''
   const manifestById = new Map(tts_manifest.map((m) => [m.id, m]))
@@ -147,34 +166,77 @@ export default function ProjectDetail() {
 
       <section className="card p-5">
         <StageHeader name="ingest" record={ingest} />
-        <p className="mb-3 text-sm text-neutral-400">Chọn file video local (mp4/mkv/webm/mov). Chưa dùng URL.</p>
+        <JobProgressBar job={ingestJob.data} formatCount={(n) => `${(n / (1024 * 1024)).toFixed(1)}MB`} />
         {ingest.status === 'done' && (
-          <p className="mb-3 text-sm text-accent-300">
-            {project.original_filename}
-            {project.duration_sec ? ` · ${Math.round(project.duration_sec)}s` : ''}
-          </p>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm text-accent-300">
+              {project.original_filename}
+              {project.duration_sec ? ` · ${Math.round(project.duration_sec)}s` : ''}
+            </p>
+            <button type="button" className={secondaryButtonClass} onClick={() => revealVideoMutation.mutate()}>
+              {revealVideoMutation.isPending ? 'Đang mở...' : 'Mở thư mục chứa file'}
+            </button>
+          </div>
         )}
         {ingest.error && <p className="mb-3 text-sm text-danger">{ingest.error}</p>}
         {video_url && (
           <video className="mb-4 max-h-72 w-full rounded-lg bg-black" src={video_url} controls preload="metadata" />
         )}
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            ref={fileRef}
-            type="file"
-            accept="video/mp4,video/webm,video/quicktime,video/x-matroska,.mp4,.mkv,.webm,.mov,.avi,.m4v"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-          <button
-            type="button"
-            className={primaryButtonClass}
-            disabled={!file || uploadMutation.isPending || busyAny}
-            onClick={() => uploadMutation.mutate()}
-          >
-            {uploadMutation.isPending ? 'Đang tải lên...' : ingest.status === 'done' ? 'Thay video' : 'Upload'}
-          </button>
+
+        <div className="mb-3 flex gap-4 text-sm text-neutral-300">
+          <label className="flex items-center gap-1.5">
+            <input type="radio" name="ingest-source" checked={ingestTab === 'file'} onChange={() => setIngestTab('file')} />
+            Upload file
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input type="radio" name="ingest-source" checked={ingestTab === 'url'} onChange={() => setIngestTab('url')} />
+            Dán link Douyin/TikTok
+          </label>
         </div>
+
+        {ingestTab === 'file' ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="video/mp4,video/webm,video/quicktime,video/x-matroska,.mp4,.mkv,.webm,.mov,.avi,.m4v"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            />
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={!file || uploadMutation.isPending || busyAny}
+              onClick={() => uploadMutation.mutate()}
+            >
+              {uploadMutation.isPending ? 'Đang tải lên...' : ingest.status === 'done' ? 'Thay video' : 'Upload'}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              className={`${inputClass} min-w-72 flex-1`}
+              placeholder="Dán link hoặc nguyên đoạn share Douyin/TikTok..."
+              value={shareUrl}
+              onChange={(e) => setShareUrl(e.target.value)}
+            />
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={!shareUrl.trim() || ingestUrlMutation.isPending || busyAny}
+              onClick={() => ingestUrlMutation.mutate()}
+            >
+              {ingestUrlMutation.isPending || busyIngest
+                ? 'Đang tải...'
+                : ingest.status === 'done'
+                  ? 'Thay video'
+                  : 'Tải xuống'}
+            </button>
+          </div>
+        )}
         {uploadMutation.error && <p className="mt-2 text-sm text-danger">{(uploadMutation.error as Error).message}</p>}
+        {ingestUrlMutation.error && (
+          <p className="mt-2 text-sm text-danger">{(ingestUrlMutation.error as Error).message}</p>
+        )}
       </section>
 
       <section className="card p-5">

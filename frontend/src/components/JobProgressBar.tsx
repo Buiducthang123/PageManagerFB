@@ -7,7 +7,13 @@ function formatDuration(sec: number): string {
   return `${m}p${s}s`
 }
 
-export default function JobProgressBar({ job }: { job: JobStatus | undefined }) {
+export default function JobProgressBar({
+  job,
+  formatCount,
+}: {
+  job: JobStatus | undefined
+  formatCount?: (n: number) => string
+}) {
   if (!job) return null
   if (job.orphaned) {
     return (
@@ -20,6 +26,7 @@ export default function JobProgressBar({ job }: { job: JobStatus | undefined }) 
 
   const pct = job.total > 0 ? Math.round((job.done_count / job.total) * 100) : 0
   const elapsed = job.started_at ? Date.now() / 1000 - job.started_at : 0
+  const fmt = formatCount ?? ((n: number) => `${n}`)
 
   return (
     <div className="mb-3 rounded-xl bg-accent-900/40 p-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
@@ -28,7 +35,7 @@ export default function JobProgressBar({ job }: { job: JobStatus | undefined }) 
           {job.current_label ? `Đang xử lý «${job.current_label}»` : 'Đang chạy...'}
         </span>
         <span className="font-mono text-xs text-accent-400">
-          {pct}% · {job.done_count}/{job.total}
+          {pct}% · {fmt(job.done_count)}/{fmt(job.total)}
         </span>
       </div>
       <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-900">

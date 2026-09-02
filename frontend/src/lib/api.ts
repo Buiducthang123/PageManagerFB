@@ -151,6 +151,8 @@ export const api = {
     form.append('file', file)
     return request(`/api/projects/${id}/ingest`, { method: 'POST', body: form })
   },
+  ingestUrl: (id: string, url: string) => postJson<{ status: string }>(`/api/projects/${id}/ingest/url`, { url }),
+  revealVideo: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/reveal-video`),
   startTranscribe: (id: string, engine: TranscribeEngine = 'whisper') =>
     postJson<{ status: string }>(`/api/projects/${id}/transcribe`, { engine }),
   startTranslate: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/translate`),
@@ -165,7 +167,7 @@ export const api = {
   ttsCue: (id: string, cueId: number, voice: string) =>
     postJson<TTSManifestEntry>(`/api/projects/${id}/cues/${cueId}/tts`, { voice }),
   startAssemble: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/assemble`),
-  jobStatus: (id: string, stage: 'transcribe' | 'translate' | 'tts' | 'assemble') =>
+  jobStatus: (id: string, stage: 'ingest' | 'transcribe' | 'translate' | 'tts' | 'assemble') =>
     request<JobStatus>(`/api/projects/${id}/jobs/${stage}`),
 
   getSettings: () => request<AppSettings>('/api/settings'),

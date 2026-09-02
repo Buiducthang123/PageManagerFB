@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../lib/api'
 
-export function useJobStatus(projectId: string, stage: 'transcribe' | 'translate' | 'tts' | 'assemble') {
+export function useJobStatus(projectId: string, stage: 'ingest' | 'transcribe' | 'translate' | 'tts' | 'assemble') {
   const queryClient = useQueryClient()
   const query = useQuery({
     queryKey: ['job', projectId, stage],

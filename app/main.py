@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .models import StageRecord, StageStatus
 from .schemas import (
     AppSettingsResponse,
     CreateProjectRequest,
+    IngestUrlRequest,
     JobItemResponse,
     JobStatusResponse,
     LogEntry,
@@ -32,6 +34,7 @@ from .schemas import (
 )
 from .stages import assemble as assemble_stage
 from .stages import dub_audio as dub_audio_stage
+from .stages import fetch_url as fetch_url_stage
 from .stages import ingest as ingest_stage
 from .stages import transcribe as transcribe_stage
 from .stages import transcribe_sensevoice as sensevoice_stage
@@ -111,7 +114,7 @@ def rename_project_route(project_id: str, body: RenameProjectRequest):
 
 @app.delete("/api/projects/{project_id}", status_code=204)
 def delete_project_route(project_id: str):
-    if any(jobs.is_job_running(f"{project_id}:{s}") for s in ("transcribe", "translate", "tts", "assemble")):
+    if any(jobs.is_job_running(f"{project_id}:{s}") for s in ("ingest", "transcribe", "translate", "tts", "assemble")):
         raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
     try:
         pj.delete_project(project_id)
@@ -175,19 +178,7 @@ def project_logs(project_id: str, limit: int = 40):
 # ------------------------------------------------------------------ Ingest
 
 
-@app.post("/api/projects/{project_id}/ingest")
-async def ingest_video(project_id: str, file: UploadFile = File(...)):
-    if any(jobs.is_job_running(f"{project_id}:{s}") for s in ("transcribe", "translate", "tts", "assemble")):
-        raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
-    root = pj.project_dir(project_id)
-    try:
-        dest, original, duration = await ingest_stage.save_uploaded_video(root, file)
-    except ValueError as err:
-        with pj.locked_project(project_id) as state:
-            state.stages["ingest"].status = StageStatus.failed
-            state.stages["ingest"].error = str(err)
-        raise HTTPException(status_code=400, detail=str(err)) from err
-
+def _finalize_ingest(project_id: str, root: Path, dest: Path, original: str, duration: float | None, log_msg: str) -> None:
     rel = dest.name
     for leftover in ("sub_zh.srt", "sub_vi.srt", "entity_dict.json", "background.wav"):
         (root / leftover).unlink(missing_ok=True)
@@ -204,8 +195,93 @@ async def ingest_video(project_id: str, file: UploadFile = File(...)):
             error=None,
             at=datetime.now(),
         )
-    pj.append_log(project_id, "ingest", f"upload {original}")
-    return {"status": "ok", "filename": original, "path": rel, "duration_sec": duration}
+    pj.append_log(project_id, "ingest", log_msg)
+
+
+@app.post("/api/projects/{project_id}/ingest")
+async def ingest_video(project_id: str, file: UploadFile = File(...)):
+    if any(jobs.is_job_running(f"{project_id}:{s}") for s in ("ingest", "transcribe", "translate", "tts", "assemble")):
+        raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
+    root = pj.project_dir(project_id)
+    try:
+        dest, original, duration = await ingest_stage.save_uploaded_video(root, file)
+    except ValueError as err:
+        with pj.locked_project(project_id) as state:
+            state.stages["ingest"].status = StageStatus.failed
+            state.stages["ingest"].error = str(err)
+        raise HTTPException(status_code=400, detail=str(err)) from err
+
+    _finalize_ingest(project_id, root, dest, original, duration, f"upload {original}")
+    return {"status": "ok", "filename": original, "path": dest.name, "duration_sec": duration}
+
+
+@app.post("/api/projects/{project_id}/ingest/url", status_code=202)
+def ingest_video_url(project_id: str, body: IngestUrlRequest):
+    if any(jobs.is_job_running(f"{project_id}:{s}") for s in ("ingest", "transcribe", "translate", "tts", "assemble")):
+        raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
+    root = pj.project_dir(project_id)
+    share_url = body.url
+
+    def target(job: jobs.JobState) -> None:
+        job.items = [jobs.JobItem(id="fetch_url", label="Tải video từ link")]
+        job.items[0].status = "running"
+        with pj.locked_project(project_id) as s:
+            s.stages["ingest"].status = StageStatus.running
+            s.stages["ingest"].error = None
+
+        def on_progress(done: int, tot: int, label: str) -> None:
+            job.done_count = done
+            job.total = max(tot, 1)
+            job.current_label = label
+
+        try:
+            dest, original, duration = fetch_url_stage.download_video_from_share(root, share_url, on_progress=on_progress)
+        except fetch_url_stage.FetchUrlError as err:
+            job.items[0].status = "failed"
+            job.items[0].error = str(err)
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.stages["ingest"].status = StageStatus.failed
+                s.stages["ingest"].error = str(err)
+            pj.append_log(project_id, "ingest", str(err))
+            return
+        except Exception as err:
+            logger.exception("Tải video từ link lỗi {}", project_id)
+            job.items[0].status = "failed"
+            job.items[0].error = str(err)
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.stages["ingest"].status = StageStatus.failed
+                s.stages["ingest"].error = str(err)
+            pj.append_log(project_id, "ingest", f"Lỗi: {err}")
+            return
+
+        job.items[0].status = "done"
+        job.done_count = job.total
+        job.status = "done"
+        _finalize_ingest(project_id, root, dest, original, duration, f"tải từ link: {original}")
+
+    job = jobs.start_job(f"{project_id}:ingest", 1, target)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang tải video cho dự án này")
+    return {"status": "started"}
+
+
+@app.post("/api/projects/{project_id}/reveal-video")
+def reveal_video(project_id: str):
+    state = pj.load_project(project_id)
+    if not state.video_relpath:
+        raise HTTPException(status_code=404, detail="Chưa có file video")
+    video_path = pj.project_dir(project_id) / state.video_relpath
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="File video không tồn tại trên đĩa")
+    try:
+        subprocess.run(["explorer", f"/select,{video_path}"], check=False)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    return {"status": "ok"}
 
 
 # ------------------------------------------------------------------ Transcribe / Translate jobs
@@ -595,7 +671,7 @@ def start_assemble(project_id: str):
 
 @app.get("/api/projects/{project_id}/jobs/{stage}", response_model=JobStatusResponse)
 def job_status(project_id: str, stage: str):
-    if stage not in ("transcribe", "translate", "tts", "assemble"):
+    if stage not in ("ingest", "transcribe", "translate", "tts", "assemble"):
         raise HTTPException(status_code=404, detail="Stage không hỗ trợ job")
     job = jobs.get_job(f"{project_id}:{stage}")
     if job is None:

@@ -15,6 +15,10 @@ class RenameProjectRequest(BaseModel):
     title: str
 
 
+class IngestUrlRequest(BaseModel):
+    url: str
+
+
 class StartTranscribeRequest(BaseModel):
     engine: str = "whisper"  # "whisper" | "sensevoice"
 
