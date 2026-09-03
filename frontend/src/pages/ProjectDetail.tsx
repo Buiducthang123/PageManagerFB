@@ -7,11 +7,30 @@ import StatusBadge from '../components/StatusBadge'
 import JobProgressBar from '../components/JobProgressBar'
 import { useJobStatus } from '../hooks/useJobStatus'
 
-function StageHeader({ name, record }: { name: StageName; record: StageRecord }) {
+function StageHeader({
+  name,
+  record,
+  busy,
+  cancelling,
+  onCancel,
+}: {
+  name: StageName
+  record: StageRecord
+  busy?: boolean
+  cancelling?: boolean
+  onCancel?: () => void
+}) {
   return (
     <div className="mb-3 flex items-center justify-between gap-3">
       <h2 className="text-lg">{STAGE_LABELS[name]}</h2>
-      <StatusBadge status={record.status} />
+      <div className="flex items-center gap-2">
+        {busy && onCancel && (
+          <button type="button" className="btn btn-ghost btn-sm text-danger" disabled={cancelling} onClick={onCancel}>
+            {cancelling ? 'Đang dừng...' : 'Dừng'}
+          </button>
+        )}
+        <StatusBadge status={record.status} />
+      </div>
     </div>
   )
 }
@@ -122,9 +141,24 @@ export default function ProjectDetail() {
     onSuccess: () => refresh(),
   })
 
+  const voiceOptions = settingsQuery.data?.tts_voices ?? []
+  const selectedVoice = voice || voiceOptions[0]?.id || ''
+
   const ttsCueMutation = useMutation({
     mutationFn: (cueId: number) => api.ttsCue(projectId, cueId, selectedVoice),
     onSuccess: () => refresh(),
+  })
+
+  const autoPipelineMutation = useMutation({
+    mutationFn: (enabled: boolean) => api.updateAutoPipeline(projectId, enabled, engine, selectedVoice),
+    onSuccess: () => refresh(),
+  })
+
+  const cancelMutation = useMutation({
+    mutationFn: (stage: StageName) => api.cancelJob(projectId, stage),
+    onSuccess: (_data, stage) => {
+      queryClient.invalidateQueries({ queryKey: ['job', projectId, stage] })
+    },
   })
 
   if (detailQuery.isLoading) return <div className="skeleton h-64 max-w-5xl" />
@@ -150,8 +184,6 @@ export default function ProjectDetail() {
   const busyTTS = tts.status === 'running' || ttsJob.data?.status === 'running'
   const busyAssemble = assemble.status === 'running' || assembleJob.data?.status === 'running'
   const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || busyAssemble
-  const voiceOptions = settingsQuery.data?.tts_voices ?? []
-  const selectedVoice = voice || voiceOptions[0]?.id || ''
   const manifestById = new Map(tts_manifest.map((m) => [m.id, m]))
 
   return (
@@ -161,11 +193,38 @@ export default function ProjectDetail() {
           ← Dự án
         </Link>
         <h1 className="mt-2 text-2xl">{project.title}</h1>
+        {cancelMutation.isError && <p className="mt-1 text-sm text-danger">{(cancelMutation.error as Error).message}</p>}
         <p className="font-mono text-xs text-neutral-500">{project.project_id}</p>
       </div>
 
+      <section className="card flex flex-wrap items-center justify-between gap-3 p-4">
+        <div>
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={project.auto_pipeline}
+              disabled={autoPipelineMutation.isPending}
+              onChange={(e) => autoPipelineMutation.mutate(e.target.checked)}
+            />
+            Tự động chạy hết pipeline
+          </label>
+          <p className="mt-1 text-xs text-neutral-400">
+            Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt Whisper → Gemini → TTS →
+            CapCut cho tới hết, dùng engine/giọng đang chọn bên dưới ({engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}
+            {selectedVoice ? ` · ${voiceOptions.find((v) => v.id === selectedVoice)?.label ?? selectedVoice}` : ''}).
+            Dừng lại ở draft CapCut — review + export vẫn phải làm tay.
+          </p>
+        </div>
+      </section>
+
       <section className="card p-5">
-        <StageHeader name="ingest" record={ingest} />
+        <StageHeader
+          name="ingest"
+          record={ingest}
+          busy={busyIngest}
+          cancelling={cancelMutation.isPending && cancelMutation.variables === 'ingest'}
+          onCancel={() => cancelMutation.mutate('ingest')}
+        />
         <JobProgressBar job={ingestJob.data} formatCount={(n) => `${(n / (1024 * 1024)).toFixed(1)}MB`} />
         {ingest.status === 'done' && (
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -240,7 +299,13 @@ export default function ProjectDetail() {
       </section>
 
       <section className="card p-5">
-        <StageHeader name="transcribe" record={transcribe} />
+        <StageHeader
+          name="transcribe"
+          record={transcribe}
+          busy={busyWhisper}
+          cancelling={cancelMutation.isPending && cancelMutation.variables === 'transcribe'}
+          onCancel={() => cancelMutation.mutate('transcribe')}
+        />
         <p className="mb-3 text-sm text-neutral-400">
           Nhận diện giọng nói → <span className="mono">sub_zh.srt</span>
           {transcribe.engine && <> · lần chạy trước dùng <b>{transcribe.engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}</b></>}
@@ -286,7 +351,13 @@ export default function ProjectDetail() {
       </section>
 
       <section className="card p-5">
-        <StageHeader name="translate" record={translate} />
+        <StageHeader
+          name="translate"
+          record={translate}
+          busy={busyGemini}
+          cancelling={cancelMutation.isPending && cancelMutation.variables === 'translate'}
+          onCancel={() => cancelMutation.mutate('translate')}
+        />
         <p className="mb-3 text-sm text-neutral-400">
           Gemini: entity dict + clean + dịch zh→vi → <span className="mono">sub_vi.srt</span> +{' '}
           <span className="mono">entity_dict.json</span>
@@ -306,7 +377,13 @@ export default function ProjectDetail() {
       </section>
 
       <section className="card p-5">
-        <StageHeader name="tts" record={tts} />
+        <StageHeader
+          name="tts"
+          record={tts}
+          busy={busyTTS}
+          cancelling={cancelMutation.isPending && cancelMutation.variables === 'tts'}
+          onCancel={() => cancelMutation.mutate('tts')}
+        />
         <p className="mb-3 text-sm text-neutral-400">
           CapCut TTS: đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
         </p>
@@ -398,7 +475,13 @@ export default function ProjectDetail() {
       </section>
 
       <section className="card p-5">
-        <StageHeader name="assemble" record={assemble} />
+        <StageHeader
+          name="assemble"
+          record={assemble}
+          busy={busyAssemble}
+          cancelling={cancelMutation.isPending && cancelMutation.variables === 'assemble'}
+          onCancel={() => cancelMutation.mutate('assemble')}
+        />
         <p className="mb-3 text-sm text-neutral-400">
           Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi
           thẳng vào thư mục CapCut thật:{' '}

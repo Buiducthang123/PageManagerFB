@@ -19,6 +19,12 @@ class IngestUrlRequest(BaseModel):
     url: str
 
 
+class UpdateAutoPipelineRequest(BaseModel):
+    enabled: bool
+    engine: str = "whisper"
+    voice: str = ""
+
+
 class StartTranscribeRequest(BaseModel):
     engine: str = "whisper"  # "whisper" | "sensevoice"
 

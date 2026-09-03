@@ -7,6 +7,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Đặt SỚM nhất có thể (trước khi torch/numpy/mkl được import ở bất kỳ đâu
+# trong app) — từng gặp Demucs (CPU) treo cứng toàn bộ process, 0% CPU, không
+# phản hồi API nào luôn, nghi do xung đột nhiều bản OpenMP runtime nạp trùng
+# (lỗi kinh điển của torch+numpy trên Windows). setdefault để không đè giá trị
+# người dùng đã tự set trong .env/hệ thống.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip().strip("'\"") or DEFAULT_GEMINI_MODEL
@@ -35,6 +43,11 @@ GEMINI_TEMPERATURE = 0.1
 
 
 SENSEVOICE_DEVICE = os.environ.get("SENSEVOICE_DEVICE", "cpu").strip() or "cpu"
+
+try:
+    TTS_CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY", "3").strip() or "3"))
+except ValueError:
+    TTS_CONCURRENCY = 3
 
 
 def sensevoice_cache_dir() -> Path:

@@ -35,6 +35,9 @@ class ProjectState(BaseModel):
     stages: dict[str, StageRecord] = Field(
         default_factory=lambda: {name: StageRecord() for name in STAGE_ORDER}
     )
+    auto_pipeline: bool = False
+    auto_engine: str = "whisper"
+    auto_voice: str = ""
 
 
 def empty_stages() -> dict[str, StageRecord]:

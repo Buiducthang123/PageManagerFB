@@ -30,6 +30,9 @@ export interface ProjectState {
   video_relpath: string | null
   duration_sec: number | null
   stages: Record<StageName, StageRecord>
+  auto_pipeline: boolean
+  auto_engine: TranscribeEngine
+  auto_voice: string
 }
 
 export interface ProjectSummary {
@@ -78,7 +81,7 @@ export interface ProjectDetail {
 export interface JobStatus {
   registered: boolean
   orphaned: boolean
-  status: 'running' | 'done' | 'failed' | null
+  status: 'running' | 'done' | 'failed' | 'cancelled' | null
   total: number
   done_count: number
   current_label: string | null
@@ -153,6 +156,11 @@ export const api = {
   },
   ingestUrl: (id: string, url: string) => postJson<{ status: string }>(`/api/projects/${id}/ingest/url`, { url }),
   revealVideo: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/reveal-video`),
+  updateAutoPipeline: (id: string, enabled: boolean, engine: TranscribeEngine, voice: string) =>
+    request<ProjectSummary>(`/api/projects/${id}/auto-pipeline`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled, engine, voice }),
+    }),
   startTranscribe: (id: string, engine: TranscribeEngine = 'whisper') =>
     postJson<{ status: string }>(`/api/projects/${id}/transcribe`, { engine }),
   startTranslate: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/translate`),
@@ -169,6 +177,8 @@ export const api = {
   startAssemble: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/assemble`),
   jobStatus: (id: string, stage: 'ingest' | 'transcribe' | 'translate' | 'tts' | 'assemble') =>
     request<JobStatus>(`/api/projects/${id}/jobs/${stage}`),
+  cancelJob: (id: string, stage: StageName) =>
+    postJson<{ status: string }>(`/api/projects/${id}/jobs/${stage}/cancel`),
 
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (

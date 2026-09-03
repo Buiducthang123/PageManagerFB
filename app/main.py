@@ -30,6 +30,7 @@ from .schemas import (
     TTSCueRequest,
     TTSManifestEntryResponse,
     UpdateAppSettingsRequest,
+    UpdateAutoPipelineRequest,
     UpdateCueRequest,
 )
 from .stages import assemble as assemble_stage
@@ -62,6 +63,39 @@ def _require_done(state, stage: str, message: str) -> None:
     rec = state.stages.get(stage)
     if rec is None or rec.status != StageStatus.done:
         raise HTTPException(status_code=409, detail=message)
+
+
+def _mark_cancelled(project_id: str, stage: str, job: jobs.JobState) -> None:
+    job.status = "cancelled"
+    for it in job.items:
+        if it.status == "running":
+            it.status = "failed"
+            it.error = "Đã dừng"
+    with pj.locked_project(project_id) as s:
+        s.stages[stage].status = StageStatus.failed
+        s.stages[stage].error = "Đã dừng theo yêu cầu người dùng"
+    pj.append_log(project_id, stage, "Đã dừng theo yêu cầu người dùng")
+
+
+def _maybe_chain(project_id: str, finished_stage: str) -> None:
+    """Nếu project bật auto_pipeline, tự động chạy tiếp stage kế tiếp ngay
+    sau khi `finished_stage` xong — cho phép "upload xong là chạy tới cùng"
+    mà không cần bấm từng nút. Dừng lại sau assemble vì review CapCut + export
+    là thao tác tay, chưa có API tương ứng."""
+    try:
+        state = pj.load_project(project_id)
+    except FileNotFoundError:
+        return
+    if not state.auto_pipeline:
+        return
+    if finished_stage == "ingest":
+        _start_transcribe(project_id, state.auto_engine)
+    elif finished_stage == "transcribe":
+        _start_translate(project_id)
+    elif finished_stage == "translate":
+        _start_tts(project_id, state.auto_voice)
+    elif finished_stage == "tts":
+        _start_assemble(project_id)
 
 
 # ------------------------------------------------------------------ Settings
@@ -109,6 +143,16 @@ def rename_project_route(project_id: str, body: RenameProjectRequest):
         state = pj.rename_project(project_id, body.title.strip())
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+    return _summary(state)
+
+
+@app.patch("/api/projects/{project_id}/auto-pipeline", response_model=ProjectSummary)
+def update_auto_pipeline_route(project_id: str, body: UpdateAutoPipelineRequest):
+    engine = "sensevoice" if body.engine == "sensevoice" else "whisper"
+    with pj.locked_project(project_id) as state:
+        state.auto_pipeline = body.enabled
+        state.auto_engine = engine
+        state.auto_voice = body.voice if body.voice in {v["id"] for v in tts_stage.VOICES} else ""
     return _summary(state)
 
 
@@ -196,6 +240,7 @@ def _finalize_ingest(project_id: str, root: Path, dest: Path, original: str, dur
             at=datetime.now(),
         )
     pj.append_log(project_id, "ingest", log_msg)
+    _maybe_chain(project_id, "ingest")
 
 
 @app.post("/api/projects/{project_id}/ingest")
@@ -230,12 +275,16 @@ def ingest_video_url(project_id: str, body: IngestUrlRequest):
             s.stages["ingest"].error = None
 
         def on_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.done_count = done
             job.total = max(tot, 1)
             job.current_label = label
 
         try:
             dest, original, duration = fetch_url_stage.download_video_from_share(root, share_url, on_progress=on_progress)
+        except jobs.JobCancelled:
+            _mark_cancelled(project_id, "ingest", job)
+            return
         except fetch_url_stage.FetchUrlError as err:
             job.items[0].status = "failed"
             job.items[0].error = str(err)
@@ -287,17 +336,15 @@ def reveal_video(project_id: str):
 # ------------------------------------------------------------------ Transcribe / Translate jobs
 
 
-@app.post("/api/projects/{project_id}/transcribe", status_code=202)
-def start_transcribe(project_id: str, body: StartTranscribeRequest | None = None):
+def _start_transcribe(project_id: str, engine: str) -> jobs.JobState | None:
     state = pj.load_project(project_id)
-    _require_done(state, "ingest", "Chưa upload video")
     if not state.video_relpath:
-        raise HTTPException(status_code=409, detail="Chưa có file video")
+        return None
     root = pj.project_dir(project_id)
     video_path = root / state.video_relpath
     total = max(1, int(state.duration_sec or 1))
 
-    engine = body.engine if body and body.engine == "sensevoice" else "whisper"
+    engine = "sensevoice" if engine == "sensevoice" else "whisper"
     stage_fn = sensevoice_stage.transcribe_video if engine == "sensevoice" else transcribe_stage.transcribe_video
     engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
 
@@ -314,12 +361,16 @@ def start_transcribe(project_id: str, body: StartTranscribeRequest | None = None
             s.stages["transcribe"].engine = engine
 
         def on_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.done_count = done
             job.total = max(tot, 1)
             job.current_label = label
 
         try:
             cues, lang = stage_fn(video_path, root / "sub_zh.srt", on_progress=on_progress)
+        except jobs.JobCancelled:
+            _mark_cancelled(project_id, "transcribe", job)
+            return
         except Exception as err:
             logger.exception("{} lỗi {}", engine_label, project_id)
             job.items[0].status = "failed"
@@ -343,17 +394,26 @@ def start_transcribe(project_id: str, body: StartTranscribeRequest | None = None
             s.stages["transcribe"].engine = engine
             s.stages["transcribe"].at = datetime.now()
         pj.append_log(project_id, "transcribe", f"{len(cues)} câu · {lang}")
+        _maybe_chain(project_id, "transcribe")
 
-    job = jobs.start_job(f"{project_id}:transcribe", total, target)
+    return jobs.start_job(f"{project_id}:transcribe", total, target)
+
+
+@app.post("/api/projects/{project_id}/transcribe", status_code=202)
+def start_transcribe_route(project_id: str, body: StartTranscribeRequest | None = None):
+    state = pj.load_project(project_id)
+    _require_done(state, "ingest", "Chưa upload video")
+    if not state.video_relpath:
+        raise HTTPException(status_code=409, detail="Chưa có file video")
+    engine = body.engine if body and body.engine == "sensevoice" else "whisper"
+    engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
+    job = _start_transcribe(project_id, engine)
     if job is None:
         raise HTTPException(status_code=409, detail=f"{engine_label} đang chạy cho dự án này")
     return {"status": "started"}
 
 
-@app.post("/api/projects/{project_id}/translate", status_code=202)
-def start_translate(project_id: str):
-    state = pj.load_project(project_id)
-    _require_done(state, "transcribe", "Chưa có phụ đề tiếng Trung — chạy Whisper trước")
+def _start_translate(project_id: str) -> jobs.JobState | None:
     root = pj.project_dir(project_id)
     n = len(load_srt(root / "sub_zh.srt")) or 1
 
@@ -368,12 +428,16 @@ def start_translate(project_id: str):
             s.stages["translate"].error = None
 
         def on_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.done_count = done
             job.total = max(tot, 1)
             job.current_label = label
 
         try:
             _, _, entity = translate_stage.translate_project(root, on_progress=on_progress)
+        except jobs.JobCancelled:
+            _mark_cancelled(project_id, "translate", job)
+            return
         except (translate_stage.LLMNotConfigured, translate_stage.GeminiQuotaError) as err:
             job.items[0].status = "failed"
             job.status = "failed"
@@ -405,8 +469,16 @@ def start_translate(project_id: str):
             s.stages["translate"].error = None
             s.stages["translate"].at = datetime.now()
         pj.append_log(project_id, "translate", f"{n} câu · {len(entity)} tên riêng")
+        _maybe_chain(project_id, "translate")
 
-    job = jobs.start_job(f"{project_id}:translate", n, target)
+    return jobs.start_job(f"{project_id}:translate", n, target)
+
+
+@app.post("/api/projects/{project_id}/translate", status_code=202)
+def start_translate_route(project_id: str):
+    state = pj.load_project(project_id)
+    _require_done(state, "transcribe", "Chưa có phụ đề tiếng Trung — chạy Whisper trước")
+    job = _start_translate(project_id)
     if job is None:
         raise HTTPException(status_code=409, detail="Gemini đang chạy cho dự án này")
     return {"status": "started"}
@@ -488,22 +560,17 @@ def tts_preview(voice: str = ""):
     return Response(content=audio_bytes, media_type="audio/mpeg")
 
 
-@app.post("/api/projects/{project_id}/tts", status_code=202)
-def start_tts(project_id: str, body: StartTTSRequest | None = None):
-    state = pj.load_project(project_id)
-    _require_done(state, "translate", "Chưa có bản dịch tiếng Việt — chạy Gemini trước")
+def _start_tts(project_id: str, voice: str, retry_only: bool = False) -> jobs.JobState | None:
     root = pj.project_dir(project_id)
 
-    voice = body.voice if body and body.voice else ""
     if voice not in {v["id"] for v in tts_stage.VOICES}:
         voice = tts_stage.DEFAULT_VOICE
     voice_label = next((v["label"] for v in tts_stage.VOICES if v["id"] == voice), voice)
-    retry_only = bool(body and body.retry_failed_only)
 
     if retry_only:
         manifest_path = root / "audio" / "manifest.json"
         if not manifest_path.exists():
-            raise HTTPException(status_code=409, detail="Chưa chạy TTS lần nào")
+            return None
         prev_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         n = sum(1 for m in prev_manifest if m.get("error")) or 1
     else:
@@ -520,6 +587,7 @@ def start_tts(project_id: str, body: StartTTSRequest | None = None):
             s.stages["tts"].error = None
 
         def on_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.done_count = done
             job.total = max(tot, 1)
             job.current_label = label
@@ -529,6 +597,9 @@ def start_tts(project_id: str, body: StartTTSRequest | None = None):
                 _, manifest = tts_stage.retry_failed_segments(root, voice=voice, on_progress=on_progress)
             else:
                 _, manifest = tts_stage.tts_project(root, voice=voice, on_progress=on_progress)
+        except jobs.JobCancelled:
+            _mark_cancelled(project_id, "tts", job)
+            return
         except tts_stage.TTSError as err:
             job.items[0].status = "failed"
             job.status = "failed"
@@ -562,8 +633,22 @@ def start_tts(project_id: str, body: StartTTSRequest | None = None):
             s.stages["tts"].error = None
             s.stages["tts"].at = datetime.now()
         pj.append_log(project_id, "tts", f"{ok}/{len(manifest)} câu · {voice_label}")
+        _maybe_chain(project_id, "tts")
 
-    job = jobs.start_job(f"{project_id}:tts", n, target)
+    return jobs.start_job(f"{project_id}:tts", n, target)
+
+
+@app.post("/api/projects/{project_id}/tts", status_code=202)
+def start_tts_route(project_id: str, body: StartTTSRequest | None = None):
+    state = pj.load_project(project_id)
+    _require_done(state, "translate", "Chưa có bản dịch tiếng Việt — chạy Gemini trước")
+    voice = body.voice if body and body.voice else ""
+    retry_only = bool(body and body.retry_failed_only)
+    if retry_only:
+        manifest_path = pj.project_dir(project_id) / "audio" / "manifest.json"
+        if not manifest_path.exists():
+            raise HTTPException(status_code=409, detail="Chưa chạy TTS lần nào")
+    job = _start_tts(project_id, voice, retry_only=retry_only)
     if job is None:
         raise HTTPException(status_code=409, detail="TTS đang chạy cho dự án này")
     return {"status": "started"}
@@ -572,13 +657,11 @@ def start_tts(project_id: str, body: StartTTSRequest | None = None):
 # ------------------------------------------------------------------ Assemble (CapCut draft)
 
 
-@app.post("/api/projects/{project_id}/assemble", status_code=202)
-def start_assemble(project_id: str):
+def _start_assemble(project_id: str) -> jobs.JobState | None:
     state = pj.load_project(project_id)
-    _require_done(state, "tts", "Chưa có audio TTS — chạy TTS trước")
     root = pj.project_dir(project_id)
     if not state.video_relpath:
-        raise HTTPException(status_code=409, detail="Chưa có file video")
+        return None
 
     def target(job: jobs.JobState) -> None:
         job.items = [
@@ -594,12 +677,16 @@ def start_assemble(project_id: str):
         bg_path = root / "background.wav"
 
         def on_bg_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.current_label = label
 
         if not bg_path.exists():
             job.items[0].status = "running"
             try:
-                dub_audio_stage.extract_background(video_path, bg_path, on_progress=on_bg_progress)
+                dub_audio_stage.extract_background(video_path, bg_path, on_progress=on_bg_progress, job=job)
+            except jobs.JobCancelled:
+                _mark_cancelled(project_id, "assemble", job)
+                return
             except dub_audio_stage.DubAudioError as err:
                 job.items[0].status = "failed"
                 job.status = "failed"
@@ -615,6 +702,7 @@ def start_assemble(project_id: str):
         job.current_label = "Dựng draft"
 
         def on_draft_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
             job.done_count = done
             job.total = max(tot, 1)
             job.current_label = label
@@ -632,6 +720,9 @@ def start_assemble(project_id: str):
                 draft_name=project_id,
                 on_progress=on_draft_progress,
             )
+        except jobs.JobCancelled:
+            _mark_cancelled(project_id, "assemble", job)
+            return
         except assemble_stage.AssembleError as err:
             job.items[1].status = "failed"
             job.status = "failed"
@@ -663,10 +754,29 @@ def start_assemble(project_id: str):
             s.stages["assemble"].at = datetime.now()
         pj.append_log(project_id, "assemble", f"draft → {draft_path}")
 
-    job = jobs.start_job(f"{project_id}:assemble", 1, target)
+    return jobs.start_job(f"{project_id}:assemble", 1, target)
+
+
+@app.post("/api/projects/{project_id}/assemble", status_code=202)
+def start_assemble_route(project_id: str):
+    state = pj.load_project(project_id)
+    _require_done(state, "tts", "Chưa có audio TTS — chạy TTS trước")
+    if not state.video_relpath:
+        raise HTTPException(status_code=409, detail="Chưa có file video")
+    job = _start_assemble(project_id)
     if job is None:
         raise HTTPException(status_code=409, detail="Assemble đang chạy cho dự án này")
     return {"status": "started"}
+
+
+@app.post("/api/projects/{project_id}/jobs/{stage}/cancel")
+def cancel_job_route(project_id: str, stage: str):
+    if stage not in ("ingest", "transcribe", "translate", "tts", "assemble"):
+        raise HTTPException(status_code=404, detail="Stage không hỗ trợ job")
+    ok = jobs.request_cancel(f"{project_id}:{stage}")
+    if not ok:
+        raise HTTPException(status_code=409, detail="Không có job nào đang chạy cho stage này")
+    return {"status": "cancelling"}
 
 
 @app.get("/api/projects/{project_id}/jobs/{stage}", response_model=JobStatusResponse)

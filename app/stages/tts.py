@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
 import requests
 from loguru import logger
 
+from .. import config
 from ..utils.srt import Cue, load_srt
 
 _client = None
@@ -56,7 +59,6 @@ DEFAULT_VOICE = VOICES[0]["id"]
 
 POLL_INTERVAL_S = 1.5
 POLL_TIMEOUT_S = 60.0
-REQUEST_GAP_S = 0.6  # nghỉ nhẹ giữa các câu, tránh dồn dập vào API không chính thức
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_S = 3.0  # tăng dần giữa các lần thử lại (3s, 6s, ...) — lỗi gặp
 # thật (ExceededConcurrentLimit, "call sami response is empty") đều tạm thời
@@ -87,7 +89,10 @@ def _synthesize(text: str, voice: str) -> tuple[bytes, int]:
     """
     client = _get_client()
     resource_id = _VOICE_RESOURCE_IDS.get(voice)
-    create_res = client.create_tts_task(texts=text, voice=voice, resource_id=resource_id, rate="1.0")
+    try:
+        create_res = client.create_tts_task(texts=text, voice=voice, resource_id=resource_id, rate="1.0")
+    except requests.exceptions.RequestException as err:
+        raise TTSError(f"CapCut TTS lỗi kết nối khi tạo task: {err}") from err
     tasks = (create_res.get("data") or {}).get("tasks") or []
     if not tasks:
         raise TTSError(f"CapCut TTS không trả về task: {create_res}")
@@ -95,7 +100,10 @@ def _synthesize(text: str, voice: str) -> tuple[bytes, int]:
 
     start = time.time()
     while time.time() - start < POLL_TIMEOUT_S:
-        q = client.query_tts_task(task_id, token)
+        try:
+            q = client.query_tts_task(task_id, token)
+        except requests.exceptions.RequestException as err:
+            raise TTSError(f"CapCut TTS lỗi kết nối khi poll task: {err}") from err
         q_tasks = (q.get("data") or {}).get("tasks") or []
         status = q_tasks[0].get("status") if q_tasks else None
         if status == "succeed":
@@ -104,8 +112,11 @@ def _synthesize(text: str, voice: str) -> tuple[bytes, int]:
             if not subs or not subs[0].get("speech_url"):
                 raise TTSError(f"CapCut TTS không có speech_url: {payload}")
             sub = subs[0]
-            resp = requests.get(sub["speech_url"], timeout=30)
-            resp.raise_for_status()
+            try:
+                resp = requests.get(sub["speech_url"], timeout=30)
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as err:
+                raise TTSError(f"CapCut TTS lỗi tải file audio: {err}") from err
             return resp.content, int(sub.get("duration") or 0)
         if status == "failed":
             raise TTSError(f"CapCut TTS task failed: {q}")
@@ -140,41 +151,57 @@ def preview_voice(voice: str, text: str = PREVIEW_TEXT) -> bytes:
     return audio_bytes
 
 
+def _synthesize_one(cue: Cue, voice: str, output_dir: Path) -> dict:
+    text = (cue.text or "").strip()
+    entry = {"id": cue.id, "start": cue.start, "end": cue.end, "path": None, "duration_ms": 0, "text": text}
+    if not text:
+        return entry
+    try:
+        audio_bytes, duration_ms = _synthesize_with_retry(text, voice)
+        out_path = output_dir / f"segment_{cue.id:03d}.mp3"
+        out_path.write_bytes(audio_bytes)
+        entry["path"] = out_path.name
+        entry["duration_ms"] = duration_ms
+    except TTSError as err:
+        logger.warning("TTS lỗi câu {} (đã thử lại {} lần): {}", cue.id, RETRY_ATTEMPTS, err)
+        entry["error"] = str(err)
+    return entry
+
+
 def _synthesize_cues(
     cues: list[Cue],
     output_dir: Path,
     voice: str,
     on_progress: Optional[Callable[[int, int, str], None]],
 ) -> list[dict]:
-    """Sinh audio TTS cho từng cue, lưu audio/segment_NNN.mp3, trả về manifest
-    [{id, start, end, path, duration_ms, error}] — path=None nếu câu rỗng/lỗi."""
+    """Sinh audio TTS song song (tối đa `config.TTS_CONCURRENCY` câu cùng lúc —
+    API là network call nên chờ tuần tự lãng phí thời gian round-trip), lưu
+    audio/segment_NNN.mp3, trả về manifest [{id, start, end, path, duration_ms,
+    error}] theo đúng thứ tự cue gốc — path=None nếu câu rỗng/lỗi."""
     output_dir.mkdir(parents=True, exist_ok=True)
     total = len(cues)
-    manifest: list[dict] = []
+    results: dict[int, dict] = {}
+    done_count = 0
+    progress_lock = threading.Lock()
 
-    for i, cue in enumerate(cues, 1):
-        text = (cue.text or "").strip()
-        entry = {"id": cue.id, "start": cue.start, "end": cue.end, "path": None, "duration_ms": 0, "text": text}
-        if not text:
-            manifest.append(entry)
+    pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
+    try:
+        futures = {pool.submit(_synthesize_one, cue, voice, output_dir): cue for cue in cues}
+        for future in as_completed(futures):
+            cue = futures[future]
+            results[cue.id] = future.result()
             if on_progress:
-                on_progress(i, total, f"câu {cue.id} rỗng, bỏ qua")
-            continue
-        try:
-            audio_bytes, duration_ms = _synthesize_with_retry(text, voice)
-            out_path = output_dir / f"segment_{cue.id:03d}.mp3"
-            out_path.write_bytes(audio_bytes)
-            entry["path"] = out_path.name
-            entry["duration_ms"] = duration_ms
-        except TTSError as err:
-            logger.warning("TTS lỗi câu {} (đã thử lại {} lần): {}", cue.id, RETRY_ATTEMPTS, err)
-            entry["error"] = str(err)
-        manifest.append(entry)
-        if on_progress:
-            on_progress(i, total, f"câu {cue.id}/{total}")
-        time.sleep(REQUEST_GAP_S)
+                with progress_lock:
+                    done_count += 1
+                    current = done_count
+                on_progress(current, total, f"câu {cue.id}/{total}")
+    finally:
+        # cancel_futures=True: nếu bị dừng giữa chừng (on_progress raise
+        # JobCancelled), huỷ luôn các câu CHƯA chạy thay vì để executor tự
+        # chạy hết queue rồi mới thoát (with-statement mặc định sẽ đợi hết).
+        pool.shutdown(wait=False, cancel_futures=True)
 
-    return manifest
+    return [results[cue.id] for cue in cues]
 
 
 def retry_failed_segments(
@@ -194,8 +221,7 @@ def retry_failed_segments(
     vi_cues = {c.id: c for c in load_srt(project_root / "sub_vi.srt")}
     failed = [e for e in manifest if e.get("error") and vi_cues.get(e["id"]) and (vi_cues[e["id"]].text or "").strip()]
 
-    total = len(failed) or 1
-    for i, entry in enumerate(failed, 1):
+    def _redo(entry: dict) -> None:
         cue = vi_cues[entry["id"]]
         try:
             audio_bytes, duration_ms = _synthesize_with_retry(cue.text.strip(), voice)
@@ -208,9 +234,23 @@ def retry_failed_segments(
         except TTSError as err:
             logger.warning("Retry TTS câu {} vẫn lỗi: {}", cue.id, err)
             entry["error"] = str(err)
-        if on_progress:
-            on_progress(i, total, f"retry câu {entry['id']} ({i}/{len(failed)})")
-        time.sleep(REQUEST_GAP_S)
+
+    total = len(failed) or 1
+    done_count = 0
+    progress_lock = threading.Lock()
+    pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
+    try:
+        futures = {pool.submit(_redo, entry): entry for entry in failed}
+        for future in as_completed(futures):
+            entry = futures[future]
+            future.result()
+            if on_progress:
+                with progress_lock:
+                    done_count += 1
+                    current = done_count
+                on_progress(current, total, f"retry câu {entry['id']} ({current}/{len(failed)})")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     return manifest_path, manifest
