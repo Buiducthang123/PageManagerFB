@@ -1,10 +1,22 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, STAGE_LABELS, type StageName, type StageRecord, type TranscribeEngine } from '../lib/api'
+import {
+  api,
+  DEFAULT_MIN_VIDEO_SPEED,
+  MIN_VIDEO_SPEED_OPTIONS,
+  STAGE_LABELS,
+  type AudioMode,
+  type StageName,
+  type StageRecord,
+  type TranscribeEngine,
+} from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from '../components/StatusBadge'
 import JobProgressBar from '../components/JobProgressBar'
+import EpisodeCard from '../components/EpisodeCard'
+import ConfirmDialog from '../components/ConfirmDialog'
+import SplitTimeline from '../components/SplitTimeline'
 import { useJobStatus } from '../hooks/useJobStatus'
 
 function StageHeader({
@@ -49,6 +61,20 @@ export default function ProjectDetail() {
   const [previewNonce, setPreviewNonce] = useState(0)
   const [editingCueId, setEditingCueId] = useState<number | null>(null)
   const [draftText, setDraftText] = useState('')
+  const [audioMode, setAudioMode] = useState<AudioMode>('separated')
+  const [minVideoSpeed, setMinVideoSpeed] = useState<number>(DEFAULT_MIN_VIDEO_SPEED)
+
+  const [voiceInitialized, setVoiceInitialized] = useState(false)
+  const [newEpisodeUrl, setNewEpisodeUrl] = useState('')
+  const [deletingEpisodeId, setDeletingEpisodeId] = useState<string | null>(null)
+  const [splitCount, setSplitCount] = useState(1)
+  const [splitPoints, setSplitPoints] = useState<number[]>([])
+  // "Đang dừng..." phải hiện xuyên suốt tới khi job THẬT SỰ dừng (không chỉ
+  // trong lúc request cancel đang gửi) — nếu không, nút quay lại "Dừng" ngay
+  // sau khi request xong dù job vẫn chạy tiếp vài chục giây, trông như bấm
+  // không có tác dụng. Xoá cờ khi useJobStatus báo job đã chuyển trạng thái
+  // xong hẳn (onSettled).
+  const [pendingCancel, setPendingCancel] = useState<Partial<Record<StageName, boolean>>>({})
 
   const detailQuery = useQuery({
     queryKey: ['project', projectId],
@@ -58,11 +84,62 @@ export default function ProjectDetail() {
 
   const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: api.getSettings })
 
-  const ingestJob = useJobStatus(projectId, 'ingest')
-  const transcribeJob = useJobStatus(projectId, 'transcribe')
-  const translateJob = useJobStatus(projectId, 'translate')
-  const ttsJob = useJobStatus(projectId, 'tts')
-  const assembleJob = useJobStatus(projectId, 'assemble')
+  // Nhớ giọng đọc/engine/audio_mode đã dùng lần trước cho dự án này — không
+  // reset về mặc định mỗi lần vào lại trang (project.auto_voice/auto_engine/
+  // auto_audio_mode được backend ghi lại sau mỗi lần chạy, xem main.py
+  // `_start_tts`/`_start_assemble`).
+  useEffect(() => {
+    if (voiceInitialized) return
+    const p = detailQuery.data?.project
+    if (!p) return
+    if (p.auto_voice) setVoice(p.auto_voice)
+    if (p.auto_engine) setEngine(p.auto_engine)
+    if (p.auto_audio_mode) setAudioMode(p.auto_audio_mode)
+    if (p.auto_min_video_speed) setMinVideoSpeed(p.auto_min_video_speed)
+    setVoiceInitialized(true)
+  }, [detailQuery.data?.project, voiceInitialized])
+
+  const splitMutation = useMutation({
+    mutationFn: () => api.splitProject(projectId, splitPoints),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project', projectId] }),
+  })
+
+  const setSplitCountAndReset = (n: number, duration: number) => {
+    setSplitCount(n)
+    setSplitPoints(n <= 1 ? [] : Array.from({ length: n - 1 }, (_, i) => (duration * (i + 1)) / n))
+  }
+
+  const createEpisodeMutation = useMutation({
+    mutationFn: async (url: string) => {
+      const created = await api.createEpisode(projectId)
+      if (url.trim()) await api.ingestEpisodeUrl(projectId, created.episode.episode_id, url.trim())
+      return created
+    },
+    onSuccess: () => {
+      setNewEpisodeUrl('')
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] })
+    },
+  })
+
+  const reorderEpisodesMutation = useMutation({
+    mutationFn: (episodeIds: string[]) => api.reorderEpisodes(projectId, episodeIds),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project', projectId] }),
+  })
+
+  const deleteEpisodeMutation = useMutation({
+    mutationFn: (episodeId: string) => api.deleteEpisode(projectId, episodeId),
+    onSuccess: () => {
+      setDeletingEpisodeId(null)
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] })
+    },
+  })
+
+  const clearPendingCancel = (stage: StageName) => setPendingCancel((prev) => ({ ...prev, [stage]: false }))
+  const ingestJob = useJobStatus(projectId, 'ingest', undefined, () => clearPendingCancel('ingest'))
+  const transcribeJob = useJobStatus(projectId, 'transcribe', undefined, () => clearPendingCancel('transcribe'))
+  const translateJob = useJobStatus(projectId, 'translate', undefined, () => clearPendingCancel('translate'))
+  const ttsJob = useJobStatus(projectId, 'tts', undefined, () => clearPendingCancel('tts'))
+  const assembleJob = useJobStatus(projectId, 'assemble', undefined, () => clearPendingCancel('assemble'))
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['project', projectId] })
 
@@ -122,7 +199,7 @@ export default function ProjectDetail() {
   })
 
   const assembleMutation = useMutation({
-    mutationFn: () => api.startAssemble(projectId),
+    mutationFn: () => api.startAssemble(projectId, audioMode, minVideoSpeed),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['job', projectId, 'assemble'] })
     },
@@ -150,14 +227,46 @@ export default function ProjectDetail() {
   })
 
   const autoPipelineMutation = useMutation({
-    mutationFn: (enabled: boolean) => api.updateAutoPipeline(projectId, enabled, engine, selectedVoice),
+    mutationFn: (opts: {
+      enabled: boolean
+      engine?: TranscribeEngine
+      voice?: string
+      audioMode?: AudioMode
+      minVideoSpeed?: number
+    }) =>
+      api.updateAutoPipeline(
+        projectId,
+        opts.enabled,
+        opts.engine ?? engine,
+        opts.voice ?? selectedVoice,
+        opts.audioMode ?? audioMode,
+        opts.minVideoSpeed ?? minVideoSpeed,
+      ),
     onSuccess: () => refresh(),
   })
+
+  // Nếu "Tự động chạy hết pipeline" đang bật, đổi engine/giọng/audio_mode/
+  // min_video_speed giữa chừng (khi pipeline mới chạy tới bước đầu, chưa tới
+  // TTS/CapCut) phải đồng bộ lại cho backend ngay — nếu không, bước
+  // auto-chain kế tiếp (main.py `_maybe_chain`) vẫn dùng giá trị auto_* CŨ đã
+  // lưu, bỏ qua lựa chọn mới trên UI.
+  const autoSyncSkipFirst = useRef(true)
+  useEffect(() => {
+    if (autoSyncSkipFirst.current) {
+      autoSyncSkipFirst.current = false
+      return
+    }
+    if (detailQuery.data?.project.auto_pipeline) {
+      autoPipelineMutation.mutate({ enabled: true, engine, voice: selectedVoice, audioMode, minVideoSpeed })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engine, selectedVoice, audioMode, minVideoSpeed])
 
   const cancelMutation = useMutation({
     mutationFn: (stage: StageName) => api.cancelJob(projectId, stage),
     onSuccess: (_data, stage) => {
       queryClient.invalidateQueries({ queryKey: ['job', projectId, stage] })
+      setPendingCancel((prev) => ({ ...prev, [stage]: true }))
     },
   })
 
@@ -185,6 +294,10 @@ export default function ProjectDetail() {
   const busyAssemble = assemble.status === 'running' || assembleJob.data?.status === 'running'
   const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || busyAssemble
   const manifestById = new Map(tts_manifest.map((m) => [m.id, m]))
+  const isMulti = project.project_type === 'multi'
+  const isSplit = project.split_mode
+  const allEpisodesTTSDone = data.episodes.length > 0 && data.episodes.every((e) => e.episode.stages.tts.status === 'done')
+  const splitEpisodes = [...data.episodes].sort((a, b) => a.episode.order - b.episode.order)
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -204,7 +317,7 @@ export default function ProjectDetail() {
               type="checkbox"
               checked={project.auto_pipeline}
               disabled={autoPipelineMutation.isPending}
-              onChange={(e) => autoPipelineMutation.mutate(e.target.checked)}
+              onChange={(e) => autoPipelineMutation.mutate({ enabled: e.target.checked })}
             />
             Tự động chạy hết pipeline
           </label>
@@ -217,12 +330,203 @@ export default function ProjectDetail() {
         </div>
       </section>
 
+      {isMulti && (
+        <section className="card space-y-4 p-5">
+          <h2 className="text-lg">Các tập</h2>
+
+          <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
+            <label className="flex-1 text-sm text-neutral-300">
+              Engine nhận diện
+              <div className="mt-1 flex gap-4">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
+                  Whisper
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
+                  SenseVoice
+                </label>
+              </div>
+            </label>
+            <label className="min-w-64 flex-1 text-sm text-neutral-300">
+              Giọng đọc mặc định (áp dụng khi chạy TTS tập bất kỳ)
+              <div className="mt-1 flex gap-2">
+                <select className={`${inputClass} mt-0 flex-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
+                  {voiceOptions.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className={secondaryButtonClass}
+                  disabled={!selectedVoice}
+                  onClick={() => {
+                    setPreviewVoice(selectedVoice)
+                    setPreviewNonce((n) => n + 1)
+                  }}
+                >
+                  Nghe thử
+                </button>
+              </div>
+            </label>
+          </div>
+          {previewVoice && (
+            <audio key={previewNonce} className="h-8 w-full" autoPlay controls preload="auto" src={api.previewVoiceUrl(previewVoice)} />
+          )}
+
+          {data.episodes.map((ep, i) => {
+            const episodeIds = data.episodes.map((e) => e.episode.episode_id)
+            const swapWith = (otherIndex: number) => {
+              const ids = [...episodeIds]
+              ;[ids[i], ids[otherIndex]] = [ids[otherIndex], ids[i]]
+              reorderEpisodesMutation.mutate(ids)
+            }
+            return (
+              <EpisodeCard
+                key={ep.episode.episode_id}
+                projectId={projectId}
+                detail={ep}
+                index={i}
+                engine={engine}
+                voice={selectedVoice}
+                canMoveUp={i > 0}
+                canMoveDown={i < data.episodes.length - 1}
+                onMoveUp={() => swapWith(i - 1)}
+                onMoveDown={() => swapWith(i + 1)}
+                onDelete={() => setDeletingEpisodeId(ep.episode.episode_id)}
+              />
+            )
+          })}
+
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-neutral-700 p-3">
+            <input
+              className={`${inputClass} mt-0 min-w-72 flex-1`}
+              placeholder="Dán link Douyin/TikTok cho tập mới (có thể để trống rồi upload file sau)..."
+              value={newEpisodeUrl}
+              onChange={(e) => setNewEpisodeUrl(e.target.value)}
+            />
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={createEpisodeMutation.isPending}
+              onClick={() => createEpisodeMutation.mutate(newEpisodeUrl)}
+            >
+              {createEpisodeMutation.isPending ? 'Đang thêm...' : '+ Thêm tập'}
+            </button>
+          </div>
+          {createEpisodeMutation.error && (
+            <p className="text-sm text-danger">{(createEpisodeMutation.error as Error).message}</p>
+          )}
+        </section>
+      )}
+
+      {isSplit && (
+        <section className="card space-y-4 p-5">
+          <h2 className="text-lg">Các đoạn (đã chia từ video gốc — chạy tuần tự, mỗi đoạn 1 draft riêng)</h2>
+
+          <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
+            <label className="flex-1 text-sm text-neutral-300">
+              Engine nhận diện
+              <div className="mt-1 flex gap-4">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
+                  Whisper
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
+                  SenseVoice
+                </label>
+              </div>
+            </label>
+            <label className="min-w-64 flex-1 text-sm text-neutral-300">
+              Giọng đọc mặc định
+              <div className="mt-1 flex gap-2">
+                <select className={`${inputClass} mt-0 flex-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
+                  {voiceOptions.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </label>
+            <label className="min-w-48 flex-1 text-sm text-neutral-300">
+              Âm thanh gốc
+              <select
+                className={`${inputClass} mt-0`}
+                value={audioMode}
+                onChange={(e) => setAudioMode(e.target.value as AudioMode)}
+              >
+                <option value="separated">Tách nhạc nền/SFX (demucs)</option>
+                <option value="original">Giữ nguyên âm thanh gốc</option>
+                <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
+              </select>
+            </label>
+            <label className="min-w-48 flex-1 text-sm text-neutral-300">
+              Video chậm tối đa
+              <select
+                className={`${inputClass} mt-0`}
+                value={minVideoSpeed}
+                onChange={(e) => setMinVideoSpeed(Number(e.target.value))}
+              >
+                {MIN_VIDEO_SPEED_OPTIONS.map((v) => (
+                  <option key={v} value={v}>
+                    {Math.round((1 - v) * 100)}% ({v.toFixed(2)}x)
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          {splitEpisodes.map((ep, i) => (
+            <EpisodeCard
+              key={ep.episode.episode_id}
+              projectId={projectId}
+              detail={ep}
+              index={i}
+              engine={engine}
+              voice={selectedVoice}
+              movable={false}
+              standaloneAssemble
+              audioMode={audioMode}
+              minVideoSpeed={minVideoSpeed}
+            />
+          ))}
+        </section>
+      )}
+
+      {(isMulti || isSplit) && Object.keys(entity_dict).length > 0 && (
+        <section className="card p-5">
+          <h2 className="mb-3 text-lg">Entity dict (dùng chung cả series)</h2>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Gốc (zh)</th>
+                <th>Phiên âm / dịch (vi)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(entity_dict).map(([k, v]) => (
+                <tr key={k}>
+                  <td>{k}</td>
+                  <td className="text-accent-200">{v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {!isMulti && !isSplit && (
+      <>
       <section className="card p-5">
         <StageHeader
           name="ingest"
           record={ingest}
           busy={busyIngest}
-          cancelling={cancelMutation.isPending && cancelMutation.variables === 'ingest'}
+          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'ingest') || pendingCancel.ingest}
           onCancel={() => cancelMutation.mutate('ingest')}
         />
         <JobProgressBar job={ingestJob.data} formatCount={(n) => `${(n / (1024 * 1024)).toFixed(1)}MB`} />
@@ -298,12 +602,48 @@ export default function ProjectDetail() {
         )}
       </section>
 
+      {ingest.status === 'done' && transcribe.status === 'pending' && !busyAny && project.duration_sec && (
+        <section className="card space-y-3 p-5">
+          <h2 className="text-lg">Chia video thành nhiều đoạn (tùy chọn)</h2>
+          <p className="text-sm text-neutral-400">
+            Video dài ráp xong 1 draft CapCut duy nhất có thể quá nặng, CapCut không load nổi — chia thành nhiều đoạn,
+            mỗi đoạn chạy hết pipeline rồi ráp thành 1 draft CapCut RIÊNG (chạy tuần tự, đoạn sau chỉ bắt đầu khi đoạn
+            trước ráp draft xong).
+          </p>
+          <label className="block text-sm text-neutral-300">
+            Chia thành mấy đoạn
+            <input
+              type="number"
+              min={1}
+              max={20}
+              className={`${inputClass} max-w-32`}
+              value={splitCount}
+              onChange={(e) => setSplitCountAndReset(Math.min(20, Math.max(1, Number(e.target.value) || 1)), project.duration_sec ?? 0)}
+            />
+          </label>
+          {splitCount > 1 && (
+            <>
+              <SplitTimeline duration={project.duration_sec} points={splitPoints} onChange={setSplitPoints} />
+              <button
+                type="button"
+                className={primaryButtonClass}
+                disabled={splitMutation.isPending}
+                onClick={() => splitMutation.mutate()}
+              >
+                {splitMutation.isPending ? 'Đang chia...' : `Xác nhận chia thành ${splitCount} đoạn`}
+              </button>
+              {splitMutation.error && <p className="text-sm text-danger">{(splitMutation.error as Error).message}</p>}
+            </>
+          )}
+        </section>
+      )}
+
       <section className="card p-5">
         <StageHeader
           name="transcribe"
           record={transcribe}
           busy={busyWhisper}
-          cancelling={cancelMutation.isPending && cancelMutation.variables === 'transcribe'}
+          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'transcribe') || pendingCancel.transcribe}
           onCancel={() => cancelMutation.mutate('transcribe')}
         />
         <p className="mb-3 text-sm text-neutral-400">
@@ -350,12 +690,13 @@ export default function ProjectDetail() {
         {whisperMutation.error && <p className="mt-2 text-sm text-danger">{(whisperMutation.error as Error).message}</p>}
       </section>
 
+
       <section className="card p-5">
         <StageHeader
           name="translate"
           record={translate}
           busy={busyGemini}
-          cancelling={cancelMutation.isPending && cancelMutation.variables === 'translate'}
+          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'translate') || pendingCancel.translate}
           onCancel={() => cancelMutation.mutate('translate')}
         />
         <p className="mb-3 text-sm text-neutral-400">
@@ -368,7 +709,11 @@ export default function ProjectDetail() {
         <button
           type="button"
           className={primaryButtonClass}
-          disabled={transcribe.status !== 'done' || busyAny || geminiMutation.isPending}
+          disabled={
+            transcribe.status !== 'done' ||
+            busyAny ||
+            geminiMutation.isPending
+          }
           onClick={() => geminiMutation.mutate()}
         >
           {busyGemini ? 'Đang phân tích...' : translate.status === 'done' ? 'Chạy lại Gemini' : 'Chạy Gemini'}
@@ -381,7 +726,7 @@ export default function ProjectDetail() {
           name="tts"
           record={tts}
           busy={busyTTS}
-          cancelling={cancelMutation.isPending && cancelMutation.variables === 'tts'}
+          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'tts') || pendingCancel.tts}
           onCancel={() => cancelMutation.mutate('tts')}
         />
         <p className="mb-3 text-sm text-neutral-400">
@@ -473,27 +818,64 @@ export default function ProjectDetail() {
           </div>
         )}
       </section>
+      </>
+      )}
 
+      {!isSplit && (
       <section className="card p-5">
         <StageHeader
           name="assemble"
           record={assemble}
           busy={busyAssemble}
-          cancelling={cancelMutation.isPending && cancelMutation.variables === 'assemble'}
+          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'assemble') || pendingCancel.assemble}
           onCancel={() => cancelMutation.mutate('assemble')}
         />
         <p className="mb-3 text-sm text-neutral-400">
-          Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi
+          {isMulti
+            ? 'Tách nhạc nền từng tập + ráp TẤT CẢ các tập nối tiếp nhau thành 1 draft CapCut duy nhất, ghi'
+            : 'Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi'}{' '}
           thẳng vào thư mục CapCut thật:{' '}
           <span className="mono text-xs">{settingsQuery.data?.capcut_drafts_dir ?? '...'}</span>
         </p>
+        {isMulti && !allEpisodesTTSDone && (
+          <p className="mb-3 text-sm text-neutral-400">Cần mọi tập chạy xong TTS trước khi ráp draft chung.</p>
+        )}
         {assemble.progress && <p className="mb-2 text-sm text-neutral-300">{assemble.progress}</p>}
         {assemble.error && <p className="mb-2 text-sm text-danger">{assemble.error}</p>}
+        <label className="mb-3 block text-sm text-neutral-300">
+          Âm thanh gốc
+          <select
+            className={`${inputClass} max-w-sm`}
+            value={audioMode}
+            disabled={busyAny}
+            onChange={(e) => setAudioMode(e.target.value as AudioMode)}
+          >
+            <option value="separated">Tách nhạc nền/SFX bằng demucs (mặc định, khuyến nghị)</option>
+            <option value="original">Giữ nguyên âm thanh gốc (không tách, không tắt — có cả thoại gốc)</option>
+            <option value="mute">Tắt hoàn toàn âm thanh gốc (bỏ qua tách nhạc nền)</option>
+          </select>
+        </label>
+        <label className="mb-3 block text-sm text-neutral-300">
+          Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc TTS)
+          <select
+            className={`${inputClass} max-w-sm`}
+            value={minVideoSpeed}
+            disabled={busyAny}
+            onChange={(e) => setMinVideoSpeed(Number(e.target.value))}
+          >
+            {MIN_VIDEO_SPEED_OPTIONS.map((v) => (
+              <option key={v} value={v}>
+                Chậm tối đa {Math.round((1 - v) * 100)}% ({v.toFixed(2)}x)
+                {v === DEFAULT_MIN_VIDEO_SPEED ? ' — mặc định' : ''}
+              </option>
+            ))}
+          </select>
+        </label>
         <JobProgressBar job={assembleJob.data} />
         <button
           type="button"
           className={primaryButtonClass}
-          disabled={tts.status !== 'done' || busyAny || assembleMutation.isPending}
+          disabled={(isMulti ? !allEpisodesTTSDone : tts.status !== 'done') || busyAny || assembleMutation.isPending}
           onClick={() => assembleMutation.mutate()}
         >
           {busyAssemble ? 'Đang dựng...' : assemble.status === 'done' ? 'Dựng lại CapCut' : 'Dựng CapCut'}
@@ -505,6 +887,7 @@ export default function ProjectDetail() {
           </p>
         )}
       </section>
+      )}
 
       {(cues.length > 0 || data.sub_zh) && (
         <section className="card p-5">
@@ -682,6 +1065,16 @@ export default function ProjectDetail() {
           </ul>
         </section>
       )}
+
+      <ConfirmDialog
+        open={deletingEpisodeId !== null}
+        title="Xoá tập?"
+        message="Video, phụ đề và audio TTS của tập này sẽ bị xoá khỏi đĩa. Cần ráp lại draft CapCut sau khi xoá."
+        confirmLabel="Xoá"
+        danger
+        onCancel={() => setDeletingEpisodeId(null)}
+        onConfirm={() => deletingEpisodeId && deleteEpisodeMutation.mutate(deletingEpisodeId)}
+      />
     </div>
   )
 }

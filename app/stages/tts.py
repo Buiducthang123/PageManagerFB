@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -182,19 +181,23 @@ def _synthesize_cues(
     total = len(cues)
     results: dict[int, dict] = {}
     done_count = 0
-    progress_lock = threading.Lock()
 
     pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
     try:
         futures = {pool.submit(_synthesize_one, cue, voice, output_dir): cue for cue in cues}
-        for future in as_completed(futures):
-            cue = futures[future]
-            results[cue.id] = future.result()
+        pending = set(futures)
+        while pending:
+            # timeout ngắn để `on_progress` (và cancel_event nó check) được
+            # gọi đều đặn mỗi ~0.5s, KHÔNG chỉ khi có 1 câu vừa xong — nếu
+            # không, lúc API CapCut đang chậm/lỗi (retry backoff hàng chục
+            # giây mỗi câu), nút Dừng phải đợi rất lâu mới có tác dụng.
+            done_now, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done_now:
+                cue = futures[future]
+                results[cue.id] = future.result()
+                done_count += 1
             if on_progress:
-                with progress_lock:
-                    done_count += 1
-                    current = done_count
-                on_progress(current, total, f"câu {cue.id}/{total}")
+                on_progress(done_count, total, f"câu {done_count}/{total}")
     finally:
         # cancel_futures=True: nếu bị dừng giữa chừng (on_progress raise
         # JobCancelled), huỷ luôn các câu CHƯA chạy thay vì để executor tự
@@ -237,18 +240,19 @@ def retry_failed_segments(
 
     total = len(failed) or 1
     done_count = 0
-    progress_lock = threading.Lock()
     pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
     try:
         futures = {pool.submit(_redo, entry): entry for entry in failed}
-        for future in as_completed(futures):
-            entry = futures[future]
-            future.result()
+        pending = set(futures)
+        while pending:
+            # xem comment tương ứng trong `_synthesize_cues` — timeout ngắn để
+            # cancel_event được check đều đặn, không phải chỉ khi có 1 câu xong.
+            done_now, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done_now:
+                future.result()
+                done_count += 1
             if on_progress:
-                with progress_lock:
-                    done_count += 1
-                    current = done_count
-                on_progress(current, total, f"retry câu {entry['id']} ({current}/{len(failed)})")
+                on_progress(done_count, total, f"retry {done_count}/{len(failed)}")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 

@@ -1,14 +1,26 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .models import ProjectState
+from .models import Episode, ProjectState, ProjectType
+
+AudioMode = Literal["separated", "original", "mute"]
 
 
 class CreateProjectRequest(BaseModel):
     title: str
+    project_type: ProjectType = "single"
+
+
+class CreateEpisodeRequest(BaseModel):
+    title: str = ""
+    insert_after_episode_id: Optional[str] = None  # None = thêm vào cuối
+
+
+class ReorderEpisodesRequest(BaseModel):
+    episode_ids: list[str]  # thứ tự mới, đầy đủ mọi episode_id hiện có
 
 
 class RenameProjectRequest(BaseModel):
@@ -23,6 +35,12 @@ class UpdateAutoPipelineRequest(BaseModel):
     enabled: bool
     engine: str = "whisper"
     voice: str = ""
+    audio_mode: AudioMode = "separated"
+    min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
+
+
+class SplitProjectRequest(BaseModel):
+    split_points_s: list[float]  # N-1 mốc cắt (giây, tăng dần) cho N đoạn
 
 
 class StartTranscribeRequest(BaseModel):
@@ -42,11 +60,23 @@ class TTSCueRequest(BaseModel):
     voice: str = ""  # rỗng = dùng mặc định server-side
 
 
+class StartAssembleRequest(BaseModel):
+    # "separated" = tách nhạc nền/SFX khỏi thoại gốc bằng demucs (mặc định)
+    # "original" = giữ nguyên âm thanh gốc (thoại + nhạc nền), không tách, không tắt
+    # "mute" = tắt hẳn âm thanh gốc, bỏ qua bước tách
+    audio_mode: AudioMode = "separated"
+    # Tốc độ video tối thiểu khi cần chậm lại để nhường thêm thời gian cho
+    # giọng đọc TTS (0.7-1.0, mặc định 0.85 = chậm tối đa 15%) — xem
+    # MIN_VIDEO_SPEED trong app/stages/assemble.py.
+    min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
+
+
 class ProjectSummary(BaseModel):
     project_id: str
     title: str
     created_at: str
     current_stage: Optional[str]
+    project_type: ProjectType = "single"
 
 
 class SrtCue(BaseModel):
@@ -121,6 +151,16 @@ class LogEntry(BaseModel):
     message: str
 
 
+class EpisodeDetail(BaseModel):
+    episode: Episode
+    current_stage: Optional[str]
+    video_url: Optional[str] = None
+    cues: list[SrtCue] = []
+    sub_zh: Optional[str] = None
+    sub_vi: Optional[str] = None
+    tts_manifest: list[dict] = []
+
+
 class ProjectDetailResponse(BaseModel):
     project: ProjectState
     current_stage: Optional[str]
@@ -131,3 +171,4 @@ class ProjectDetailResponse(BaseModel):
     sub_vi: Optional[str] = None
     tts_manifest: list[dict] = []
     logs: list[LogEntry] = []
+    episodes: list[EpisodeDetail] = []

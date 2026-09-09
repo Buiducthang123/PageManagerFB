@@ -13,7 +13,7 @@ from typing import Iterator
 
 from dotenv import load_dotenv
 
-from .models import STAGE_ORDER, ProjectState, StageRecord
+from .models import EPISODE_STAGE_ORDER, STAGE_ORDER, Episode, ProjectState, StageRecord, StageStatus
 
 load_dotenv()
 
@@ -68,6 +68,16 @@ def project_json_path(project_id: str) -> Path:
     return project_dir(project_id) / "project.json"
 
 
+def episode_dir(project_id: str, episode_id: str) -> Path:
+    return project_dir(project_id) / "episodes" / episode_id
+
+
+def entity_dict_path(project_id: str) -> Path:
+    """Entity dict dùng chung cho mọi episode trong 1 dự án dài tập — tên
+    riêng được chốt ở tập trước phải áp dụng nhất quán cho các tập sau."""
+    return project_dir(project_id) / "entity_dict.json"
+
+
 def save_project(state: ProjectState) -> None:
     path = project_json_path(state.project_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +113,70 @@ def current_stage(state: ProjectState) -> str | None:
     return None
 
 
-def create_project(title: str) -> ProjectState:
+def episode_current_stage(episode: Episode) -> str | None:
+    for name in EPISODE_STAGE_ORDER:
+        rec = episode.stages.get(name) or StageRecord()
+        if rec.status != "done":
+            return name
+    return None
+
+
+def find_episode(state: ProjectState, episode_id: str) -> Episode:
+    for ep in state.episodes:
+        if ep.episode_id == episode_id:
+            return ep
+    raise FileNotFoundError(f'Không tìm thấy tập "{episode_id}"')
+
+
+def create_episode(state: ProjectState, title: str = "", insert_after_episode_id: str | None = None) -> Episode:
+    """Thêm 1 tập mới vào `state.episodes` (đã sort theo `order`). Mặc định
+    thêm vào cuối; truyền `insert_after_episode_id` để chèn ngay sau tập đó,
+    dồn `order` các tập phía sau lên — cho phép thêm tập giữa chừng sau khi
+    dự án đã chạy xong mà không đụng tới các tập khác."""
+    n = len(state.episodes)
+    episode_id = f"ep-{n + 1:03d}"
+    while any(ep.episode_id == episode_id for ep in state.episodes):
+        n += 1
+        episode_id = f"ep-{n + 1:03d}"
+
+    if insert_after_episode_id is None:
+        order = len(state.episodes)
+    else:
+        after = find_episode(state, insert_after_episode_id)
+        order = after.order + 1
+        for ep in state.episodes:
+            if ep.order >= order:
+                ep.order += 1
+
+    episode = Episode(
+        episode_id=episode_id,
+        order=order,
+        title=title.strip() or None,
+        created_at=datetime.now(),
+    )
+    state.episodes.append(episode)
+    state.episodes.sort(key=lambda e: e.order)
+    episode_dir(state.project_id, episode_id).mkdir(parents=True, exist_ok=True)
+    return episode
+
+
+def reset_episode_from(episode: Episode, stage: str) -> None:
+    idx = EPISODE_STAGE_ORDER.index(stage)
+    for name in EPISODE_STAGE_ORDER[idx:]:
+        episode.stages[name] = StageRecord()
+    if stage == "ingest":
+        episode.original_filename = None
+        episode.video_relpath = None
+        episode.duration_sec = None
+
+
+def all_episodes_stage_done(state: ProjectState, stage: str) -> bool:
+    if not state.episodes:
+        return False
+    return all((ep.stages.get(stage) or StageRecord()).status == "done" for ep in state.episodes)
+
+
+def create_project(title: str, project_type: str = "single") -> ProjectState:
     _ensure_workspace()
     title = title.strip()
     if not title:
@@ -114,7 +187,7 @@ def create_project(title: str) -> ProjectState:
     if base.exists():
         raise ValueError(f'Dự án "{project_id}" đã tồn tại')
     (base / "logs").mkdir(parents=True, exist_ok=True)
-    state = ProjectState(project_id=project_id, title=title, created_at=datetime.now())
+    state = ProjectState(project_id=project_id, title=title, created_at=datetime.now(), project_type=project_type)
     save_project(state)
     index = _load_index()
     index["projects"].insert(

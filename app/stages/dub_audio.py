@@ -34,6 +34,25 @@ def _extract_wav(video_path: Path, out_wav: Path) -> None:
         raise DubAudioError(f"ffmpeg trích audio gốc lỗi: {result.stderr[-500:]}")
 
 
+def extract_original_audio(
+    video_path: Path,
+    output_path: Path,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+) -> Path:
+    """Trích NGUYÊN audio gốc (thoại + nhạc nền, KHÔNG tách bằng demucs) — dùng
+    khi người dùng chọn "giữ nguyên âm thanh gốc" thay vì tách nhạc nền hoặc
+    tắt hẳn. Chỉ chạy ffmpeg nên nhanh hơn nhiều so với `extract_background`
+    (không cần model demucs)."""
+    if not video_path.exists():
+        raise DubAudioError(f"Không thấy video: {video_path}")
+    if on_progress:
+        on_progress(0, 1, "trích audio gốc (giữ nguyên)")
+    _extract_wav(video_path, output_path)
+    if on_progress:
+        on_progress(1, 1, "xong")
+    return output_path
+
+
 def extract_background(
     video_path: Path,
     output_path: Path,
@@ -109,6 +128,16 @@ def extract_background(
 
     if proc.returncode != 0 or not output_path.exists():
         detail = (stderr or stdout or "").strip()[-1000:]
+        # 0xC0000005 (ACCESS_VIOLATION, hiển thị dạng unsigned 3221225477 hoặc
+        # signed -1073741819 tùy chỗ in) — đã gặp thật với video dài (~22 phút)
+        # trên máy RAM thấp: Demucs giữ tensor output cả bài trong RAM (vài GB
+        # cho video dài), hết bộ nhớ giữa chừng crash native thay vì báo lỗi
+        # gọn gàng. Gợi ý rõ để không phải đoán lại mỗi lần gặp.
+        if proc.returncode in (3221225477, -1073741819):
+            detail = (
+                "Có vẻ do hết RAM (access violation, thường gặp với video dài trên máy ít RAM trống) — "
+                f"thử đóng bớt app khác (trình duyệt, CapCut...) rồi bấm chạy lại. Chi tiết: {detail}"
+            )
         raise DubAudioError(f"Demucs lỗi (subprocess exit={proc.returncode}): {detail}")
 
     if on_progress:

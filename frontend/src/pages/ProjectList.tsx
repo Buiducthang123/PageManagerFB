@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, STAGE_LABELS, type ProjectSummary } from '../lib/api'
+import { api, STAGE_LABELS, type ProjectSummary, type ProjectType } from '../lib/api'
 import { inputClass, primaryButtonClass } from '../lib/ui'
 import ConfirmDialog from '../components/ConfirmDialog'
 
@@ -21,12 +21,13 @@ export default function ProjectList() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const [title, setTitle] = useState('')
+  const [projectType, setProjectType] = useState<ProjectType>('single')
   const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.listProjects })
 
   const createMutation = useMutation({
-    mutationFn: (t: string) => api.createProject(t),
+    mutationFn: ({ t, type }: { t: string; type: ProjectType }) => api.createProject(t, type),
     onSuccess: (p) => {
       setTitle('')
       queryClient.invalidateQueries({ queryKey: ['projects'] })
@@ -50,21 +51,43 @@ export default function ProjectList() {
       <p className="mb-6 text-sm text-neutral-400">Upload video tiếng Trung → Whisper → Gemini dịch tiếng Việt.</p>
 
       <form
-        className="mb-8 flex flex-wrap gap-2"
+        className="mb-8 flex flex-col gap-3"
         onSubmit={(e) => {
           e.preventDefault()
-          if (title.trim()) createMutation.mutate(title.trim())
+          if (title.trim()) createMutation.mutate({ t: title.trim(), type: projectType })
         }}
       >
-        <input
-          className={`${inputClass} mt-0 max-w-md flex-1`}
-          placeholder="Tên dự án mới..."
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <button type="submit" disabled={!title.trim() || createMutation.isPending} className={primaryButtonClass}>
-          {createMutation.isPending ? 'Đang tạo...' : 'Tạo dự án'}
-        </button>
+        <div className="flex gap-4 text-sm text-neutral-300">
+          <label className="flex items-center gap-1.5">
+            <input
+              type="radio"
+              name="project-type"
+              checked={projectType === 'single'}
+              onChange={() => setProjectType('single')}
+            />
+            Dự án đơn (1 video)
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="radio"
+              name="project-type"
+              checked={projectType === 'multi'}
+              onChange={() => setProjectType('multi')}
+            />
+            Dự án dài tập (nhiều video/link)
+          </label>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <input
+            className={`${inputClass} mt-0 max-w-md flex-1`}
+            placeholder="Tên dự án mới..."
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+          <button type="submit" disabled={!title.trim() || createMutation.isPending} className={primaryButtonClass}>
+            {createMutation.isPending ? 'Đang tạo...' : 'Tạo dự án'}
+          </button>
+        </div>
       </form>
       {createMutation.error && <p className="mb-4 text-sm text-danger">{(createMutation.error as Error).message}</p>}
 
@@ -92,6 +115,11 @@ export default function ProjectList() {
                   <Link to={`/projects/${p.project_id}`} className="font-medium">
                     {p.title}
                   </Link>
+                  {p.project_type === 'multi' && (
+                    <span className="ml-2 rounded-md bg-accent-800 px-1.5 py-0.5 font-mono text-[10px] text-accent-100">
+                      dài tập
+                    </span>
+                  )}
                   <div className="font-mono text-[11px] text-neutral-500">{p.project_id}</div>
                 </td>
                 <td className="text-sm text-neutral-300">
