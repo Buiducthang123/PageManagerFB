@@ -276,6 +276,10 @@ def assemble_project(
     cursor_us = 0
     drift_us = 0
     speedup_count = 0
+    # Mốc THẬT SỰ mà giọng đọc từng câu chiếm trên timeline — phụ đề phải
+    # khớp đúng khoảng này, không phải khung [start,end] gốc của cue (xem
+    # comment ở khối "Phụ đề" bên dưới để biết lý do).
+    voice_placement: dict[int, tuple[int, int]] = {}
     for i, item in enumerate(tts_order):
         start_us = max(item["start_us"], cursor_us)
         if start_us > item["start_us"]:
@@ -297,6 +301,7 @@ def assemble_project(
             seg = cc.AudioSegment(item["material"], cc.Timerange(start_us, item["tts_dur_us"]))
         script.add_segment(seg, track_name=VOICE_TRACK)
         cursor_us = start_us + seg.target_timerange.duration
+        voice_placement[item["entry"]["id"]] = (start_us, cursor_us)
 
     for entry in manifest:
         step(f"voice câu {entry['id']}")
@@ -315,8 +320,12 @@ def assemble_project(
             drift_us / SEC,
         )
 
-    # --- Phụ đề — mốc thời gian cũng quy đổi qua map_time() để khớp với
-    # video đã bị giãn ở những đoạn cần bù giờ.
+    # --- Phụ đề — LẤY ĐÚNG mốc giọng đọc thật đã đặt ở voice_placement (Bước
+    # 3 ở trên), không tự tính lại từ [cue.start, cue.end] gốc — 2 khung này
+    # thường KHÔNG khớp nhau (câu tiếng Việt đọc nhanh/chậm hơn khung gốc của
+    # câu tiếng Trung), gây hiện tượng giọng đọc xong rồi mà phụ đề vẫn còn
+    # hiện trên CapCut (hoặc ngược lại, phụ đề tắt trước khi đọc xong). Cue
+    # không có audio (lỗi/rỗng) mới fallback về map_time(cue.start/end) như cũ.
     # sub_vi.srt đôi khi có 2 cue chồng vài trăm mili-giây ở ranh giới 2 khối
     # Whisper kề nhau (dedup ở transcribe.py chỉ bắt trùng lặp lớn >50%, không
     # bắt chồng biên nhỏ) — pycapcut báo lỗi cứng SegmentOverlap nếu chồng,
@@ -327,8 +336,14 @@ def assemble_project(
     for cue in vi_cues:
         text = (cue.text or "").strip()
         if text:
-            start_us = max(map_time(sec_to_us(parse_ts(cue.start))), text_cursor_us)
-            end_us = map_time(sec_to_us(parse_ts(cue.end)))
+            placement = voice_placement.get(cue.id)
+            if placement is not None:
+                raw_start_us, raw_end_us = placement
+            else:
+                raw_start_us = map_time(sec_to_us(parse_ts(cue.start)))
+                raw_end_us = map_time(sec_to_us(parse_ts(cue.end)))
+            start_us = max(raw_start_us, text_cursor_us)
+            end_us = max(raw_end_us, start_us)
             dur_us = max(end_us - start_us, 1)
             clip = cc.ClipSettings(transform_y=_SUBTITLE_TRANSFORM_Y)
             seg = cc.TextSegment(text, cc.Timerange(start_us, dur_us), style=style, clip_settings=clip, border=border)
@@ -539,6 +554,9 @@ def assemble_multi(
         cursor_us = episode_offset_us
         drift_us = 0
         speedup_count = 0
+        # Mốc THẬT SỰ giọng đọc từng câu chiếm — xem comment tương ứng trong
+        # assemble_project(). Reset mỗi tập vì cue.id đánh số lại từ đầu.
+        voice_placement: dict[int, tuple[int, int]] = {}
         for i, item in enumerate(tts_order):
             start_us = max(item["start_us"], cursor_us)
             if start_us > item["start_us"]:
@@ -560,6 +578,7 @@ def assemble_multi(
                 seg = cc.AudioSegment(item["material"], cc.Timerange(start_us, item["tts_dur_us"]))
             script.add_segment(seg, track_name=VOICE_TRACK)
             cursor_us = start_us + seg.target_timerange.duration
+            voice_placement[item["entry"]["id"]] = (start_us, cursor_us)
 
         for entry in src.manifest:
             step(f"voice câu {entry['id']} (tập {ep_index + 1})")
@@ -579,8 +598,14 @@ def assemble_multi(
         for cue in src.vi_cues:
             text = (cue.text or "").strip()
             if text:
-                start_us = max(episode_offset_us + map_time(sec_to_us(parse_ts(cue.start))), text_cursor_us)
-                end_us = episode_offset_us + map_time(sec_to_us(parse_ts(cue.end)))
+                placement = voice_placement.get(cue.id)
+                if placement is not None:
+                    raw_start_us, raw_end_us = placement
+                else:
+                    raw_start_us = episode_offset_us + map_time(sec_to_us(parse_ts(cue.start)))
+                    raw_end_us = episode_offset_us + map_time(sec_to_us(parse_ts(cue.end)))
+                start_us = max(raw_start_us, text_cursor_us)
+                end_us = max(raw_end_us, start_us)
                 dur_us = max(end_us - start_us, 1)
                 clip = cc.ClipSettings(transform_y=_SUBTITLE_TRANSFORM_Y)
                 seg = cc.TextSegment(text, cc.Timerange(start_us, dur_us), style=style, clip_settings=clip, border=border)

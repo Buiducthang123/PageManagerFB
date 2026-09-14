@@ -23,3 +23,7 @@ demucs
 
 # Ráp draft CapCut — pip name "pycapcut" (github.com/GuanYixuan/pycapcut)
 pycapcut
+
+# TTS tiếng Việt local (thay thế/bổ sung cho CapCut TTS) — chạy CPU mặc định
+# (VIENEU_DEVICE=cpu), model tự tải lần đầu qua HuggingFace Hub
+vieneu

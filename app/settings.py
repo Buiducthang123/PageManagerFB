@@ -8,6 +8,7 @@ from dotenv import set_key, unset_key
 from . import config, projects as pj
 from .schemas import AppSettingsResponse, ModelOption
 from .stages import tts as tts_stage
+from .stages import tts_vieneu as tts_vieneu_stage
 
 GEMINI_MODELS = [
     ModelOption(id="gemini-3.5-flash-lite", label="3.5 Flash Lite (mặc định — rẻ, quota free cao)"),
@@ -35,6 +36,12 @@ WHISPER_LANGUAGES = [
     ModelOption(id="auto", label="Tự động nhận diện"),
 ]
 
+TRANSLATE_PACES = [
+    ModelOption(id="natural", label="Đọc tự nhiên (15.5 CPS) — có thể cắt bớt ý ở câu quá dồn"),
+    ModelOption(id="balanced", label="Cân bằng (18 CPS)"),
+    ModelOption(id="full_meaning", label="Đủ ý hơn (20-22 CPS, mặc định) — chấp nhận đọc nhanh/trôi timing nhẹ"),
+]
+
 
 def _with_current(options: list[ModelOption], current: str) -> list[ModelOption]:
     current = (current or "").strip()
@@ -57,6 +64,7 @@ def get_settings() -> AppSettingsResponse:
     gemini_model = config.resolve_gemini_model()
     whisper_model = (os.environ.get("WHISPER_MODEL") or config.WHISPER_MODEL).strip()
     whisper_language = (os.environ.get("WHISPER_LANGUAGE") or config.WHISPER_LANGUAGE).strip()
+    translate_pace = (os.environ.get("TRANSLATE_PACE") or config.TRANSLATE_PACE).strip()
     return AppSettingsResponse(
         workspace_dir=str(pj.WORKSPACE_DIR),
         gemini_api_key_masked=_mask(os.environ.get("GEMINI_API_KEY", "")),
@@ -64,10 +72,13 @@ def get_settings() -> AppSettingsResponse:
         whisper_model=whisper_model,
         whisper_device=os.environ.get("WHISPER_DEVICE", config.WHISPER_DEVICE),
         whisper_language=whisper_language,
+        translate_pace=translate_pace,
         gemini_models=_with_current(GEMINI_MODELS, gemini_model),
         whisper_models=_with_current(WHISPER_MODELS, whisper_model),
         whisper_languages=_with_current(WHISPER_LANGUAGES, whisper_language),
+        translate_paces=TRANSLATE_PACES,
         tts_voices=[ModelOption(id=v["id"], label=v["label"]) for v in tts_stage.VOICES],
+        tts_voices_vieneu=[ModelOption(id=v["id"], label=v["label"]) for v in tts_vieneu_stage.VOICES],
         whisper_cache_dir=str(config.whisper_cache_dir()),
         capcut_drafts_dir=str(config.capcut_drafts_dir()),
     )
@@ -94,6 +105,7 @@ def update_settings(
     whisper_model: Optional[str] = None,
     whisper_device: Optional[str] = None,
     whisper_language: Optional[str] = None,
+    translate_pace: Optional[str] = None,
 ) -> AppSettingsResponse:
     _set_var("WORKSPACE_DIR", workspace_dir, empty_clears=True)
     if gemini_api_key:
@@ -102,4 +114,7 @@ def update_settings(
     _set_var("WHISPER_MODEL", whisper_model, empty_clears=False)
     _set_var("WHISPER_DEVICE", whisper_device, empty_clears=False)
     _set_var("WHISPER_LANGUAGE", whisper_language, empty_clears=False)
+    if translate_pace and translate_pace not in config.TRANSLATE_PACE_PROFILES:
+        raise ValueError(f'Mức độ dịch "{translate_pace}" không hợp lệ')
+    _set_var("TRANSLATE_PACE", translate_pace, empty_clears=False)
     return get_settings()

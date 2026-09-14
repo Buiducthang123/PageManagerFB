@@ -34,6 +34,7 @@ class IngestUrlRequest(BaseModel):
 class UpdateAutoPipelineRequest(BaseModel):
     enabled: bool
     engine: str = "whisper"
+    tts_engine: str = "capcut"  # "capcut" | "vieneu"
     voice: str = ""
     audio_mode: AudioMode = "separated"
     min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
@@ -49,6 +50,7 @@ class StartTranscribeRequest(BaseModel):
 
 class StartTTSRequest(BaseModel):
     voice: str = ""  # rỗng = dùng mặc định server-side
+    engine: str = "capcut"  # "capcut" | "vieneu" — bỏ qua khi retry_failed_only=True
     retry_failed_only: bool = False  # True = chỉ tạo lại câu lỗi/rỗng lần trước
 
 
@@ -118,10 +120,13 @@ class AppSettingsResponse(BaseModel):
     whisper_model: str = ""
     whisper_device: str = ""
     whisper_language: str = ""
+    translate_pace: str = ""
     gemini_models: list[ModelOption] = []
     whisper_models: list[ModelOption] = []
     whisper_languages: list[ModelOption] = []
+    translate_paces: list[ModelOption] = []
     tts_voices: list[ModelOption] = []
+    tts_voices_vieneu: list[ModelOption] = []
     whisper_cache_dir: str = ""
     capcut_drafts_dir: str = ""
 
@@ -133,6 +138,7 @@ class UpdateAppSettingsRequest(BaseModel):
     whisper_model: Optional[str] = None
     whisper_device: Optional[str] = None
     whisper_language: Optional[str] = None
+    translate_pace: Optional[str] = None
 
 
 class TTSManifestEntryResponse(BaseModel):

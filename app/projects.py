@@ -28,6 +28,13 @@ INDEX_PATH = WORKSPACE_DIR / "index.json"
 _project_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
+# index.json dùng CHUNG cho mọi dự án (không như project.json — mỗi dự án 1
+# file, khoá riêng qua _lock_for) — đọc-sửa-ghi không khoá từng bị race khi
+# xoá nhiều dự án CÙNG LÚC (vd. tính năng chọn nhiều để xoá ở frontend gọi
+# song song nhiều request delete): 2 request cùng đọc file, cùng ghi đè,
+# từng làm index.json hỏng (JSON không hợp lệ, dữ liệu cũ+mới lẫn vào nhau).
+_index_lock = threading.Lock()
+
 
 def _lock_for(project_id: str) -> threading.Lock:
     with _locks_guard:
@@ -58,6 +65,14 @@ def _load_index() -> dict:
 
 def _save_index(index: dict) -> None:
     INDEX_PATH.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+@contextmanager
+def _locked_index() -> Iterator[dict]:
+    with _index_lock:
+        index = _load_index()
+        yield index
+        _save_index(index)
 
 
 def project_dir(project_id: str) -> Path:
@@ -189,24 +204,22 @@ def create_project(title: str, project_type: str = "single") -> ProjectState:
     (base / "logs").mkdir(parents=True, exist_ok=True)
     state = ProjectState(project_id=project_id, title=title, created_at=datetime.now(), project_type=project_type)
     save_project(state)
-    index = _load_index()
-    index["projects"].insert(
-        0,
-        {"project_id": project_id, "title": title, "created_at": state.created_at.isoformat()},
-    )
-    _save_index(index)
+    with _locked_index() as index:
+        index["projects"].insert(
+            0,
+            {"project_id": project_id, "title": title, "created_at": state.created_at.isoformat()},
+        )
     return state
 
 
 def rename_project(project_id: str, title: str) -> ProjectState:
     with locked_project(project_id) as state:
         state.title = title
-    index = _load_index()
-    for item in index["projects"]:
-        if item["project_id"] == project_id:
-            item["title"] = title
-            break
-    _save_index(index)
+    with _locked_index() as index:
+        for item in index["projects"]:
+            if item["project_id"] == project_id:
+                item["title"] = title
+                break
     return load_project(project_id)
 
 
@@ -215,9 +228,8 @@ def delete_project(project_id: str) -> None:
     if not base.exists():
         raise FileNotFoundError(f'Không tìm thấy dự án "{project_id}"')
     shutil.rmtree(base)
-    index = _load_index()
-    index["projects"] = [p for p in index["projects"] if p["project_id"] != project_id]
-    _save_index(index)
+    with _locked_index() as index:
+        index["projects"] = [p for p in index["projects"] if p["project_id"] != project_id]
 
 
 def list_projects() -> list[ProjectState]:

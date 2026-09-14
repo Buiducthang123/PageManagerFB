@@ -7,12 +7,12 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from . import jobs, projects as pj, settings as app_settings
+from . import jobs, merges as mg, projects as pj, settings as app_settings
 from .models import Episode, StageRecord, StageStatus
 from .schemas import (
     AppSettingsResponse,
@@ -46,6 +46,8 @@ from .stages import transcribe as transcribe_stage
 from .stages import transcribe_sensevoice as sensevoice_stage
 from .stages import translate as translate_stage
 from .stages import tts as tts_stage
+from .stages import tts_vieneu as tts_vieneu_stage
+from .stages import video_merge as video_merge_stage
 from .stages import video_split as video_split_stage
 from .utils.srt import load_srt, update_cue_text
 
@@ -64,6 +66,18 @@ def _summary(state) -> ProjectSummary:
         current_stage=pj.current_stage(state),
         project_type=state.project_type,
     )
+
+
+def _tts_module(engine: str):
+    return tts_vieneu_stage if engine == "vieneu" else tts_stage
+
+
+def _tts_voices(engine: str) -> list[dict[str, str]]:
+    return tts_vieneu_stage.VOICES if engine == "vieneu" else tts_stage.VOICES
+
+
+def _tts_engine_label(engine: str) -> str:
+    return "VieNeu-TTS" if engine == "vieneu" else "CapCut TTS"
 
 
 def _require_done(state, stage: str, message: str) -> None:
@@ -124,7 +138,7 @@ def _maybe_chain(project_id: str, finished_stage: str) -> None:
     elif finished_stage == "transcribe":
         _start_translate(project_id)
     elif finished_stage == "translate":
-        _start_tts(project_id, state.auto_voice)
+        _start_tts(project_id, state.auto_voice, engine=state.auto_tts_engine)
     elif finished_stage == "tts":
         _start_assemble(project_id, audio_mode=state.auto_audio_mode, min_video_speed=state.auto_min_video_speed)
 
@@ -146,7 +160,7 @@ def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) 
     elif finished_stage == "transcribe":
         _start_episode_translate(project_id, episode_id)
     elif finished_stage == "translate":
-        _start_episode_tts(project_id, episode_id, state.auto_voice)
+        _start_episode_tts(project_id, episode_id, state.auto_voice, engine=state.auto_tts_engine)
     elif finished_stage == "tts":
         if state.split_mode:
             # Dự án "split": mỗi đoạn tự ráp draft RIÊNG ngay khi xong TTS,
@@ -159,10 +173,18 @@ def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) 
     elif finished_stage == "assemble" and state.split_mode:
         # Đoạn này ráp draft xong — chỉ giờ mới bắt đầu đoạn KẾ TIẾP (tuần tự,
         # không chạy song song như các tập của dự án "multi").
+        #
+        # Chỉ tự chạy tập kế tiếp nếu nó THẬT SỰ chưa từng đụng tới
+        # (transcribe còn "pending") — nếu không, chạy lại 1 tập bất kỳ ở
+        # giữa chuỗi (vd sửa lỗi, dịch lại) sẽ khiến tập SAU nó (dù đã xong
+        # từ trước) bị tự động kích hoạt chạy lại theo, chồng lấn job với các
+        # tập khác đang chạy — đã xác nhận trực tiếp qua log thật: chạy lại
+        # ep-001 xong assemble → ep-002 (đã xong từ hôm trước) tự transcribe
+        # lại, trùng lúc ep-003/ep-006 cũng đang chạy.
         episodes = sorted(state.episodes, key=lambda e: e.order)
         current = pj.find_episode(state, episode_id)
         next_ep = next((e for e in episodes if e.order == current.order + 1), None)
-        if next_ep is not None:
+        if next_ep is not None and next_ep.stages["transcribe"].status == StageStatus.pending:
             _start_episode_transcribe(project_id, next_ep.episode_id, state.auto_engine)
 
 
@@ -176,14 +198,18 @@ def get_settings_route():
 
 @app.put("/api/settings", response_model=AppSettingsResponse)
 def update_settings_route(body: UpdateAppSettingsRequest):
-    return app_settings.update_settings(
-        workspace_dir=body.workspace_dir,
-        gemini_api_key=body.gemini_api_key,
-        gemini_model=body.gemini_model,
-        whisper_model=body.whisper_model,
-        whisper_device=body.whisper_device,
-        whisper_language=body.whisper_language,
-    )
+    try:
+        return app_settings.update_settings(
+            workspace_dir=body.workspace_dir,
+            gemini_api_key=body.gemini_api_key,
+            gemini_model=body.gemini_model,
+            whisper_model=body.whisper_model,
+            whisper_device=body.whisper_device,
+            whisper_language=body.whisper_language,
+            translate_pace=body.translate_pace,
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
 
 
 # ------------------------------------------------------------------ Projects
@@ -217,11 +243,13 @@ def rename_project_route(project_id: str, body: RenameProjectRequest):
 @app.patch("/api/projects/{project_id}/auto-pipeline", response_model=ProjectSummary)
 def update_auto_pipeline_route(project_id: str, body: UpdateAutoPipelineRequest):
     engine = "sensevoice" if body.engine == "sensevoice" else "whisper"
+    tts_engine = "vieneu" if body.tts_engine == "vieneu" else "capcut"
     audio_mode = body.audio_mode if body.audio_mode in ("separated", "original", "mute") else "separated"
     with pj.locked_project(project_id) as state:
         state.auto_pipeline = body.enabled
         state.auto_engine = engine
-        state.auto_voice = body.voice if body.voice in {v["id"] for v in tts_stage.VOICES} else ""
+        state.auto_tts_engine = tts_engine
+        state.auto_voice = body.voice if body.voice in {v["id"] for v in _tts_voices(tts_engine)} else ""
         state.auto_audio_mode = audio_mode
         state.auto_min_video_speed = body.min_video_speed
     return _summary(state)
@@ -394,8 +422,13 @@ def split_project_route(project_id: str, body: SplitProjectRequest):
     if state.split_mode:
         raise HTTPException(status_code=409, detail="Dự án này đã được chia đoạn rồi")
     _require_done(state, "ingest", "Chưa upload video")
-    if state.stages["transcribe"].status != StageStatus.pending:
-        raise HTTPException(status_code=409, detail="Đã chạy Whisper trên video gốc — không thể chia đoạn nữa")
+    # Chỉ chặn khi Whisper THẬT SỰ đang chạy (tránh race) — "pending"/"failed"/
+    # "done" đều cho chia được: 1 khi bật split_mode, các stage cấp PROJECT
+    # (transcribe/translate/tts/assemble) không còn ai đọc tới nữa (chỉ
+    # episodes mới có ý nghĩa — xem comment ProjectState.split_mode), nên kết
+    # quả Whisper cũ (nếu có) chỉ nằm im vô hại trên đĩa, không cần chặn.
+    if jobs.is_job_running(f"{project_id}:transcribe"):
+        raise HTTPException(status_code=409, detail="Whisper đang chạy cho video gốc — đợi xong hoặc bấm Dừng trước")
     if not state.video_relpath or not state.duration_sec:
         raise HTTPException(status_code=409, detail="Chưa có video/độ dài video")
 
@@ -727,12 +760,17 @@ def start_episode_translate_route(project_id: str, episode_id: str):
     return {"status": "started"}
 
 
-def _start_episode_tts(project_id: str, episode_id: str, voice: str, retry_only: bool = False) -> jobs.JobState | None:
+def _start_episode_tts(
+    project_id: str, episode_id: str, voice: str, retry_only: bool = False, engine: str = "capcut"
+) -> jobs.JobState | None:
     root = pj.episode_dir(project_id, episode_id)
+    mod = _tts_module(engine)
+    voices = _tts_voices(engine)
+    engine_label = _tts_engine_label(engine)
 
-    if voice not in {v["id"] for v in tts_stage.VOICES}:
-        voice = tts_stage.DEFAULT_VOICE
-    voice_label = next((v["label"] for v in tts_stage.VOICES if v["id"] == voice), voice)
+    if voice not in {v["id"] for v in voices}:
+        voice = mod.DEFAULT_VOICE
+    voice_label = next((v["label"] for v in voices if v["id"] == voice), voice)
 
     if retry_only:
         manifest_path = root / "audio" / "manifest.json"
@@ -744,7 +782,7 @@ def _start_episode_tts(project_id: str, episode_id: str, voice: str, retry_only:
         n = len(load_srt(root / "sub_vi.srt")) or 1
 
     def target(job: jobs.JobState) -> None:
-        label = f"Thử lại câu lỗi · {voice_label}" if retry_only else f"CapCut TTS · {voice_label}"
+        label = f"Thử lại câu lỗi · {voice_label}" if retry_only else f"{engine_label} · {voice_label}"
         job.items = [jobs.JobItem(id="tts", label=label)]
         job.items[0].status = "running"
         job.current_label = voice_label
@@ -762,13 +800,13 @@ def _start_episode_tts(project_id: str, episode_id: str, voice: str, retry_only:
 
         try:
             if retry_only:
-                _, manifest = tts_stage.retry_failed_segments(root, voice=voice, on_progress=on_progress)
+                _, manifest = mod.retry_failed_segments(root, voice=voice, on_progress=on_progress)
             else:
-                _, manifest = tts_stage.tts_project(root, voice=voice, on_progress=on_progress)
+                _, manifest = mod.tts_project(root, voice=voice, on_progress=on_progress)
         except jobs.JobCancelled:
             _mark_cancelled_episode(project_id, episode_id, "tts", job)
             return
-        except tts_stage.TTSError as err:
+        except mod.TTSError as err:
             job.items[0].status = "failed"
             job.status = "failed"
             job.error = str(err)
@@ -801,9 +839,11 @@ def _start_episode_tts(project_id: str, episode_id: str, voice: str, retry_only:
             ep.stages["tts"].status = StageStatus.done
             ep.stages["tts"].output = "audio/manifest.json"
             ep.stages["tts"].progress = f"{ok}/{len(manifest)} câu · {voice_label}" + (f" · {failed} lỗi" if failed else "")
+            ep.stages["tts"].engine = engine
             ep.stages["tts"].error = None
             ep.stages["tts"].at = datetime.now()
             s.auto_voice = voice  # nhớ giọng vừa dùng — mặc định cho tập kế tiếp / lần sau
+            s.auto_tts_engine = engine
         pj.append_log(project_id, "tts", f"[{episode_id}] {ok}/{len(manifest)} câu · {voice_label}")
         _maybe_chain_episode(project_id, episode_id, "tts")
 
@@ -817,11 +857,12 @@ def start_episode_tts_route(project_id: str, episode_id: str, body: StartTTSRequ
     _require_episode_done(episode, "translate", "Chưa có bản dịch tiếng Việt — chạy Gemini trước")
     voice = body.voice if body and body.voice else ""
     retry_only = bool(body and body.retry_failed_only)
+    engine = (episode.stages["tts"].engine or "capcut") if retry_only else ("vieneu" if body and body.engine == "vieneu" else "capcut")
     if retry_only:
         manifest_path = pj.episode_dir(project_id, episode_id) / "audio" / "manifest.json"
         if not manifest_path.exists():
             raise HTTPException(status_code=409, detail="Chưa chạy TTS lần nào")
-    job = _start_episode_tts(project_id, episode_id, voice, retry_only=retry_only)
+    job = _start_episode_tts(project_id, episode_id, voice, retry_only=retry_only, engine=engine)
     if job is None:
         raise HTTPException(status_code=409, detail="TTS đang chạy cho tập này")
     return {"status": "started"}
@@ -1031,11 +1072,14 @@ def tts_episode_cue_route(project_id: str, episode_id: str, cue_id: int, body: T
         raise HTTPException(status_code=409, detail="Đang có job chạy — đợi xong đã")
     root = pj.episode_dir(project_id, episode_id)
     voice = body.voice if body and body.voice else ""
-    if voice not in {v["id"] for v in tts_stage.VOICES}:
-        voice = tts_stage.DEFAULT_VOICE
+    engine = episode.stages["tts"].engine or "capcut"
+    mod = _tts_module(engine)
+    voices = _tts_voices(engine)
+    if voice not in {v["id"] for v in voices}:
+        voice = mod.DEFAULT_VOICE
     try:
-        entry = tts_stage.tts_single_segment(root, cue_id, voice=voice)
-    except tts_stage.TTSError as err:
+        entry = mod.tts_single_segment(root, cue_id, voice=voice)
+    except mod.TTSError as err:
         raise HTTPException(status_code=502, detail=str(err)) from err
     pj.append_log(project_id, "tts", f"[{episode_id}] Đọc lại câu #{cue_id}")
     return TTSManifestEntryResponse(**entry)
@@ -1402,32 +1446,41 @@ def tts_cue_route(project_id: str, cue_id: int, body: TTSCueRequest | None = Non
     _reject_if_busy(project_id)
     root = pj.project_dir(project_id)
     voice = body.voice if body and body.voice else ""
-    if voice not in {v["id"] for v in tts_stage.VOICES}:
-        voice = tts_stage.DEFAULT_VOICE
+    engine = state.stages["tts"].engine or "capcut"
+    mod = _tts_module(engine)
+    voices = _tts_voices(engine)
+    if voice not in {v["id"] for v in voices}:
+        voice = mod.DEFAULT_VOICE
     try:
-        entry = tts_stage.tts_single_segment(root, cue_id, voice=voice)
-    except tts_stage.TTSError as err:
+        entry = mod.tts_single_segment(root, cue_id, voice=voice)
+    except mod.TTSError as err:
         raise HTTPException(status_code=502, detail=str(err)) from err
     pj.append_log(project_id, "tts", f"Đọc lại câu #{cue_id}")
     return TTSManifestEntryResponse(**entry)
 
 
 @app.get("/api/tts/preview")
-def tts_preview(voice: str = ""):
-    voice = voice if voice in {v["id"] for v in tts_stage.VOICES} else tts_stage.DEFAULT_VOICE
+def tts_preview(voice: str = "", engine: str = "capcut"):
+    engine = "vieneu" if engine == "vieneu" else "capcut"
+    mod = _tts_module(engine)
+    voices = _tts_voices(engine)
+    voice = voice if voice in {v["id"] for v in voices} else mod.DEFAULT_VOICE
     try:
-        audio_bytes = tts_stage.preview_voice(voice)
-    except tts_stage.TTSError as err:
+        audio_bytes = mod.preview_voice(voice)
+    except mod.TTSError as err:
         raise HTTPException(status_code=502, detail=str(err)) from err
     return Response(content=audio_bytes, media_type="audio/mpeg")
 
 
-def _start_tts(project_id: str, voice: str, retry_only: bool = False) -> jobs.JobState | None:
+def _start_tts(project_id: str, voice: str, retry_only: bool = False, engine: str = "capcut") -> jobs.JobState | None:
     root = pj.project_dir(project_id)
+    mod = _tts_module(engine)
+    voices = _tts_voices(engine)
+    engine_label = _tts_engine_label(engine)
 
-    if voice not in {v["id"] for v in tts_stage.VOICES}:
-        voice = tts_stage.DEFAULT_VOICE
-    voice_label = next((v["label"] for v in tts_stage.VOICES if v["id"] == voice), voice)
+    if voice not in {v["id"] for v in voices}:
+        voice = mod.DEFAULT_VOICE
+    voice_label = next((v["label"] for v in voices if v["id"] == voice), voice)
 
     if retry_only:
         manifest_path = root / "audio" / "manifest.json"
@@ -1439,7 +1492,7 @@ def _start_tts(project_id: str, voice: str, retry_only: bool = False) -> jobs.Jo
         n = len(load_srt(root / "sub_vi.srt")) or 1
 
     def target(job: jobs.JobState) -> None:
-        label = f"Thử lại câu lỗi · {voice_label}" if retry_only else f"CapCut TTS · {voice_label}"
+        label = f"Thử lại câu lỗi · {voice_label}" if retry_only else f"{engine_label} · {voice_label}"
         job.items = [jobs.JobItem(id="tts", label=label)]
         job.items[0].status = "running"
         job.current_label = voice_label
@@ -1456,13 +1509,13 @@ def _start_tts(project_id: str, voice: str, retry_only: bool = False) -> jobs.Jo
 
         try:
             if retry_only:
-                _, manifest = tts_stage.retry_failed_segments(root, voice=voice, on_progress=on_progress)
+                _, manifest = mod.retry_failed_segments(root, voice=voice, on_progress=on_progress)
             else:
-                _, manifest = tts_stage.tts_project(root, voice=voice, on_progress=on_progress)
+                _, manifest = mod.tts_project(root, voice=voice, on_progress=on_progress)
         except jobs.JobCancelled:
             _mark_cancelled(project_id, "tts", job)
             return
-        except tts_stage.TTSError as err:
+        except mod.TTSError as err:
             job.items[0].status = "failed"
             job.status = "failed"
             job.error = str(err)
@@ -1492,9 +1545,11 @@ def _start_tts(project_id: str, voice: str, retry_only: bool = False) -> jobs.Jo
             s.stages["tts"].status = StageStatus.done
             s.stages["tts"].output = "audio/manifest.json"
             s.stages["tts"].progress = f"{ok}/{len(manifest)} câu · {voice_label}" + (f" · {failed} lỗi" if failed else "")
+            s.stages["tts"].engine = engine
             s.stages["tts"].error = None
             s.stages["tts"].at = datetime.now()
             s.auto_voice = voice  # nhớ giọng vừa dùng — mặc định cho lần chạy sau
+            s.auto_tts_engine = engine
         pj.append_log(project_id, "tts", f"{ok}/{len(manifest)} câu · {voice_label}")
         _maybe_chain(project_id, "tts")
 
@@ -1507,11 +1562,15 @@ def start_tts_route(project_id: str, body: StartTTSRequest | None = None):
     _require_done(state, "translate", "Chưa có bản dịch tiếng Việt — chạy Gemini trước")
     voice = body.voice if body and body.voice else ""
     retry_only = bool(body and body.retry_failed_only)
+    # retry chỉ tạo lại câu lỗi trong manifest ĐÃ có — phải dùng đúng engine
+    # của lần chạy trước, bỏ qua engine truyền vào (tránh trộn giọng 2 engine
+    # khác namespace trong cùng 1 manifest).
+    engine = (state.stages["tts"].engine or "capcut") if retry_only else ("vieneu" if body and body.engine == "vieneu" else "capcut")
     if retry_only:
         manifest_path = pj.project_dir(project_id) / "audio" / "manifest.json"
         if not manifest_path.exists():
             raise HTTPException(status_code=409, detail="Chưa chạy TTS lần nào")
-    job = _start_tts(project_id, voice, retry_only=retry_only)
+    job = _start_tts(project_id, voice, retry_only=retry_only, engine=engine)
     if job is None:
         raise HTTPException(status_code=409, detail="TTS đang chạy cho dự án này")
     return {"status": "started"}
@@ -1831,6 +1890,147 @@ def job_status(project_id: str, stage: str):
         error=job.error,
         started_at=job.started_at,
     )
+
+
+# ------------------------------------------------------------------ Ghép video (không thuộc project nào)
+
+
+@app.get("/api/merges")
+def list_merges_route():
+    return mg.list_merges()
+
+
+@app.post("/api/merges", status_code=202)
+async def create_merge_route(title: str = Form(""), files: list[UploadFile] = File(...)):
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Cần ít nhất 2 video để ghép")
+
+    filenames = [f.filename or f"video_{i}.mp4" for i, f in enumerate(files)]
+    meta = mg.create_merge(title, filenames)
+    merge_id = meta["merge_id"]
+    root = mg.merge_dir(merge_id)
+
+    input_paths: list[Path] = []
+    for i, f in enumerate(files):
+        ext = Path(f.filename or "").suffix or ".mp4"
+        dest = root / f"input_{i:03d}{ext}"
+        with dest.open("wb") as out:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        input_paths.append(dest)
+
+    def target(job: jobs.JobState) -> None:
+        job.items = [jobs.JobItem(id="merge", label="Ghép video")]
+        job.items[0].status = "running"
+        job.current_label = "Đang ghép video..."
+        meta_run = mg.load_meta(merge_id)
+        meta_run["status"] = "running"
+        mg.save_meta(merge_id, meta_run)
+
+        try:
+            out_path = root / "merged.mp4"
+            video_merge_stage.merge_videos(input_paths, out_path, job=job)
+        except jobs.JobCancelled:
+            job.status = "cancelled"
+            job.items[0].status = "failed"
+            job.items[0].error = "Đã dừng"
+            meta_c = mg.load_meta(merge_id)
+            meta_c["status"] = "failed"
+            meta_c["error"] = "Đã dừng theo yêu cầu người dùng"
+            mg.save_meta(merge_id, meta_c)
+            return
+        except video_merge_stage.VideoMergeError as err:
+            job.items[0].status = "failed"
+            job.status = "failed"
+            job.error = str(err)
+            meta_err = mg.load_meta(merge_id)
+            meta_err["status"] = "failed"
+            meta_err["error"] = str(err)
+            mg.save_meta(merge_id, meta_err)
+            return
+        except Exception as err:
+            logger.exception("Ghép video lỗi {}", merge_id)
+            job.items[0].status = "failed"
+            job.status = "failed"
+            job.error = str(err)
+            meta_err2 = mg.load_meta(merge_id)
+            meta_err2["status"] = "failed"
+            meta_err2["error"] = str(err)
+            mg.save_meta(merge_id, meta_err2)
+            return
+
+        job.items[0].status = "done"
+        job.done_count = 1
+        job.status = "done"
+        meta_done = mg.load_meta(merge_id)
+        meta_done["status"] = "done"
+        meta_done["output_filename"] = "merged.mp4"
+        mg.save_meta(merge_id, meta_done)
+
+    jobs.start_job(f"merge:{merge_id}", 1, target)
+    return {"merge_id": merge_id, "status": "started"}
+
+
+@app.get("/api/merges/{merge_id}/jobs/status", response_model=JobStatusResponse)
+def merge_job_status_route(merge_id: str):
+    job = jobs.get_job(f"merge:{merge_id}")
+    if job is None:
+        try:
+            meta = mg.load_meta(merge_id)
+        except FileNotFoundError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        orphaned = meta.get("status") == "running"
+        if orphaned:
+            meta["status"] = "failed"
+            meta["error"] = "Phiên trước bị gián đoạn (server restart) — bấm ghép lại."
+            mg.save_meta(merge_id, meta)
+        return JobStatusResponse(registered=False, orphaned=orphaned)
+    return JobStatusResponse(
+        registered=True,
+        status=job.status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[JobItemResponse(id=it.id, label=it.label, status=it.status, error=it.error) for it in job.items],
+        error=job.error,
+        started_at=job.started_at,
+    )
+
+
+@app.post("/api/merges/{merge_id}/jobs/cancel")
+def cancel_merge_job_route(merge_id: str):
+    ok = jobs.request_cancel(f"merge:{merge_id}")
+    if not ok:
+        raise HTTPException(status_code=409, detail="Không có job nào đang chạy")
+    return {"status": "cancelling"}
+
+
+@app.get("/api/merges/{merge_id}/download")
+def download_merge_route(merge_id: str):
+    try:
+        meta = mg.load_meta(merge_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if meta.get("status") != "done" or not meta.get("output_filename"):
+        raise HTTPException(status_code=409, detail="Chưa ghép xong")
+    path = mg.merge_dir(merge_id) / meta["output_filename"]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Không tìm thấy file đã ghép")
+    safe_name = pj.slugify(meta.get("title") or merge_id) + ".mp4"
+    return FileResponse(path, filename=safe_name, media_type="video/mp4")
+
+
+@app.delete("/api/merges/{merge_id}", status_code=204)
+def delete_merge_route(merge_id: str):
+    if jobs.is_job_running(f"merge:{merge_id}"):
+        raise HTTPException(status_code=409, detail="Đang ghép — đợi xong hoặc bấm Dừng trước")
+    try:
+        mg.delete_merge(merge_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
 
 
 @app.get("/api/projects/{project_id}/assets/{asset_path:path}")

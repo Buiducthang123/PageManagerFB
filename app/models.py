@@ -58,6 +58,7 @@ class ProjectState(BaseModel):
     episodes: list[Episode] = Field(default_factory=list)
     auto_pipeline: bool = False
     auto_engine: str = "whisper"
+    auto_tts_engine: str = "capcut"
     auto_voice: str = ""
     auto_audio_mode: str = "separated"
     auto_min_video_speed: float = 0.85

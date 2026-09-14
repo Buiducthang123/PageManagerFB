@@ -10,6 +10,7 @@ import {
   type StageName,
   type StageRecord,
   type TranscribeEngine,
+  type TTSEngine,
 } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from '../components/StatusBadge'
@@ -56,6 +57,7 @@ export default function ProjectDetail() {
   const [shareUrl, setShareUrl] = useState('')
   const [tab, setTab] = useState<'table' | 'zh' | 'vi' | 'entity'>('table')
   const [engine, setEngine] = useState<TranscribeEngine>('whisper')
+  const [ttsEngine, setTtsEngine] = useState<TTSEngine>('capcut')
   const [voice, setVoice] = useState('')
   const [previewVoice, setPreviewVoice] = useState<string | null>(null)
   const [previewNonce, setPreviewNonce] = useState(0)
@@ -94,6 +96,7 @@ export default function ProjectDetail() {
     if (!p) return
     if (p.auto_voice) setVoice(p.auto_voice)
     if (p.auto_engine) setEngine(p.auto_engine)
+    if (p.auto_tts_engine) setTtsEngine(p.auto_tts_engine)
     if (p.auto_audio_mode) setAudioMode(p.auto_audio_mode)
     if (p.auto_min_video_speed) setMinVideoSpeed(p.auto_min_video_speed)
     setVoiceInitialized(true)
@@ -185,7 +188,7 @@ export default function ProjectDetail() {
   })
 
   const ttsMutation = useMutation({
-    mutationFn: () => api.startTTS(projectId, voice),
+    mutationFn: () => api.startTTS(projectId, voice, ttsEngine),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['job', projectId, 'tts'] })
     },
@@ -218,8 +221,13 @@ export default function ProjectDetail() {
     onSuccess: () => refresh(),
   })
 
-  const voiceOptions = settingsQuery.data?.tts_voices ?? []
-  const selectedVoice = voice || voiceOptions[0]?.id || ''
+  const voiceOptions = (ttsEngine === 'vieneu' ? settingsQuery.data?.tts_voices_vieneu : settingsQuery.data?.tts_voices) ?? []
+  const selectedVoice = voiceOptions.some((v) => v.id === voice) ? voice : voiceOptions[0]?.id || ''
+
+  const changeTtsEngine = (next: TTSEngine) => {
+    setTtsEngine(next)
+    setVoice('') // đổi engine thì đổi hẳn namespace giọng — về giọng đầu tiên của engine mới
+  }
 
   const ttsCueMutation = useMutation({
     mutationFn: (cueId: number) => api.ttsCue(projectId, cueId, selectedVoice),
@@ -230,6 +238,7 @@ export default function ProjectDetail() {
     mutationFn: (opts: {
       enabled: boolean
       engine?: TranscribeEngine
+      ttsEngine?: TTSEngine
       voice?: string
       audioMode?: AudioMode
       minVideoSpeed?: number
@@ -238,6 +247,7 @@ export default function ProjectDetail() {
         projectId,
         opts.enabled,
         opts.engine ?? engine,
+        opts.ttsEngine ?? ttsEngine,
         opts.voice ?? selectedVoice,
         opts.audioMode ?? audioMode,
         opts.minVideoSpeed ?? minVideoSpeed,
@@ -257,10 +267,10 @@ export default function ProjectDetail() {
       return
     }
     if (detailQuery.data?.project.auto_pipeline) {
-      autoPipelineMutation.mutate({ enabled: true, engine, voice: selectedVoice, audioMode, minVideoSpeed })
+      autoPipelineMutation.mutate({ enabled: true, engine, ttsEngine, voice: selectedVoice, audioMode, minVideoSpeed })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, selectedVoice, audioMode, minVideoSpeed])
+  }, [engine, ttsEngine, selectedVoice, audioMode, minVideoSpeed])
 
   const cancelMutation = useMutation({
     mutationFn: (stage: StageName) => api.cancelJob(projectId, stage),
@@ -324,6 +334,8 @@ export default function ProjectDetail() {
           <p className="mt-1 text-xs text-neutral-400">
             Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt Whisper → Gemini → TTS →
             CapCut cho tới hết, dùng engine/giọng đang chọn bên dưới ({engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}
+            {' · '}
+            {ttsEngine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}
             {selectedVoice ? ` · ${voiceOptions.find((v) => v.id === selectedVoice)?.label ?? selectedVoice}` : ''}).
             Dừng lại ở draft CapCut — review + export vẫn phải làm tay.
           </p>
@@ -345,6 +357,19 @@ export default function ProjectDetail() {
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                   SenseVoice
+                </label>
+              </div>
+            </label>
+            <label className="flex-1 text-sm text-neutral-300">
+              Engine TTS
+              <div className="mt-1 flex gap-4">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
+                  CapCut TTS
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
+                  VieNeu-TTS
                 </label>
               </div>
             </label>
@@ -373,7 +398,14 @@ export default function ProjectDetail() {
             </label>
           </div>
           {previewVoice && (
-            <audio key={previewNonce} className="h-8 w-full" autoPlay controls preload="auto" src={api.previewVoiceUrl(previewVoice)} />
+            <audio
+              key={previewNonce}
+              className="h-8 w-full"
+              autoPlay
+              controls
+              preload="auto"
+              src={api.previewVoiceUrl(previewVoice, ttsEngine)}
+            />
           )}
 
           {data.episodes.map((ep, i) => {
@@ -391,6 +423,7 @@ export default function ProjectDetail() {
                 index={i}
                 engine={engine}
                 voice={selectedVoice}
+                ttsEngine={ttsEngine}
                 canMoveUp={i > 0}
                 canMoveDown={i < data.episodes.length - 1}
                 onMoveUp={() => swapWith(i - 1)}
@@ -437,6 +470,19 @@ export default function ProjectDetail() {
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                   SenseVoice
+                </label>
+              </div>
+            </label>
+            <label className="flex-1 text-sm text-neutral-300">
+              Engine TTS
+              <div className="mt-1 flex gap-4">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
+                  CapCut TTS
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
+                  VieNeu-TTS
                 </label>
               </div>
             </label>
@@ -488,6 +534,7 @@ export default function ProjectDetail() {
               index={i}
               engine={engine}
               voice={selectedVoice}
+              ttsEngine={ttsEngine}
               movable={false}
               standaloneAssemble
               audioMode={audioMode}
@@ -602,7 +649,7 @@ export default function ProjectDetail() {
         )}
       </section>
 
-      {ingest.status === 'done' && transcribe.status === 'pending' && !busyAny && project.duration_sec && (
+      {ingest.status === 'done' && transcribe.status !== 'done' && !busyAny && project.duration_sec && (
         <section className="card space-y-3 p-5">
           <h2 className="text-lg">Chia video thành nhiều đoạn (tùy chọn)</h2>
           <p className="text-sm text-neutral-400">
@@ -730,8 +777,19 @@ export default function ProjectDetail() {
           onCancel={() => cancelMutation.mutate('tts')}
         />
         <p className="mb-3 text-sm text-neutral-400">
-          CapCut TTS: đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
+          Đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
+          {tts.engine && <> · lần chạy trước dùng <b>{tts.engine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}</b></>}
         </p>
+        <div className="mb-3 flex gap-4 text-sm text-neutral-300">
+          <label className="flex items-center gap-1.5">
+            <input type="radio" checked={ttsEngine === 'capcut'} disabled={busyAny} onChange={() => changeTtsEngine('capcut')} />
+            CapCut TTS (cloud)
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input type="radio" checked={ttsEngine === 'vieneu'} disabled={busyAny} onChange={() => changeTtsEngine('vieneu')} />
+            VieNeu-TTS (local, tiếng Việt)
+          </label>
+        </div>
         <label className="mb-1 block text-sm text-neutral-300">
           Giọng đọc
           <div className="flex gap-2">
@@ -761,7 +819,14 @@ export default function ProjectDetail() {
           </div>
         </label>
         {previewVoice && (
-          <audio key={previewNonce} className="mb-3 h-8 w-full" autoPlay controls preload="auto" src={api.previewVoiceUrl(previewVoice)} />
+          <audio
+            key={previewNonce}
+            className="mb-3 h-8 w-full"
+            autoPlay
+            controls
+            preload="auto"
+            src={api.previewVoiceUrl(previewVoice, ttsEngine)}
+          />
         )}
         {tts.progress && <p className="mb-2 text-sm text-neutral-300">{tts.progress}</p>}
         {tts.error && <p className="mb-2 text-sm text-danger">{tts.error}</p>}

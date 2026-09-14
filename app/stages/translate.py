@@ -11,15 +11,24 @@ from loguru import logger
 from .. import config
 from ..utils.srt import Cue, load_srt, parse_ts, update_cue_text, write_srt
 
-# Tốc độ đọc tự nhiên mục tiêu / ngưỡng chấp nhận được (ký tự việt/giây).
+# Tốc độ đọc tự nhiên mục tiêu / ngưỡng chấp nhận được (ký tự việt/giây) —
+# đọc động từ config (đổi được qua Settings, xem config.TRANSLATE_PACE_PROFILES)
+# thay vì hardcode, vì đây là đánh đổi tuỳ video (thoại càng dồn dập càng cần
+# nới lỏng để giữ đủ ý thay vì cắt bớt).
 # Đã thử nhét ngân sách thời lượng vào prompt dịch 1-lần-cho-cả-315-câu — cải
 # thiện CPS thật nhưng làm Gemini áp 1 văn phong súc tích cho TOÀN BỘ phản
 # hồi (kể cả câu không hề gấp), gây mất tên riêng/từ nối, đọc cộc lốc. Nên
 # tách 2 lượt: dịch tự nhiên bình thường trước (không nhắc ngân sách gì cả),
 # rồi CHỈ gom đúng những câu thật sự vượt MAX_CPS gửi riêng 1 lượt nén lại —
 # giữ chất lượng tự nhiên cho phần lớn câu còn lại.
-TARGET_CPS = 15.5
-MAX_CPS = 18.0
+
+
+def _target_cps() -> float:
+    return config.translate_cps()[0]
+
+
+def _max_cps() -> float:
+    return config.translate_cps()[1]
 
 # Video dài (90p-3h) có thể lên tới vài nghìn câu — dịch nguyên video trong 1
 # lần gọi Gemini sẽ vỡ giới hạn max_output_tokens (32768, xem _generate).
@@ -258,25 +267,29 @@ def _compact_rewrite_batch(
     """Gom đúng những câu vượt MAX_CPS, gửi riêng 1 lượt yêu cầu viết súc tích
     hơn theo ngân sách ký tự — chỉ đụng tới nhóm này, không ảnh hưởng các câu
     đã dịch tự nhiên tốt ở lượt 1."""
+    target_cps = _target_cps()
     payload = [
         {
             "id": cue.id,
             "zh": cue.text,
             "current_vi": vi_text,
             "available_duration_s": round(_duration_s(cue), 2),
-            "max_chars_vi": max(round(_duration_s(cue) * TARGET_CPS), 1),
+            "max_chars_vi": max(round(_duration_s(cue) * target_cps), 1),
         }
         for cue, vi_text in items
     ]
     prompt = f"""Các câu tiếng Việt dưới đây ("current_vi") đọc TTS sẽ bị GẤP vì dài hơn
 "available_duration_s" giây cho phép — cần viết lại NGẮN GỌN hơn, bám sát "max_chars_vi" ký tự
-(tốc độ đọc tự nhiên ~{TARGET_CPS} ký tự/giây).
+(tốc độ đọc tự nhiên ~{target_cps} ký tự/giây).
 
 Cách làm: bỏ từ đệm/thừa/trạng từ không cần thiết, dùng từ/cụm ngắn hơn nghĩa tương đương, gộp ý
-nếu được. TUYỆT ĐỐI KHÔNG:
+nếu được. ƯU TIÊN GIỮ LẠI nội dung cốt truyện quan trọng (hành động chính, thông tin/số liệu quan
+trọng, twist/mâu thuẫn) — nếu bắt buộc phải cắt bớt ý để vừa số ký tự, cắt phần MÔ TẢ/CẢM THÁN/nhấn
+mạnh trước, đừng cắt phần cốt truyện. TUYỆT ĐỐI KHÔNG:
 - Bỏ tên riêng rồi thay bằng đại từ/mô tả mơ hồ (vd "cậu ấy", "người kia") — giữ nguyên tên.
 - Viết cộc lốc thiếu ngữ pháp hay khó hiểu — vẫn phải là câu tiếng Việt tự nhiên, nghe xuôi tai.
-Nếu không thể rút ngắn thêm mà vẫn giữ tự nhiên, giữ nguyên current_vi.
+- Cắt bỏ chi tiết cốt truyện (ai làm gì, chuyện gì xảy ra) chỉ để đọc nhanh hơn.
+Nếu không thể rút ngắn thêm mà vẫn giữ tự nhiên + đủ ý, giữ nguyên current_vi.
 
 Entity dict — áp dụng nhất quán, không đổi tên khác đi:
 {json.dumps(entity_dict, ensure_ascii=False)}
@@ -382,7 +395,8 @@ def process_llm(
     # Lượt 2 — chỉ nén lại đúng những câu vượt MAX_CPS, không đụng câu khác.
     # Cũng chia batch: video dài có thể có hàng trăm câu vượt CPS cùng lúc,
     # nén hết trong 1 lần gọi sẽ vỡ giới hạn output y như lượt dịch chính.
-    violators = [(c, c.text) for c in out if c.text.strip() and _cps(c.text, _duration_s(c)) > MAX_CPS]
+    max_cps = _max_cps()
+    violators = [(c, c.text) for c in out if c.text.strip() and _cps(c.text, _duration_s(c)) > max_cps]
     if violators:
         if on_progress:
             on_progress(total, total, f"nén {len(violators)} câu đọc gấp")
@@ -399,7 +413,7 @@ def process_llm(
             for cue in out:
                 if cue.id in rewritten:
                     cue.text = rewritten[cue.id]
-            logger.info("Lượt 2: nén được {}/{} câu vượt {} CPS", len(rewritten), len(violators), MAX_CPS)
+            logger.info("Lượt 2: nén được {}/{} câu vượt {} CPS", len(rewritten), len(violators), max_cps)
 
     if on_progress:
         on_progress(len(cues), len(cues), "xong")
@@ -450,7 +464,7 @@ Trả về: {{"text_vi":"..."}}"""
 
     # Nếu bản dịch tự nhiên vẫn đọc quá gấp, nén lại đúng câu này (không ép
     # súc tích ngay từ đầu — xem lý do ở comment TARGET_CPS/MAX_CPS phía trên).
-    if text_vi and _cps(text_vi, _duration_s(cue)) > MAX_CPS:
+    if text_vi and _cps(text_vi, _duration_s(cue)) > _max_cps():
         try:
             rewritten = _compact_rewrite_batch([(cue, text_vi)], entity_dict)
             if cue_id in rewritten:
@@ -458,7 +472,7 @@ Trả về: {{"text_vi":"..."}}"""
         except Exception as err:
             logger.warning("Nén câu #{} lỗi ({}), giữ bản dịch tự nhiên", cue_id, err)
 
-    vi_path = project_root / "sub_vi.srt"
+    vi_path = episode_root / "sub_vi.srt"
     if load_srt(vi_path):
         update_cue_text(vi_path, cue_id, text_vi)
     return text_vi

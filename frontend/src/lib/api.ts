@@ -29,6 +29,7 @@ export interface StageRecord {
 }
 
 export type TranscribeEngine = 'whisper' | 'sensevoice'
+export type TTSEngine = 'capcut' | 'vieneu'
 
 export interface Episode {
   episode_id: string
@@ -53,6 +54,7 @@ export interface ProjectState {
   episodes: Episode[]
   auto_pipeline: boolean
   auto_engine: TranscribeEngine
+  auto_tts_engine: TTSEngine
   auto_voice: string
   auto_audio_mode: AudioMode
   auto_min_video_speed: number
@@ -114,6 +116,16 @@ export interface ProjectDetail {
   episodes: EpisodeDetail[]
 }
 
+export interface MergeItem {
+  merge_id: string
+  title: string
+  created_at: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  error: string | null
+  input_filenames: string[]
+  output_filename: string | null
+}
+
 export interface JobStatus {
   registered: boolean
   orphaned: boolean
@@ -138,10 +150,13 @@ export interface AppSettings {
   whisper_model: string
   whisper_device: string
   whisper_language: string
+  translate_pace: string
   gemini_models: ModelOption[]
   whisper_models: ModelOption[]
   whisper_languages: ModelOption[]
+  translate_paces: ModelOption[]
   tts_voices: ModelOption[]
+  tts_voices_vieneu: ModelOption[]
   whisper_cache_dir: string
   capcut_drafts_dir: string
 }
@@ -197,21 +212,31 @@ export const api = {
     id: string,
     enabled: boolean,
     engine: TranscribeEngine,
+    ttsEngine: TTSEngine,
     voice: string,
     audioMode: AudioMode,
     minVideoSpeed: number,
   ) =>
     request<ProjectSummary>(`/api/projects/${id}/auto-pipeline`, {
       method: 'PATCH',
-      body: JSON.stringify({ enabled, engine, voice, audio_mode: audioMode, min_video_speed: minVideoSpeed }),
+      body: JSON.stringify({
+        enabled,
+        engine,
+        tts_engine: ttsEngine,
+        voice,
+        audio_mode: audioMode,
+        min_video_speed: minVideoSpeed,
+      }),
     }),
   startTranscribe: (id: string, engine: TranscribeEngine = 'whisper') =>
     postJson<{ status: string }>(`/api/projects/${id}/transcribe`, { engine }),
   startTranslate: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/translate`),
-  startTTS: (id: string, voice: string) => postJson<{ status: string }>(`/api/projects/${id}/tts`, { voice }),
+  startTTS: (id: string, voice: string, engine: TTSEngine = 'capcut') =>
+    postJson<{ status: string }>(`/api/projects/${id}/tts`, { voice, engine }),
   retryTTS: (id: string, voice: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/tts`, { voice, retry_failed_only: true }),
-  previewVoiceUrl: (voice: string) => `/api/tts/preview?voice=${encodeURIComponent(voice)}`,
+  previewVoiceUrl: (voice: string, engine: TTSEngine = 'capcut') =>
+    `/api/tts/preview?voice=${encodeURIComponent(voice)}&engine=${engine}`,
   updateCue: (id: string, cueId: number, text_vi: string) =>
     request<SrtCue>(`/api/projects/${id}/cues/${cueId}`, { method: 'PATCH', body: JSON.stringify({ text_vi }) }),
   retranslateCue: (id: string, cueId: number) =>
@@ -252,8 +277,8 @@ export const api = {
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/transcribe`, { engine }),
   startEpisodeTranslate: (id: string, episodeId: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/translate`),
-  startEpisodeTTS: (id: string, episodeId: string, voice: string) =>
-    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/tts`, { voice }),
+  startEpisodeTTS: (id: string, episodeId: string, voice: string, engine: TTSEngine = 'capcut') =>
+    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/tts`, { voice, engine }),
   retryEpisodeTTS: (id: string, episodeId: string, voice: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/tts`, { voice, retry_failed_only: true }),
   startEpisodeAssemble: (id: string, episodeId: string, audioMode: AudioMode, minVideoSpeed: number) =>
@@ -277,6 +302,19 @@ export const api = {
   cancelEpisodeJob: (id: string, episodeId: string, stage: EpisodeStageName) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/jobs/${stage}/cancel`),
 
+  // --- Ghép video (đứng riêng, không thuộc project nào) ---
+  listMerges: () => request<MergeItem[]>('/api/merges'),
+  createMerge: (title: string, files: File[]) => {
+    const form = new FormData()
+    form.append('title', title)
+    files.forEach((f) => form.append('files', f))
+    return request<{ merge_id: string; status: string }>('/api/merges', { method: 'POST', body: form })
+  },
+  mergeJobStatus: (mergeId: string) => request<JobStatus>(`/api/merges/${mergeId}/jobs/status`),
+  cancelMergeJob: (mergeId: string) => postJson<{ status: string }>(`/api/merges/${mergeId}/jobs/cancel`),
+  downloadMergeUrl: (mergeId: string) => `/api/merges/${mergeId}/download`,
+  deleteMerge: (mergeId: string) => request<void>(`/api/merges/${mergeId}`, { method: 'DELETE' }),
+
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (
     body: Partial<{
@@ -286,6 +324,7 @@ export const api = {
       whisper_model: string
       whisper_device: string
       whisper_language: string
+      translate_pace: string
     }>,
   ) => request<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
 }

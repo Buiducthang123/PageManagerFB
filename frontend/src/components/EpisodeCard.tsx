@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AudioMode, type EpisodeDetail, type EpisodeStageName, type TranscribeEngine } from '../lib/api'
+import { api, type AudioMode, type EpisodeDetail, type EpisodeStageName, type TranscribeEngine, type TTSEngine } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from './StatusBadge'
 import JobProgressBar from './JobProgressBar'
@@ -20,6 +20,7 @@ export default function EpisodeCard({
   index,
   engine,
   voice,
+  ttsEngine = 'capcut',
   movable = true,
   onDelete,
   onMoveUp,
@@ -35,6 +36,7 @@ export default function EpisodeCard({
   index: number
   engine: TranscribeEngine
   voice: string
+  ttsEngine?: TTSEngine
   movable?: boolean
   onDelete?: () => void
   onMoveUp?: () => void
@@ -98,7 +100,7 @@ export default function EpisodeCard({
   })
 
   const ttsMutation = useMutation({
-    mutationFn: () => api.startEpisodeTTS(projectId, episodeId, voice),
+    mutationFn: () => api.startEpisodeTTS(projectId, episodeId, voice, ttsEngine),
     onSuccess: () => invalidateJob('tts'),
   })
 

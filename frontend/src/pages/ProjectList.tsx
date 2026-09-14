@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, STAGE_LABELS, type ProjectSummary, type ProjectType } from '../lib/api'
 import { inputClass, primaryButtonClass } from '../lib/ui'
 import ConfirmDialog from '../components/ConfirmDialog'
+import VideoMergePanel from '../components/VideoMergePanel'
 
 function relativeTime(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime()
@@ -23,6 +24,8 @@ export default function ProjectList() {
   const [title, setTitle] = useState('')
   const [projectType, setProjectType] = useState<ProjectType>('single')
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.listProjects })
 
@@ -43,7 +46,28 @@ export default function ProjectList() {
     },
   })
 
+  const bulkDeleteMutation = useMutation({
+    mutationFn: (ids: string[]) => Promise.all(ids.map((id) => api.deleteProject(id))),
+    onSuccess: () => {
+      setBulkDeleteOpen(false)
+      setSelectedIds(new Set())
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+    },
+  })
+
   const list = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data])
+
+  const toggleSelected = (id: string) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+
+  const allSelected = list.length > 0 && list.every((p) => selectedIds.has(p.project_id))
+  const toggleSelectAll = () =>
+    setSelectedIds(allSelected ? new Set() : new Set(list.map((p) => p.project_id)))
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -99,9 +123,24 @@ export default function ProjectList() {
           Chưa có dự án — đặt tên rồi bấm Tạo.
         </div>
       ) : (
+        <>
+        {selectedIds.size > 0 && (
+          <div className="mb-3 flex items-center gap-3 rounded-lg border border-danger-800 bg-danger-950/30 px-3 py-2 text-sm">
+            <span>Đã chọn {selectedIds.size} dự án</span>
+            <button type="button" className="btn btn-danger btn-sm" onClick={() => setBulkDeleteOpen(true)}>
+              Xoá đã chọn
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setSelectedIds(new Set())}>
+              Bỏ chọn
+            </button>
+          </div>
+        )}
         <table className="table">
           <thead>
             <tr>
+              <th className="w-8">
+                <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+              </th>
               <th>Tên</th>
               <th>Bước hiện tại</th>
               <th>Tạo lúc</th>
@@ -111,6 +150,13 @@ export default function ProjectList() {
           <tbody>
             {list.map((p: ProjectSummary) => (
               <tr key={p.project_id}>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(p.project_id)}
+                    onChange={() => toggleSelected(p.project_id)}
+                  />
+                </td>
                 <td>
                   <Link to={`/projects/${p.project_id}`} className="font-medium">
                     {p.title}
@@ -139,6 +185,7 @@ export default function ProjectList() {
             ))}
           </tbody>
         </table>
+        </>
       )}
 
       <ConfirmDialog
@@ -150,6 +197,23 @@ export default function ProjectList() {
         onCancel={() => setDeletingId(null)}
         onConfirm={() => deletingId && deleteMutation.mutate(deletingId)}
       />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title={`Xoá ${selectedIds.size} dự án đã chọn?`}
+        message="Video, phụ đề và entity dict của TẤT CẢ dự án đã chọn sẽ bị xoá khỏi đĩa. Không thể hoàn tác."
+        confirmLabel={bulkDeleteMutation.isPending ? 'Đang xoá...' : 'Xoá tất cả'}
+        danger
+        onCancel={() => setBulkDeleteOpen(false)}
+        onConfirm={() => bulkDeleteMutation.mutate([...selectedIds])}
+      />
+      {bulkDeleteMutation.error && (
+        <p className="mt-2 text-sm text-danger">{(bulkDeleteMutation.error as Error).message}</p>
+      )}
+
+      <div className="mt-10">
+        <VideoMergePanel />
+      </div>
     </div>
   )
 }

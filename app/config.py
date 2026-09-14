@@ -41,8 +41,34 @@ TRANSLATE_BLOCK_SIZE = 10
 GEMINI_BLOCK_SLEEP_S = 4.0
 GEMINI_TEMPERATURE = 0.1
 
+# Tốc độ đọc mục tiêu/ngưỡng nén lại (ký tự việt/giây) khi dịch — video gốc
+# càng thoại dồn dập (gần như không có khoảng nghỉ giữa các câu) thì càng dễ
+# phải đánh đổi giữa "đọc tự nhiên" và "dịch đủ ý". 3 mức người dùng tự chọn
+# ở Settings — "natural" giữ tốc độ đọc chuẩn, chấp nhận cắt bớt ý ở câu quá
+# dồn; "full_meaning" ưu tiên dịch đủ nghĩa hơn, chấp nhận đọc nhanh hơn/để
+# timing trôi nhẹ (đã có cơ chế chậm video + tăng tốc giọng + đẩy lùi câu sau
+# ở assemble.py xử lý phần dôi ra).
+TRANSLATE_PACE_PROFILES: dict[str, tuple[float, float]] = {
+    "natural": (15.5, 18.0),
+    "balanced": (18.0, 23.0),
+    "full_meaning": (20.0, 22.0),
+}
+DEFAULT_TRANSLATE_PACE = "full_meaning"
+TRANSLATE_PACE = os.environ.get("TRANSLATE_PACE", DEFAULT_TRANSLATE_PACE).strip() or DEFAULT_TRANSLATE_PACE
+
+
+def translate_cps(pace: str | None = None) -> tuple[float, float]:
+    mode = (pace or os.environ.get("TRANSLATE_PACE") or TRANSLATE_PACE).strip()
+    return TRANSLATE_PACE_PROFILES.get(mode, TRANSLATE_PACE_PROFILES[DEFAULT_TRANSLATE_PACE])
+
 
 SENSEVOICE_DEVICE = os.environ.get("SENSEVOICE_DEVICE", "cpu").strip() or "cpu"
+
+# Mặc định CPU — Whisper (transcribe) đã chiếm VRAM và model vẫn giữ resident
+# suốt đời process (không unload), TTS chạy SAU trong cùng pipeline nên cộng
+# dồn VRAM nếu cũng chạy CUDA. Máy dev 4GB VRAM khá sát — an toàn hơn để CPU,
+# người dùng có nhiều VRAM hơn có thể tự set VIENEU_DEVICE=cuda.
+VIENEU_DEVICE = os.environ.get("VIENEU_DEVICE", "cpu").strip() or "cpu"
 
 try:
     TTS_CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY", "3").strip() or "3"))

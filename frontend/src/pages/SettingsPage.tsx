@@ -11,6 +11,7 @@ export default function SettingsPage() {
   const [whisperModel, setWhisperModel] = useState('')
   const [whisperDevice, setWhisperDevice] = useState('auto')
   const [whisperLanguage, setWhisperLanguage] = useState('zh')
+  const [translatePace, setTranslatePace] = useState('full_meaning')
   const [hydrated, setHydrated] = useState(false)
 
   useEffect(() => {
@@ -20,6 +21,7 @@ export default function SettingsPage() {
     setWhisperModel(settingsQuery.data.whisper_model)
     setWhisperDevice(settingsQuery.data.whisper_device)
     setWhisperLanguage(settingsQuery.data.whisper_language || 'zh')
+    setTranslatePace(settingsQuery.data.translate_pace || 'full_meaning')
     setHydrated(true)
   }, [settingsQuery.data, hydrated])
 
@@ -32,6 +34,7 @@ export default function SettingsPage() {
         whisper_model: whisperModel,
         whisper_device: whisperDevice,
         whisper_language: whisperLanguage,
+        translate_pace: translatePace,
       }),
     onSuccess: () => setGeminiKey(''),
   })
@@ -111,6 +114,22 @@ export default function SettingsPage() {
             </option>
           ))}
         </select>
+      </label>
+
+      <label className="block text-sm text-neutral-300">
+        Mức độ dịch (đủ ý vs đọc tự nhiên)
+        <select className={inputClass} value={translatePace} onChange={(e) => setTranslatePace(e.target.value)}>
+          {(data?.translate_paces ?? []).map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-xs text-neutral-500">
+          Video thoại càng dồn dập (ít khoảng nghỉ) càng dễ phải đánh đổi giữa dịch đủ nghĩa và đọc
+          TTS tự nhiên — chọn "Đủ ý hơn" nếu ưu tiên giữ cốt truyện, chấp nhận timing trôi nhẹ ở
+          những câu quá gấp (assemble đã tự chậm video/tăng tốc giọng để bù, xem log khi ráp).
+        </span>
       </label>
 
       {data?.whisper_cache_dir && (
