@@ -4,7 +4,7 @@ import { api, type EpisodeStageName, type StageName } from '../lib/api'
 
 export function useJobStatus(
   projectId: string,
-  stage: StageName,
+  stage: StageName | 'export',
   episodeId?: string,
   onSettled?: () => void,
 ) {

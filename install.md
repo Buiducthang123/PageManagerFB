@@ -52,6 +52,46 @@ Gói chính trong [requirements.txt](requirements.txt):
 
 Package dùng để đọc phụ đề tiếng Việt thành giọng nói qua API CapCut **không có trên PyPI**, đã vendor sẵn tại [workspace/vendor/capcut-tts-api/](workspace/vendor/capcut-tts-api/) và cài editable như lệnh ở trên (`pip install -e workspace/vendor/capcut-tts-api`). Xem chi tiết SDK/CLI trong [workspace/vendor/capcut-tts-api/README.md](workspace/vendor/capcut-tts-api/README.md). Không cần API key riêng — client tự ký request bằng RSA/AWS SigV4 giả lập thiết bị CapCut.
 
+### douyin-downloader (ingest link Douyin + trang "Tải video")
+
+Ingest video bằng link Douyin (và trang "Tải video" độc lập trên sidebar) dùng
+[jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) tự
+host qua CLI — **không có trên PyPI**, clone thủ công:
+
+```powershell
+git clone --depth 1 https://github.com/jiji262/douyin-downloader.git workspace/vendor/douyin-downloader
+pip install -r workspace/vendor/douyin-downloader/requirements.txt
+copy workspace\vendor\douyin-downloader\config.example.yml workspace\vendor\douyin-downloader\config.yml
+```
+
+Sửa `link: []` trong `config.yml` vừa tạo (file mẫu có sẵn 1 link demo).
+
+Set biến môi trường trong `.env`:
+
+```
+DOUYIN_DL_DIR=D:/ReupVideoVjpPro/workspace/vendor/douyin-downloader
+```
+
+**Bắt buộc phải có cookie thật** — đã xác nhận trực tiếp: kể cả tải 1 video
+công khai cũng bị Douyin chặn anti-bot nếu không có cookie (trái với mô tả
+"không cần đăng nhập" trong README gốc của tool). Lấy cookie bằng cách đăng
+nhập Douyin qua trình duyệt tự động của chính tool:
+
+```powershell
+cd workspace/vendor/douyin-downloader
+python -m tools.cookie_fetcher --config config.yml
+```
+
+Đăng nhập xong quay lại terminal nhấn Enter — cookie tự ghi vào `config.yml`.
+Cookie sẽ hết hạn theo thời gian, cần chạy lại lệnh trên khi ingest Douyin bắt
+đầu báo lỗi "cookie hết hạn".
+
+Chưa set `DOUYIN_DL_DIR` (hoặc chưa clone) thì ingest bằng link Douyin tự
+fallback về API resolve cũ (snaptiktok.to) — không bắt buộc phải setup ngay.
+Link TikTok luôn dùng snaptiktok.to vì douyin-downloader không hỗ trợ TikTok.
+Trang "Tải video" độc lập (tải theo trang cá nhân/từ khoá) thì bắt buộc phải
+setup vì không có tool thay thế.
+
 ## 3. Frontend (Node)
 
 ```powershell

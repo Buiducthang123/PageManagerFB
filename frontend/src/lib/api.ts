@@ -28,7 +28,13 @@ export interface StageRecord {
   engine: string | null
 }
 
-export type TranscribeEngine = 'whisper' | 'sensevoice'
+export type TranscribeEngine = 'whisper' | 'sensevoice' | 'ocr'
+
+export const TRANSCRIBE_ENGINE_LABELS: Record<TranscribeEngine, string> = {
+  whisper: 'Whisper',
+  sensevoice: 'SenseVoice',
+  ocr: 'OCR (phụ đề cứng)',
+}
 export type TTSEngine = 'capcut' | 'vieneu'
 
 export interface Episode {
@@ -59,6 +65,10 @@ export interface ProjectState {
   auto_audio_mode: AudioMode
   auto_min_video_speed: number
   split_mode: boolean
+  // "Xuất video trực tiếp" (ffmpeg, không qua CapCut) — hành động PHỤ, tách
+  // riêng khỏi `stages`/STAGE_ORDER (xem app/models.py::ProjectState.export).
+  export: StageRecord
+  export_blur_region: number[] | null
 }
 
 export interface ProjectSummary {
@@ -124,6 +134,35 @@ export interface MergeItem {
   error: string | null
   input_filenames: string[]
   output_filename: string | null
+}
+
+export type DownloadMode = 'single' | 'profile' | 'search' | 'info'
+
+export interface DownloadVideoInfo {
+  title: string
+  caption: string
+  author: string
+  share_url: string
+  play_url: string
+  thumb_url: string | null
+  duration_sec: number
+  likes: number | null
+  comments: number | null
+  shares: number | null
+}
+
+export interface DownloadItem {
+  download_id: string
+  title: string
+  mode: DownloadMode
+  input: Record<string, unknown>
+  created_at: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  error: string | null
+  output_files: string[]
+  // Song song với output_files (cùng thứ tự) — 1 phần tử có thể null nếu
+  // đọc file metadata lỗi. Chỉ có khi status === 'done'.
+  video_info?: (DownloadVideoInfo | null)[]
 }
 
 export interface JobStatus {
@@ -228,8 +267,8 @@ export const api = {
         min_video_speed: minVideoSpeed,
       }),
     }),
-  startTranscribe: (id: string, engine: TranscribeEngine = 'whisper') =>
-    postJson<{ status: string }>(`/api/projects/${id}/transcribe`, { engine }),
+  startTranscribe: (id: string, engine: TranscribeEngine = 'whisper', cropRegion?: number[] | null) =>
+    postJson<{ status: string }>(`/api/projects/${id}/transcribe`, { engine, crop_region: cropRegion ?? null }),
   startTranslate: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/translate`),
   startTTS: (id: string, voice: string, engine: TTSEngine = 'capcut') =>
     postJson<{ status: string }>(`/api/projects/${id}/tts`, { voice, engine }),
@@ -248,10 +287,37 @@ export const api = {
       audio_mode: audioMode,
       min_video_speed: minVideoSpeed,
     }),
-  jobStatus: (id: string, stage: StageName) =>
+  jobStatus: (id: string, stage: StageName | 'export') =>
     request<JobStatus>(`/api/projects/${id}/jobs/${stage}`),
-  cancelJob: (id: string, stage: StageName) =>
+  cancelJob: (id: string, stage: StageName | 'export') =>
     postJson<{ status: string }>(`/api/projects/${id}/jobs/${stage}/cancel`),
+
+  // --- Xuất video trực tiếp (ffmpeg, không qua CapCut) ---
+  startExport: (id: string, audioMode: AudioMode, minVideoSpeed: number) =>
+    postJson<{ status: string }>(`/api/projects/${id}/export`, {
+      audio_mode: audioMode,
+      min_video_speed: minVideoSpeed,
+    }),
+  updateExportBlurRegion: (id: string, region: number[] | null) =>
+    postJson<{ status: string }>(`/api/projects/${id}/export/blur-region`, { region }),
+  detectExportBlurRegion: (id: string) =>
+    postJson<{ status: string; region: number[] }>(`/api/projects/${id}/export/detect-blur-region`, {}),
+  revealExportVideo: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/export/reveal`),
+  uploadExportMusic: (id: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<{ status: string }>(`/api/projects/${id}/export/music`, { method: 'POST', body: form })
+  },
+  deleteExportMusic: (id: string) => request<void>(`/api/projects/${id}/export/music`, { method: 'DELETE' }),
+  uploadExportLogo: (id: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<{ status: string }>(`/api/projects/${id}/export/logo`, { method: 'POST', body: form })
+  },
+  deleteExportLogo: (id: string) => request<void>(`/api/projects/${id}/export/logo`, { method: 'DELETE' }),
+  exportVideoUrl: (id: string) => `/api/projects/${id}/assets/export/final.mp4`,
+  exportMusicUrl: (id: string) => `/api/projects/${id}/export/music`,
+  exportLogoUrl: (id: string) => `/api/projects/${id}/export/logo`,
 
   // --- Episodes (dự án dài tập) ---
   createEpisode: (id: string, opts?: { title?: string; insertAfterEpisodeId?: string }) =>
@@ -273,8 +339,11 @@ export const api = {
   },
   ingestEpisodeUrl: (id: string, episodeId: string, url: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/ingest/url`, { url }),
-  startEpisodeTranscribe: (id: string, episodeId: string, engine: TranscribeEngine = 'whisper') =>
-    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/transcribe`, { engine }),
+  startEpisodeTranscribe: (id: string, episodeId: string, engine: TranscribeEngine = 'whisper', cropRegion?: number[] | null) =>
+    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/transcribe`, {
+      engine,
+      crop_region: cropRegion ?? null,
+    }),
   startEpisodeTranslate: (id: string, episodeId: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/translate`),
   startEpisodeTTS: (id: string, episodeId: string, voice: string, engine: TTSEngine = 'capcut') =>
@@ -314,6 +383,44 @@ export const api = {
   cancelMergeJob: (mergeId: string) => postJson<{ status: string }>(`/api/merges/${mergeId}/jobs/cancel`),
   downloadMergeUrl: (mergeId: string) => `/api/merges/${mergeId}/download`,
   deleteMerge: (mergeId: string) => request<void>(`/api/merges/${mergeId}`, { method: 'DELETE' }),
+
+  // --- Tải video riêng (Douyin, đứng riêng không thuộc project nào) ---
+  listDownloads: () => request<DownloadItem[]>('/api/downloads'),
+  pickDownloadFolder: () => postJson<{ path: string | null }>('/api/downloads/pick-folder'),
+  createSingleDownload: (url: string, destDir = '', title = '') =>
+    postJson<{ download_id: string; status: string }>('/api/downloads', { mode: 'single', url, dest_dir: destDir, title }),
+  createProfileDownload: (url: string, modes: string[], number: Record<string, number>, destDir = '', title = '') =>
+    postJson<{ download_id: string; status: string }>('/api/downloads', {
+      mode: 'profile',
+      url,
+      modes,
+      number,
+      dest_dir: destDir,
+      title,
+    }),
+  // Chỉ lấy thông tin (title/caption/thumb/link/thống kê), KHÔNG tải video.
+  createInfoScanDownload: (url: string, modes: string[], number: Record<string, number>, title = '') =>
+    postJson<{ download_id: string; status: string }>('/api/downloads', {
+      mode: 'info',
+      url,
+      modes,
+      number,
+      title,
+    }),
+  createSearchDownload: (keyword: string, searchMax: number, destDir = '', title = '') =>
+    postJson<{ download_id: string; status: string }>('/api/downloads', {
+      mode: 'search',
+      keyword,
+      search_max: searchMax,
+      dest_dir: destDir,
+      title,
+    }),
+  downloadJobStatus: (downloadId: string) => request<JobStatus>(`/api/downloads/${downloadId}/jobs/status`),
+  cancelDownloadJob: (downloadId: string) => postJson<{ status: string }>(`/api/downloads/${downloadId}/jobs/cancel`),
+  downloadFileUrl: (downloadId: string, filename: string) =>
+    `/api/downloads/${downloadId}/files/${encodeURIComponent(filename)}`,
+  revealDownload: (downloadId: string) => postJson<{ status: string }>(`/api/downloads/${downloadId}/reveal`),
+  deleteDownload: (downloadId: string) => request<void>(`/api/downloads/${downloadId}`, { method: 'DELETE' }),
 
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (

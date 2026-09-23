@@ -66,6 +66,13 @@ class ProjectState(BaseModel):
     # chạy TUẦN TỰ) — khi True, stages ở cấp project (transcribe/translate/
     # tts/assemble) không còn dùng nữa, chỉ episodes mới có ý nghĩa.
     split_mode: bool = False
+    # "Xuất video trực tiếp" (ffmpeg, không qua CapCut) — hành động PHỤ, song
+    # song với "assemble"/CapCut, không bắt buộc theo tuần tự pipeline. Cố
+    # tình KHÔNG nằm trong `stages`/STAGE_ORDER: nếu thêm vào STAGE_ORDER,
+    # `current_stage()` sẽ coi mọi project đã xong CapCut nhưng chưa xuất
+    # trực tiếp là "chưa xong" — sai, vì đây là lựa chọn không bắt buộc.
+    export: StageRecord = Field(default_factory=StageRecord)
+    export_blur_region: Optional[list[float]] = None  # [x,y,w,h] phân số, lưu lại giữa các lần xuất
 
 
 def empty_stages() -> dict[str, StageRecord]:

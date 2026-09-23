@@ -12,10 +12,11 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from . import jobs, merges as mg, projects as pj, settings as app_settings
+from . import config, downloads as dl, jobs, merges as mg, projects as pj, settings as app_settings
 from .models import Episode, StageRecord, StageStatus
 from .schemas import (
     AppSettingsResponse,
+    CreateDownloadRequest,
     CreateEpisodeRequest,
     CreateProjectRequest,
     EpisodeDetail,
@@ -30,6 +31,7 @@ from .schemas import (
     SplitProjectRequest,
     SrtCue,
     StartAssembleRequest,
+    StartExportRequest,
     StartTranscribeRequest,
     StartTTSRequest,
     TTSCueRequest,
@@ -37,12 +39,16 @@ from .schemas import (
     UpdateAppSettingsRequest,
     UpdateAutoPipelineRequest,
     UpdateCueRequest,
+    UpdateExportBlurRegionRequest,
 )
 from .stages import assemble as assemble_stage
+from .stages import douyin_dl as douyin_dl_stage
 from .stages import dub_audio as dub_audio_stage
+from .stages import export_direct as export_direct_stage
 from .stages import fetch_url as fetch_url_stage
 from .stages import ingest as ingest_stage
 from .stages import transcribe as transcribe_stage
+from .stages import transcribe_ocr as ocr_stage
 from .stages import transcribe_sensevoice as sensevoice_stage
 from .stages import translate as translate_stage
 from .stages import tts as tts_stage
@@ -93,6 +99,21 @@ def _require_episode_done(episode: Episode, stage: str, message: str) -> None:
 
 
 EPISODE_STAGES = ("ingest", "transcribe", "translate", "tts", "assemble")
+
+# 3 engine transcribe — tra cứu 1 chỗ duy nhất thay vì ternary lặp lại ở mỗi
+# route/hàm start (project-level, episode-level, auto-pipeline validate).
+TRANSCRIBE_ENGINES: dict[str, tuple[object, str]] = {
+    "whisper": (transcribe_stage.transcribe_video, "Whisper zh"),
+    "sensevoice": (sensevoice_stage.transcribe_video, "SenseVoice"),
+    "ocr": (ocr_stage.transcribe_video, "OCR (phụ đề cứng)"),
+}
+DEFAULT_TRANSCRIBE_ENGINE = "whisper"
+
+
+def _resolve_transcribe_engine(engine: str | None) -> tuple[str, object, str]:
+    key = engine if engine in TRANSCRIBE_ENGINES else DEFAULT_TRANSCRIBE_ENGINE
+    stage_fn, label = TRANSCRIBE_ENGINES[key]
+    return key, stage_fn, label
 
 
 def _episode_job_key(project_id: str, episode_id: str, stage: str) -> str:
@@ -242,7 +263,7 @@ def rename_project_route(project_id: str, body: RenameProjectRequest):
 
 @app.patch("/api/projects/{project_id}/auto-pipeline", response_model=ProjectSummary)
 def update_auto_pipeline_route(project_id: str, body: UpdateAutoPipelineRequest):
-    engine = "sensevoice" if body.engine == "sensevoice" else "whisper"
+    engine, _, _ = _resolve_transcribe_engine(body.engine)
     tts_engine = "vieneu" if body.tts_engine == "vieneu" else "capcut"
     audio_mode = body.audio_mode if body.audio_mode in ("separated", "original", "mute") else "separated"
     with pj.locked_project(project_id) as state:
@@ -602,7 +623,9 @@ def ingest_episode_video_url(project_id: str, episode_id: str, body: IngestUrlRe
     return {"status": "started"}
 
 
-def _start_episode_transcribe(project_id: str, episode_id: str, engine: str) -> jobs.JobState | None:
+def _start_episode_transcribe(
+    project_id: str, episode_id: str, engine: str, crop_region: list[float] | None = None
+) -> jobs.JobState | None:
     state = pj.load_project(project_id)
     episode = pj.find_episode(state, episode_id)
     if not episode.video_relpath:
@@ -611,9 +634,11 @@ def _start_episode_transcribe(project_id: str, episode_id: str, engine: str) -> 
     video_path = root / episode.video_relpath
     total = max(1, int(episode.duration_sec or 1))
 
-    engine = "sensevoice" if engine == "sensevoice" else "whisper"
-    stage_fn = sensevoice_stage.transcribe_video if engine == "sensevoice" else transcribe_stage.transcribe_video
-    engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
+    engine, stage_fn, engine_label = _resolve_transcribe_engine(engine)
+    # `crop_region` (x,y,w,h dạng phân số 0-1, người dùng tự khoanh trên
+    # preview video) chỉ engine "ocr" hiểu — 2 engine kia không nhận tham số
+    # này, nên chỉ truyền khi thật sự dùng OCR để không vỡ signature của chúng.
+    extra_kwargs = {"crop_region": tuple(crop_region)} if engine == "ocr" and crop_region else {}
 
     def target(job: jobs.JobState) -> None:
         job.items = [jobs.JobItem(id=engine, label=engine_label)]
@@ -634,7 +659,7 @@ def _start_episode_transcribe(project_id: str, episode_id: str, engine: str) -> 
             job.current_label = label
 
         try:
-            cues, lang = stage_fn(video_path, root / "sub_zh.srt", on_progress=on_progress)
+            cues, lang = stage_fn(video_path, root / "sub_zh.srt", on_progress=on_progress, **extra_kwargs)
         except jobs.JobCancelled:
             _mark_cancelled_episode(project_id, episode_id, "transcribe", job)
             return
@@ -675,9 +700,8 @@ def start_episode_transcribe_route(project_id: str, episode_id: str, body: Start
     _require_episode_done(episode, "ingest", "Chưa upload video")
     if not episode.video_relpath:
         raise HTTPException(status_code=409, detail="Chưa có file video")
-    engine = body.engine if body and body.engine == "sensevoice" else "whisper"
-    engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
-    job = _start_episode_transcribe(project_id, episode_id, engine)
+    engine, _, engine_label = _resolve_transcribe_engine(body.engine if body else None)
+    job = _start_episode_transcribe(project_id, episode_id, engine, body.crop_region if body else None)
     if job is None:
         raise HTTPException(status_code=409, detail=f"{engine_label} đang chạy cho tập này")
     return {"status": "started"}
@@ -1242,7 +1266,9 @@ def reveal_video(project_id: str):
 # ------------------------------------------------------------------ Transcribe / Translate jobs
 
 
-def _start_transcribe(project_id: str, engine: str) -> jobs.JobState | None:
+def _start_transcribe(
+    project_id: str, engine: str, crop_region: list[float] | None = None
+) -> jobs.JobState | None:
     state = pj.load_project(project_id)
     if not state.video_relpath:
         return None
@@ -1250,9 +1276,8 @@ def _start_transcribe(project_id: str, engine: str) -> jobs.JobState | None:
     video_path = root / state.video_relpath
     total = max(1, int(state.duration_sec or 1))
 
-    engine = "sensevoice" if engine == "sensevoice" else "whisper"
-    stage_fn = sensevoice_stage.transcribe_video if engine == "sensevoice" else transcribe_stage.transcribe_video
-    engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
+    engine, stage_fn, engine_label = _resolve_transcribe_engine(engine)
+    extra_kwargs = {"crop_region": tuple(crop_region)} if engine == "ocr" and crop_region else {}
 
     def target(job: jobs.JobState) -> None:
         job.items = [jobs.JobItem(id=engine, label=engine_label)]
@@ -1273,7 +1298,7 @@ def _start_transcribe(project_id: str, engine: str) -> jobs.JobState | None:
             job.current_label = label
 
         try:
-            cues, lang = stage_fn(video_path, root / "sub_zh.srt", on_progress=on_progress)
+            cues, lang = stage_fn(video_path, root / "sub_zh.srt", on_progress=on_progress, **extra_kwargs)
         except jobs.JobCancelled:
             _mark_cancelled(project_id, "transcribe", job)
             return
@@ -1311,9 +1336,8 @@ def start_transcribe_route(project_id: str, body: StartTranscribeRequest | None 
     _require_done(state, "ingest", "Chưa upload video")
     if not state.video_relpath:
         raise HTTPException(status_code=409, detail="Chưa có file video")
-    engine = body.engine if body and body.engine == "sensevoice" else "whisper"
-    engine_label = "SenseVoice" if engine == "sensevoice" else "Whisper zh"
-    job = _start_transcribe(project_id, engine)
+    engine, _, engine_label = _resolve_transcribe_engine(body.engine if body else None)
+    job = _start_transcribe(project_id, engine, body.crop_region if body else None)
     if job is None:
         raise HTTPException(status_code=409, detail=f"{engine_label} đang chạy cho dự án này")
     return {"status": "started"}
@@ -1828,6 +1852,266 @@ def _start_assemble(project_id: str, audio_mode: str = "separated", min_video_sp
     return jobs.start_job(f"{project_id}:assemble", 1, target)
 
 
+# ------------------------------------------------------------------ Xuất video trực tiếp (ffmpeg, không qua CapCut)
+# Hành động PHỤ song song với assemble/CapCut — xem comment ở
+# `ProjectState.export` (models.py) lý do không nằm trong STAGE_ORDER.
+
+
+def _mark_export_cancelled(project_id: str, job: jobs.JobState) -> None:
+    """Mirror `_mark_cancelled` nhưng ghi vào `state.export` — `export` nằm
+    RIÊNG ngoài `stages` dict (xem models.py) nên không dùng chung được."""
+    job.status = "cancelled"
+    for it in job.items:
+        if it.status == "running":
+            it.status = "failed"
+            it.error = "Đã dừng"
+    with pj.locked_project(project_id) as s:
+        s.export.status = StageStatus.failed
+        s.export.error = "Đã dừng theo yêu cầu người dùng"
+    pj.append_log(project_id, "export", "Đã dừng theo yêu cầu người dùng")
+
+
+def _export_dir(project_id: str) -> Path:
+    d = pj.project_dir(project_id) / "export"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _export_asset_path(project_id: str, stem: str) -> Path | None:
+    """Tìm file `music.*`/`logo.*` đã upload trong thư mục export của
+    project (đuôi file có thể khác nhau tuỳ định dạng người dùng upload)."""
+    matches = sorted(_export_dir(project_id).glob(f"{stem}.*"))
+    return matches[0] if matches else None
+
+
+def _start_export(project_id: str, audio_mode: str, min_video_speed: float) -> jobs.JobState | None:
+    state = pj.load_project(project_id)
+    root = pj.project_dir(project_id)
+    if not state.video_relpath:
+        return None
+
+    mute_original_audio = audio_mode == "mute"
+    bg_filename = "background.wav" if audio_mode == "separated" else "background_original.wav"
+
+    def target(job: jobs.JobState) -> None:
+        bg_label = (
+            "Tắt âm thanh gốc" if mute_original_audio
+            else "Tách nhạc nền (demucs)" if audio_mode == "separated"
+            else "Trích audio gốc (giữ nguyên)"
+        )
+        job.items = [jobs.JobItem(id="background", label=bg_label), jobs.JobItem(id="render", label="Dựng video")]
+        job.current_label = job.items[0].label
+        with pj.locked_project(project_id) as s:
+            s.export.status = StageStatus.running
+            s.export.error = None
+
+        video_path = root / state.video_relpath
+        bg_path: Path | None = root / bg_filename
+
+        def on_bg_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
+            job.current_label = label
+
+        if mute_original_audio:
+            bg_path = None
+        elif not bg_path.exists():
+            job.items[0].status = "running"
+            try:
+                if audio_mode == "separated":
+                    dub_audio_stage.extract_background(video_path, bg_path, on_progress=on_bg_progress, job=job)
+                else:
+                    dub_audio_stage.extract_original_audio(video_path, bg_path, on_progress=on_bg_progress)
+            except jobs.JobCancelled:
+                _mark_export_cancelled(project_id, job)
+                return
+            except dub_audio_stage.DubAudioError as err:
+                job.items[0].status = "failed"
+                job.status = "failed"
+                job.error = str(err)
+                with pj.locked_project(project_id) as s:
+                    s.export.status = StageStatus.failed
+                    s.export.error = str(err)
+                pj.append_log(project_id, "export", str(err))
+                return
+        job.items[0].status = "done"
+
+        job.items[1].status = "running"
+        job.current_label = "Dựng video"
+
+        def on_render_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
+            job.done_count = done
+            job.total = max(tot, 1)
+            job.current_label = label
+
+        blur_region = tuple(state.export_blur_region) if state.export_blur_region else None
+        music_path = _export_asset_path(project_id, "music")
+        logo_path = _export_asset_path(project_id, "logo")
+        output_path = _export_dir(project_id) / "final.mp4"
+
+        try:
+            manifest_path = root / "audio" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
+            vi_cues = load_srt(root / "sub_vi.srt")
+            export_direct_stage.render_video(
+                video_path=video_path,
+                background_path=bg_path,
+                manifest=manifest,
+                vi_cues=vi_cues,
+                audio_dir=root / "audio",
+                output_path=output_path,
+                blur_region=blur_region,
+                music_path=music_path,
+                logo_path=logo_path,
+                min_video_speed=min_video_speed,
+                on_progress=on_render_progress,
+                job=job,
+            )
+        except jobs.JobCancelled:
+            _mark_export_cancelled(project_id, job)
+            return
+        except export_direct_stage.ExportDirectError as err:
+            job.items[1].status = "failed"
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.export.status = StageStatus.failed
+                s.export.error = str(err)
+            pj.append_log(project_id, "export", str(err))
+            return
+        except Exception as err:
+            logger.exception("Xuất video trực tiếp lỗi {}", project_id)
+            job.items[1].status = "failed"
+            job.items[1].error = str(err)
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.export.status = StageStatus.failed
+                s.export.error = str(err)
+            pj.append_log(project_id, "export", f"Lỗi: {err}")
+            return
+
+        job.items[1].status = "done"
+        job.status = "done"
+        with pj.locked_project(project_id) as s:
+            s.export.status = StageStatus.done
+            s.export.output = str(output_path)
+            s.export.progress = "final.mp4"
+            s.export.error = None
+            s.export.at = datetime.now()
+        pj.append_log(project_id, "export", f"video → {output_path}")
+
+    return jobs.start_job(f"{project_id}:export", 1, target)
+
+
+@app.post("/api/projects/{project_id}/export", status_code=202)
+def start_export_route(project_id: str, body: StartExportRequest | None = None):
+    state = pj.load_project(project_id)
+    if state.project_type == "multi" or state.split_mode:
+        raise HTTPException(status_code=409, detail="Xuất video trực tiếp hiện chỉ hỗ trợ dự án đơn")
+    _require_done(state, "tts", "Chưa có audio TTS — chạy TTS trước")
+    if not state.video_relpath:
+        raise HTTPException(status_code=409, detail="Chưa có file video")
+    job = _start_export(
+        project_id,
+        audio_mode=(body.audio_mode if body else "separated"),
+        min_video_speed=(body.min_video_speed if body else 0.85),
+    )
+    if job is None:
+        raise HTTPException(status_code=409, detail="Xuất video đang chạy cho dự án này")
+    return {"status": "started"}
+
+
+@app.post("/api/projects/{project_id}/export/blur-region")
+def update_export_blur_region(project_id: str, body: UpdateExportBlurRegionRequest):
+    with pj.locked_project(project_id) as s:
+        s.export_blur_region = body.region
+    return {"status": "ok"}
+
+
+@app.post("/api/projects/{project_id}/export/detect-blur-region")
+def detect_export_blur_region(project_id: str):
+    state = pj.load_project(project_id)
+    if not state.video_relpath:
+        raise HTTPException(status_code=409, detail="Chưa có file video")
+    video_path = pj.project_dir(project_id) / state.video_relpath
+    try:
+        region = ocr_stage.detect_subtitle_region(video_path)
+    except ocr_stage.TranscribeOCRError as err:
+        raise HTTPException(status_code=500, detail=str(err)) from err
+    if region is None:
+        raise HTTPException(status_code=422, detail="Không phát hiện được chữ phụ đề nào trong video")
+    with pj.locked_project(project_id) as s:
+        s.export_blur_region = list(region)
+    return {"status": "ok", "region": list(region)}
+
+
+@app.post("/api/projects/{project_id}/export/reveal")
+def reveal_export_video(project_id: str):
+    video_path = _export_dir(project_id) / "final.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Chưa xuất video hoặc file không tồn tại trên đĩa")
+    try:
+        subprocess.run(["explorer", f"/select,{video_path}"], check=False)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    return {"status": "ok"}
+
+
+@app.post("/api/projects/{project_id}/export/music")
+async def upload_export_music(project_id: str, file: UploadFile = File(...)):
+    ext = Path(file.filename or "music.mp3").suffix or ".mp3"
+    d = _export_dir(project_id)
+    for old in d.glob("music.*"):
+        old.unlink(missing_ok=True)
+    dest = d / f"music{ext}"
+    dest.write_bytes(await file.read())
+    return {"status": "ok"}
+
+
+@app.delete("/api/projects/{project_id}/export/music")
+def delete_export_music(project_id: str):
+    for old in _export_dir(project_id).glob("music.*"):
+        old.unlink(missing_ok=True)
+    return {"status": "ok"}
+
+
+@app.post("/api/projects/{project_id}/export/logo")
+async def upload_export_logo(project_id: str, file: UploadFile = File(...)):
+    ext = Path(file.filename or "logo.png").suffix or ".png"
+    d = _export_dir(project_id)
+    for old in d.glob("logo.*"):
+        old.unlink(missing_ok=True)
+    dest = d / f"logo{ext}"
+    dest.write_bytes(await file.read())
+    return {"status": "ok"}
+
+
+@app.delete("/api/projects/{project_id}/export/logo")
+def delete_export_logo(project_id: str):
+    for old in _export_dir(project_id).glob("logo.*"):
+        old.unlink(missing_ok=True)
+    return {"status": "ok"}
+
+
+@app.get("/api/projects/{project_id}/export/music")
+def get_export_music(project_id: str):
+    # Đuôi file thật do người dùng upload quyết định (`music.mp3`/`.wav`/...)
+    # — route riêng này phục vụ đúng file bất kể đuôi, để FE khỏi phải đoán.
+    path = _export_asset_path(project_id, "music")
+    if not path:
+        raise HTTPException(status_code=404, detail="Chưa có nhạc nền")
+    return FileResponse(path)
+
+
+@app.get("/api/projects/{project_id}/export/logo")
+def get_export_logo(project_id: str):
+    path = _export_asset_path(project_id, "logo")
+    if not path:
+        raise HTTPException(status_code=404, detail="Chưa có logo")
+    return FileResponse(path)
+
+
 @app.post("/api/projects/{project_id}/assemble", status_code=202)
 def start_assemble_route(project_id: str, body: StartAssembleRequest | None = None):
     state = pj.load_project(project_id)
@@ -1852,9 +2136,12 @@ def start_assemble_route(project_id: str, body: StartAssembleRequest | None = No
     return {"status": "started"}
 
 
+_JOB_STAGES = ("ingest", "transcribe", "translate", "tts", "assemble", "export")
+
+
 @app.post("/api/projects/{project_id}/jobs/{stage}/cancel")
 def cancel_job_route(project_id: str, stage: str):
-    if stage not in ("ingest", "transcribe", "translate", "tts", "assemble"):
+    if stage not in _JOB_STAGES:
         raise HTTPException(status_code=404, detail="Stage không hỗ trợ job")
     ok = jobs.request_cancel(f"{project_id}:{stage}")
     if not ok:
@@ -1864,20 +2151,24 @@ def cancel_job_route(project_id: str, stage: str):
 
 @app.get("/api/projects/{project_id}/jobs/{stage}", response_model=JobStatusResponse)
 def job_status(project_id: str, stage: str):
-    if stage not in ("ingest", "transcribe", "translate", "tts", "assemble"):
+    if stage not in _JOB_STAGES:
         raise HTTPException(status_code=404, detail="Stage không hỗ trợ job")
     job = jobs.get_job(f"{project_id}:{stage}")
     if job is None:
         state = pj.load_project(project_id)
-        orphaned = state.stages[stage].status == StageStatus.running
+        # "export" nằm riêng ngoài `stages` dict (xem models.py) — đọc/ghi
+        # qua `state.export` thay vì `state.stages["export"]`.
+        record = state.export if stage == "export" else state.stages[stage]
+        orphaned = record.status == StageStatus.running
         if orphaned:
             # Job chết theo tiến trình cũ (server restart) không kịp ghi lại
             # state — "running" sẽ treo mãi trong project.json nếu không tự
             # sửa ở đây, khiến nút "Chạy ..." cứ hiện đang chạy dù job đã chết.
             with pj.locked_project(project_id) as s:
-                if s.stages[stage].status == StageStatus.running:
-                    s.stages[stage].status = StageStatus.failed
-                    s.stages[stage].error = "Phiên trước bị gián đoạn (server restart) — bấm chạy lại."
+                s_record = s.export if stage == "export" else s.stages[stage]
+                if s_record.status == StageStatus.running:
+                    s_record.status = StageStatus.failed
+                    s_record.error = "Phiên trước bị gián đoạn (server restart) — bấm chạy lại."
             pj.append_log(project_id, stage, "Phiên trước bị gián đoạn (server restart)")
         return JobStatusResponse(registered=False, orphaned=orphaned)
     return JobStatusResponse(
@@ -2029,6 +2320,260 @@ def delete_merge_route(merge_id: str):
         raise HTTPException(status_code=409, detail="Đang ghép — đợi xong hoặc bấm Dừng trước")
     try:
         mg.delete_merge(merge_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+
+
+# ------------------------------------------------------------------ Tải video riêng (không thuộc project nào)
+
+
+@app.post("/api/downloads/pick-folder")
+def pick_download_folder_route():
+    """Bật hộp thoại chọn thư mục gốc Windows trên chính máy chạy server —
+    browser không cho JS lấy đường dẫn ổ đĩa thật từ input chọn thư mục vì lý
+    do sandbox, nhưng app này chạy local nên server tự mở dialog thay được.
+    Route SYNC (không async) — Starlette tự chạy trong threadpool riêng nên
+    không chặn các request khác dù dialog treo chờ người dùng chọn."""
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$owner = New-Object System.Windows.Forms.Form; $owner.TopMost = $true;"
+        "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
+        "$f.Description = 'Chon thu muc luu video';"
+        "if ($f.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }"
+        "$owner.Dispose()"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ chọn thư mục trên Windows") from err
+    except subprocess.TimeoutExpired:
+        return {"path": None}
+    path = (result.stdout or "").strip()
+    return {"path": path or None}
+
+
+@app.get("/api/downloads")
+def list_downloads_route():
+    return dl.list_downloads()
+
+
+@app.post("/api/downloads", status_code=202)
+def create_download_route(body: CreateDownloadRequest):
+    if body.mode == "single":
+        if not body.url.strip():
+            raise HTTPException(status_code=400, detail="Chưa dán link")
+    elif body.mode == "profile":
+        if not body.url.strip():
+            raise HTTPException(status_code=400, detail="Chưa dán link trang cá nhân")
+        if not body.modes:
+            raise HTTPException(status_code=400, detail="Chưa chọn chế độ tải (post/like/mix/music)")
+    elif body.mode == "search":
+        if not body.keyword.strip():
+            raise HTTPException(status_code=400, detail="Chưa nhập từ khoá")
+    elif body.mode == "info":
+        if not body.url.strip():
+            raise HTTPException(status_code=400, detail="Chưa dán link trang cá nhân")
+        if not body.modes:
+            raise HTTPException(status_code=400, detail="Chưa chọn chế độ lấy (post/like/mix/music)")
+    else:
+        raise HTTPException(status_code=400, detail=f'Mode "{body.mode}" không hợp lệ')
+    if not config.douyin_dl_available():
+        raise HTTPException(status_code=409, detail="Chưa cấu hình DOUYIN_DL_DIR — xem README để clone douyin-downloader")
+    # Chạy 2 lượt douyin-downloader ĐỒNG THỜI (mỗi lượt tự mở 1 trình duyệt
+    # headless riêng lấy token) đã xác nhận thật làm Douyin trả về thiếu/rỗng
+    # kết quả dù tiến trình báo "thành công" — giới hạn CHẠY 1 LƯỢT TẠI 1 THỜI
+    # ĐIỂM cho cả trang, không chỉ theo từng download_id riêng.
+    if jobs.any_job_running("download:"):
+        raise HTTPException(
+            status_code=409,
+            detail="Đang có 1 lượt tải/quét khác chạy — đợi xong rồi thử lại (chạy đồng thời dễ khiến Douyin trả kết quả thiếu)",
+        )
+
+    title = body.title.strip() or (body.url.strip() or body.keyword.strip())
+    meta = dl.create_download(title, body.mode, body.model_dump(exclude={"title"}))
+    download_id = meta["download_id"]
+    root = dl.download_dir(download_id)
+    # Thư mục lưu thật — người dùng chọn (`dest_dir`) hoặc mặc định trong
+    # workspace/downloads/<id>/files nếu để trống.
+    output_dir = Path(body.dest_dir).expanduser().resolve() if body.dest_dir.strip() else (root / "files")
+    meta["output_dir"] = str(output_dir)
+    dl.save_meta(download_id, meta)
+
+    # Ước lượng tổng số video để tính % tiến trình thật (JobProgressBar) —
+    # không biết trước chính xác (vd trang cá nhân có ít video hơn giới hạn),
+    # nhưng dùng đúng số bạn đã yêu cầu làm mẫu số là hợp lý nhất có thể; nếu
+    # tải vượt mốc này (mode "0 = không giới hạn"), on_poll trong douyin_dl.py
+    # tự nới `job.total` lên theo thực tế (xem `job.total = max(...)`).
+    if body.mode == "single":
+        total_hint = 1
+    elif body.mode in ("profile", "info"):
+        counts = [n for n in body.number.values() if n > 0]
+        total_hint = sum(counts) if counts else 1
+    else:
+        total_hint = max(body.search_max, 1)
+
+    def target(job: jobs.JobState) -> None:
+        # Không đặt sẵn 1 item tĩnh "Đang tải" — douyin_dl.py tự quét thư mục
+        # đích mỗi 0.5s và APPEND 1 JobItem thật cho mỗi video vừa tải xong
+        # (xem douyin_dl.py::_run_download/on_poll), nên job.items phản ánh
+        # đúng danh sách video thật thay vì 1 dòng trạng thái chung chung.
+        job.items = []
+        job.total = total_hint
+        job.current_label = "Đang tải..."
+        meta_run = dl.load_meta(download_id)
+        meta_run["status"] = "running"
+        dl.save_meta(download_id, meta_run)
+
+        scanned_infos: list[dict] | None = None
+        try:
+            if body.mode == "single":
+                path, _title = douyin_dl_stage.download_single(body.url, output_dir, job=job, flatten_names=True)
+                files = [path]
+            elif body.mode == "profile":
+                files = douyin_dl_stage.download_profile_batch(
+                    body.url, body.modes, body.number, output_dir, job=job, flatten_names=True
+                )
+            elif body.mode == "info":
+                files = []
+                scanned_infos = douyin_dl_stage.scan_profile_info(body.url, body.modes, body.number, output_dir, job=job)
+            else:
+                files = douyin_dl_stage.search_and_download(
+                    body.keyword, body.search_max, output_dir, job=job, flatten_names=True
+                )
+        except jobs.JobCancelled:
+            job.status = "cancelled"
+            meta_c = dl.load_meta(download_id)
+            meta_c["status"] = "failed"
+            meta_c["error"] = "Đã dừng theo yêu cầu người dùng"
+            dl.save_meta(download_id, meta_c)
+            return
+        except douyin_dl_stage.DouyinDlError as err:
+            job.status = "failed"
+            job.error = str(err)
+            meta_err = dl.load_meta(download_id)
+            meta_err["status"] = "failed"
+            meta_err["error"] = str(err)
+            dl.save_meta(download_id, meta_err)
+            return
+        except Exception as err:
+            logger.exception("Tải video lỗi {}", download_id)
+            job.status = "failed"
+            job.error = str(err)
+            meta_err2 = dl.load_meta(download_id)
+            meta_err2["status"] = "failed"
+            meta_err2["error"] = str(err)
+            dl.save_meta(download_id, meta_err2)
+            return
+
+        result_count = len(scanned_infos) if scanned_infos is not None else len(files)
+        job.done_count = result_count
+        job.total = max(result_count, 1)
+        job.status = "done"
+        meta_done = dl.load_meta(download_id)
+        meta_done["status"] = "done"
+        if scanned_infos is not None:
+            # mode "info" — chỉ lấy thông tin, không có file video nào để show.
+            meta_done["output_files"] = []
+            meta_done["video_info"] = scanned_infos
+        else:
+            meta_done["output_files"] = [str(p.relative_to(output_dir)) for p in files]
+            # Metadata đi kèm (caption/tác giả/link chia sẻ/lượt thích...) —
+            # file douyin_dl.py đã đổi tên khớp đúng thứ tự với `files` khi
+            # flatten (xem douyin_dl.py::_run_download on_poll, "{n}.json"
+            # cạnh "{n}.mp4").
+            video_info = []
+            for p in files:
+                info = douyin_dl_stage.read_video_info(p.with_suffix(".json"))
+                video_info.append(info)
+            meta_done["video_info"] = video_info
+        dl.save_meta(download_id, meta_done)
+
+    jobs.start_job(f"download:{download_id}", 1, target)
+    return {"download_id": download_id, "status": "started"}
+
+
+@app.get("/api/downloads/{download_id}/jobs/status", response_model=JobStatusResponse)
+def download_job_status_route(download_id: str):
+    job = jobs.get_job(f"download:{download_id}")
+    if job is None:
+        try:
+            meta = dl.load_meta(download_id)
+        except FileNotFoundError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        orphaned = meta.get("status") == "running"
+        if orphaned:
+            meta["status"] = "failed"
+            meta["error"] = "Phiên trước bị gián đoạn (server restart) — bấm tải lại."
+            dl.save_meta(download_id, meta)
+        return JobStatusResponse(registered=False, orphaned=orphaned)
+    return JobStatusResponse(
+        registered=True,
+        status=job.status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[JobItemResponse(id=it.id, label=it.label, status=it.status, error=it.error) for it in job.items],
+        error=job.error,
+        started_at=job.started_at,
+    )
+
+
+@app.post("/api/downloads/{download_id}/jobs/cancel")
+def cancel_download_job_route(download_id: str):
+    ok = jobs.request_cancel(f"download:{download_id}")
+    if not ok:
+        raise HTTPException(status_code=409, detail="Không có job nào đang chạy")
+    return {"status": "cancelling"}
+
+
+@app.get("/api/downloads/{download_id}/files/{filename:path}")
+def download_file_route(download_id: str, filename: str):
+    try:
+        meta = dl.load_meta(download_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if filename not in (meta.get("output_files") or []):
+        raise HTTPException(status_code=404, detail="Không tìm thấy file")
+    output_dir = meta.get("output_dir") or str(dl.download_dir(download_id) / "files")
+    path = Path(output_dir) / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File không còn trên đĩa")
+    return FileResponse(path, filename=path.name)
+
+
+@app.post("/api/downloads/{download_id}/reveal")
+def reveal_download_route(download_id: str):
+    try:
+        meta = dl.load_meta(download_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    output_dir = meta.get("output_dir") or str(dl.download_dir(download_id) / "files")
+    target = Path(output_dir)
+    files = meta.get("output_files") or []
+    select_path = target / files[0] if files else target
+    if not select_path.exists():
+        raise HTTPException(status_code=404, detail="Thư mục/file không còn trên đĩa")
+    try:
+        if files:
+            subprocess.run(["explorer", f"/select,{select_path}"], check=False)
+        else:
+            subprocess.run(["explorer", str(select_path)], check=False)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    return {"status": "ok"}
+
+
+@app.delete("/api/downloads/{download_id}", status_code=204)
+def delete_download_route(download_id: str):
+    if jobs.is_job_running(f"download:{download_id}"):
+        raise HTTPException(status_code=409, detail="Đang tải — đợi xong hoặc bấm Dừng trước")
+    try:
+        dl.delete_download(download_id)
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
 

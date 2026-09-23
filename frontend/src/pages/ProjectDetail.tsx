@@ -6,19 +6,41 @@ import {
   DEFAULT_MIN_VIDEO_SPEED,
   MIN_VIDEO_SPEED_OPTIONS,
   STAGE_LABELS,
+  STAGE_ORDER,
+  TRANSCRIBE_ENGINE_LABELS,
   type AudioMode,
+  type EpisodeDetail,
   type StageName,
   type StageRecord,
+  type StageStatus,
   type TranscribeEngine,
   type TTSEngine,
 } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
+import { srtTimeToSeconds } from '../lib/srt'
 import StatusBadge from '../components/StatusBadge'
 import JobProgressBar from '../components/JobProgressBar'
 import EpisodeCard from '../components/EpisodeCard'
 import ConfirmDialog from '../components/ConfirmDialog'
 import SplitTimeline from '../components/SplitTimeline'
+import OcrCropSelector, { type CropRegion } from '../components/OcrCropSelector'
+import ProjectSidebar from '../components/ProjectSidebar'
+import PinnedVideoPanel from '../components/PinnedVideoPanel'
+import HorizontalStepper from '../components/HorizontalStepper'
+import CollapsibleStageSection from '../components/CollapsibleStageSection'
+import DirectExportPanel from '../components/DirectExportPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
+
+// Trạng thái tổng hợp của 1 tập/đoạn — dùng cho chấm màu ở sidebar: có bước
+// nào lỗi thì ưu tiên hiện lỗi, có bước đang chạy thì hiện "đang chạy", mọi
+// bước xong hết mới hiện "xong", còn lại là "chưa chạy".
+function episodeOverallStatus(ep: EpisodeDetail): StageStatus {
+  const statuses = Object.values(ep.episode.stages).map((s) => s.status)
+  if (statuses.some((s) => s === 'failed')) return 'failed'
+  if (statuses.some((s) => s === 'running')) return 'running'
+  if (statuses.every((s) => s === 'done')) return 'done'
+  return 'pending'
+}
 
 function StageHeader({
   name,
@@ -52,11 +74,15 @@ export default function ProjectDetail() {
   const { projectId = '' } = useParams()
   const queryClient = useQueryClient()
   const fileRef = useRef<HTMLInputElement>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [videoDuration, setVideoDuration] = useState(0)
   const [file, setFile] = useState<File | null>(null)
   const [ingestTab, setIngestTab] = useState<'file' | 'url'>('file')
   const [shareUrl, setShareUrl] = useState('')
   const [tab, setTab] = useState<'table' | 'zh' | 'vi' | 'entity'>('table')
   const [engine, setEngine] = useState<TranscribeEngine>('whisper')
+  const [ocrCrop, setOcrCrop] = useState<CropRegion | null>(null)
   const [ttsEngine, setTtsEngine] = useState<TTSEngine>('capcut')
   const [voice, setVoice] = useState('')
   const [previewVoice, setPreviewVoice] = useState<string | null>(null)
@@ -71,6 +97,7 @@ export default function ProjectDetail() {
   const [deletingEpisodeId, setDeletingEpisodeId] = useState<string | null>(null)
   const [splitCount, setSplitCount] = useState(1)
   const [splitPoints, setSplitPoints] = useState<number[]>([])
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null)
   // "Đang dừng..." phải hiện xuyên suốt tới khi job THẬT SỰ dừng (không chỉ
   // trong lúc request cancel đang gửi) — nếu không, nút quay lại "Dừng" ngay
   // sau khi request xong dù job vẫn chạy tiếp vài chục giây, trông như bấm
@@ -146,6 +173,10 @@ export default function ProjectDetail() {
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['project', projectId] })
 
+  const seekTo = (ts: string) => {
+    if (videoRef.current) videoRef.current.currentTime = srtTimeToSeconds(ts)
+  }
+
   const uploadMutation = useMutation({
     mutationFn: () => {
       if (!file) throw new Error('Chưa chọn file')
@@ -174,7 +205,7 @@ export default function ProjectDetail() {
   })
 
   const whisperMutation = useMutation({
-    mutationFn: () => api.startTranscribe(projectId, engine),
+    mutationFn: () => api.startTranscribe(projectId, engine, engine === 'ocr' ? ocrCrop : null),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['job', projectId, 'transcribe'] })
     },
@@ -307,18 +338,41 @@ export default function ProjectDetail() {
   const isMulti = project.project_type === 'multi'
   const isSplit = project.split_mode
   const allEpisodesTTSDone = data.episodes.length > 0 && data.episodes.every((e) => e.episode.stages.tts.status === 'done')
-  const splitEpisodes = [...data.episodes].sort((a, b) => a.episode.order - b.episode.order)
+  const orderedEpisodes = [...data.episodes].sort((a, b) => a.episode.order - b.episode.order)
+  const activeEpisodeId = selectedEpisodeId && orderedEpisodes.some((e) => e.episode.episode_id === selectedEpisodeId)
+    ? selectedEpisodeId
+    : (orderedEpisodes[0]?.episode.episode_id ?? null)
+  const activeEpisode = orderedEpisodes.find((e) => e.episode.episode_id === activeEpisodeId) ?? null
+  const activeEpisodeIndex = orderedEpisodes.findIndex((e) => e.episode.episode_id === activeEpisodeId)
+
+  const isSingle = !isMulti && !isSplit
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6">
-      <div>
+    <div className={isSingle ? 'mx-auto max-w-[1600px]' : 'mx-auto max-w-6xl'}>
+      <div className="mb-6">
         <Link to="/" className="text-sm text-neutral-400">
           ← Dự án
         </Link>
-        <h1 className="mt-2 text-2xl">{project.title}</h1>
+        <h1 className="mt-2 text-2xl font-medium">{project.title}</h1>
         {cancelMutation.isError && <p className="mt-1 text-sm text-danger">{(cancelMutation.error as Error).message}</p>}
         <p className="font-mono text-xs text-neutral-500">{project.project_id}</p>
       </div>
+
+      <div className="flex items-start gap-6">
+      {(isMulti || isSplit) && orderedEpisodes.length > 0 && (
+        <ProjectSidebar
+          mode="episodes"
+          title={isMulti ? 'Các tập' : 'Các đoạn'}
+          episodes={orderedEpisodes.map((e, i) => ({
+            id: e.episode.episode_id,
+            label: e.episode.title || `${isMulti ? 'Tập' : 'Đoạn'} ${i + 1}`,
+            overallStatus: episodeOverallStatus(e),
+          }))}
+          selectedId={activeEpisodeId}
+          onSelect={setSelectedEpisodeId}
+        />
+      )}
+      <div className="min-w-0 flex-1 space-y-6">
 
       <section className="card flex flex-wrap items-center justify-between gap-3 p-4">
         <div>
@@ -333,7 +387,7 @@ export default function ProjectDetail() {
           </label>
           <p className="mt-1 text-xs text-neutral-400">
             Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt Whisper → Gemini → TTS →
-            CapCut cho tới hết, dùng engine/giọng đang chọn bên dưới ({engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}
+            CapCut cho tới hết, dùng engine/giọng đang chọn bên dưới ({TRANSCRIBE_ENGINE_LABELS[engine]}
             {' · '}
             {ttsEngine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}
             {selectedVoice ? ` · ${voiceOptions.find((v) => v.id === selectedVoice)?.label ?? selectedVoice}` : ''}).
@@ -357,6 +411,10 @@ export default function ProjectDetail() {
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                   SenseVoice
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
+                  OCR
                 </label>
               </div>
             </label>
@@ -408,8 +466,9 @@ export default function ProjectDetail() {
             />
           )}
 
-          {data.episodes.map((ep, i) => {
-            const episodeIds = data.episodes.map((e) => e.episode.episode_id)
+          {activeEpisode && (() => {
+            const i = activeEpisodeIndex
+            const episodeIds = orderedEpisodes.map((e) => e.episode.episode_id)
             const swapWith = (otherIndex: number) => {
               const ids = [...episodeIds]
               ;[ids[i], ids[otherIndex]] = [ids[otherIndex], ids[i]]
@@ -417,21 +476,21 @@ export default function ProjectDetail() {
             }
             return (
               <EpisodeCard
-                key={ep.episode.episode_id}
+                key={activeEpisode.episode.episode_id}
                 projectId={projectId}
-                detail={ep}
+                detail={activeEpisode}
                 index={i}
                 engine={engine}
                 voice={selectedVoice}
                 ttsEngine={ttsEngine}
                 canMoveUp={i > 0}
-                canMoveDown={i < data.episodes.length - 1}
+                canMoveDown={i < orderedEpisodes.length - 1}
                 onMoveUp={() => swapWith(i - 1)}
                 onMoveDown={() => swapWith(i + 1)}
-                onDelete={() => setDeletingEpisodeId(ep.episode.episode_id)}
+                onDelete={() => setDeletingEpisodeId(activeEpisode.episode.episode_id)}
               />
             )
-          })}
+          })()}
 
           <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-neutral-700 p-3">
             <input
@@ -470,6 +529,10 @@ export default function ProjectDetail() {
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                   SenseVoice
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
+                  OCR
                 </label>
               </div>
             </label>
@@ -526,12 +589,12 @@ export default function ProjectDetail() {
             </label>
           </div>
 
-          {splitEpisodes.map((ep, i) => (
+          {activeEpisode && (
             <EpisodeCard
-              key={ep.episode.episode_id}
+              key={activeEpisode.episode.episode_id}
               projectId={projectId}
-              detail={ep}
-              index={i}
+              detail={activeEpisode}
+              index={activeEpisodeIndex}
               engine={engine}
               voice={selectedVoice}
               ttsEngine={ttsEngine}
@@ -540,7 +603,7 @@ export default function ProjectDetail() {
               audioMode={audioMode}
               minVideoSpeed={minVideoSpeed}
             />
-          ))}
+          )}
         </section>
       )}
 
@@ -567,15 +630,45 @@ export default function ProjectDetail() {
       )}
 
       {!isMulti && !isSplit && (
-      <>
-      <section className="card p-5">
-        <StageHeader
-          name="ingest"
-          record={ingest}
-          busy={busyIngest}
-          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'ingest') || pendingCancel.ingest}
-          onCancel={() => cancelMutation.mutate('ingest')}
+      <div className="flex items-start gap-4.5">
+        {video_url && (
+          <PinnedVideoPanel
+            videoUrl={video_url}
+            videoRef={videoRef}
+            cues={cues}
+            currentTime={currentTime}
+            duration={videoDuration}
+            onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+            onLoadedMetadata={() => setVideoDuration(videoRef.current?.duration ?? 0)}
+          />
+        )}
+        <div className="min-w-0 flex-1 space-y-4.5">
+        <HorizontalStepper
+          steps={STAGE_ORDER.map((s) => ({ id: s, label: STAGE_LABELS[s], status: project.stages[s].status }))}
         />
+        <CollapsibleStageSection
+          id="stage-ingest"
+          label={STAGE_LABELS.ingest}
+          status={ingest.status}
+          meta={
+            ingest.status === 'done'
+              ? `${project.original_filename ?? ''}${project.duration_sec ? ` · ${Math.round(project.duration_sec)}s` : ''}`
+              : ingest.progress
+          }
+          defaultExpanded={ingest.status !== 'done'}
+          headerExtra={
+            busyIngest ? (
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm text-danger"
+                disabled={pendingCancel.ingest}
+                onClick={() => cancelMutation.mutate('ingest')}
+              >
+                {(cancelMutation.isPending && cancelMutation.variables === 'ingest') || pendingCancel.ingest ? 'Đang dừng...' : 'Dừng'}
+              </button>
+            ) : undefined
+          }
+        >
         <JobProgressBar job={ingestJob.data} formatCount={(n) => `${(n / (1024 * 1024)).toFixed(1)}MB`} />
         {ingest.status === 'done' && (
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -589,9 +682,6 @@ export default function ProjectDetail() {
           </div>
         )}
         {ingest.error && <p className="mb-3 text-sm text-danger">{ingest.error}</p>}
-        {video_url && (
-          <video className="mb-4 max-h-72 w-full rounded-lg bg-black" src={video_url} controls preload="metadata" />
-        )}
 
         <div className="mb-3 flex gap-4 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
@@ -647,7 +737,7 @@ export default function ProjectDetail() {
         {ingestUrlMutation.error && (
           <p className="mt-2 text-sm text-danger">{(ingestUrlMutation.error as Error).message}</p>
         )}
-      </section>
+        </CollapsibleStageSection>
 
       {ingest.status === 'done' && transcribe.status !== 'done' && !busyAny && project.duration_sec && (
         <section className="card space-y-3 p-5">
@@ -685,17 +775,32 @@ export default function ProjectDetail() {
         </section>
       )}
 
-      <section className="card p-5">
-        <StageHeader
-          name="transcribe"
-          record={transcribe}
-          busy={busyWhisper}
-          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'transcribe') || pendingCancel.transcribe}
-          onCancel={() => cancelMutation.mutate('transcribe')}
-        />
+      <CollapsibleStageSection
+        id="stage-transcribe"
+        label={STAGE_LABELS.transcribe}
+        status={transcribe.status}
+        meta={
+          transcribe.status === 'done'
+            ? `${transcribe.output ?? 'sub_zh.srt'}${transcribe.engine ? ` · ${TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}` : ''}`
+            : transcribe.progress
+        }
+        defaultExpanded={ingest.status === 'done' && transcribe.status !== 'done'}
+        headerExtra={
+          busyWhisper ? (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm text-danger"
+              disabled={pendingCancel.transcribe}
+              onClick={() => cancelMutation.mutate('transcribe')}
+            >
+              {(cancelMutation.isPending && cancelMutation.variables === 'transcribe') || pendingCancel.transcribe ? 'Đang dừng...' : 'Dừng'}
+            </button>
+          ) : undefined
+        }
+      >
         <p className="mb-3 text-sm text-neutral-400">
           Nhận diện giọng nói → <span className="mono">sub_zh.srt</span>
-          {transcribe.engine && <> · lần chạy trước dùng <b>{transcribe.engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}</b></>}
+          {transcribe.engine && <> · lần chạy trước dùng <b>{TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}</b></>}
         </p>
         <div className="mb-3 flex gap-4 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
@@ -718,7 +823,23 @@ export default function ProjectDetail() {
             />
             SenseVoice (funasr, CPU)
           </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="radio"
+              name="engine"
+              checked={engine === 'ocr'}
+              disabled={busyAny}
+              onChange={() => setEngine('ocr')}
+            />
+            OCR — đọc phụ đề cứng (chậm, thử nghiệm)
+          </label>
         </div>
+        {engine === 'ocr' && video_url && (
+          <div className="mb-3">
+            <p className="mb-1.5 text-sm text-neutral-300">Khoanh vùng phụ đề (để trống = mặc định 25% đáy khung hình)</p>
+            <OcrCropSelector videoUrl={video_url} crop={ocrCrop} onChange={setOcrCrop} />
+          </div>
+        )}
         {transcribe.progress && <p className="mb-2 text-sm text-neutral-300">{transcribe.progress}</p>}
         {transcribe.error && <p className="mb-2 text-sm text-danger">{transcribe.error}</p>}
         <JobProgressBar job={transcribeJob.data} />
@@ -731,21 +852,31 @@ export default function ProjectDetail() {
           {busyWhisper
             ? 'Đang nhận diện...'
             : transcribe.status === 'done'
-              ? `Chạy lại ${engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}`
-              : `Chạy ${engine === 'sensevoice' ? 'SenseVoice' : 'Whisper'}`}
+              ? `Chạy lại ${TRANSCRIBE_ENGINE_LABELS[engine]}`
+              : `Chạy ${TRANSCRIBE_ENGINE_LABELS[engine]}`}
         </button>
         {whisperMutation.error && <p className="mt-2 text-sm text-danger">{(whisperMutation.error as Error).message}</p>}
-      </section>
+      </CollapsibleStageSection>
 
-
-      <section className="card p-5">
-        <StageHeader
-          name="translate"
-          record={translate}
-          busy={busyGemini}
-          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'translate') || pendingCancel.translate}
-          onCancel={() => cancelMutation.mutate('translate')}
-        />
+      <CollapsibleStageSection
+        id="stage-translate"
+        label={STAGE_LABELS.translate}
+        status={translate.status}
+        meta={translate.status === 'done' ? (translate.output ?? 'sub_vi.srt') : translate.progress}
+        defaultExpanded={transcribe.status === 'done' && translate.status !== 'done'}
+        headerExtra={
+          busyGemini ? (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm text-danger"
+              disabled={pendingCancel.translate}
+              onClick={() => cancelMutation.mutate('translate')}
+            >
+              {(cancelMutation.isPending && cancelMutation.variables === 'translate') || pendingCancel.translate ? 'Đang dừng...' : 'Dừng'}
+            </button>
+          ) : undefined
+        }
+      >
         <p className="mb-3 text-sm text-neutral-400">
           Gemini: entity dict + clean + dịch zh→vi → <span className="mono">sub_vi.srt</span> +{' '}
           <span className="mono">entity_dict.json</span>
@@ -766,16 +897,31 @@ export default function ProjectDetail() {
           {busyGemini ? 'Đang phân tích...' : translate.status === 'done' ? 'Chạy lại Gemini' : 'Chạy Gemini'}
         </button>
         {geminiMutation.error && <p className="mt-2 text-sm text-danger">{(geminiMutation.error as Error).message}</p>}
-      </section>
+      </CollapsibleStageSection>
 
-      <section className="card p-5">
-        <StageHeader
-          name="tts"
-          record={tts}
-          busy={busyTTS}
-          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'tts') || pendingCancel.tts}
-          onCancel={() => cancelMutation.mutate('tts')}
-        />
+      <CollapsibleStageSection
+        id="stage-tts"
+        label={STAGE_LABELS.tts}
+        status={tts.status}
+        meta={
+          tts.status === 'done'
+            ? `${tts_manifest.length} câu${tts.engine ? ` · ${tts.engine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}` : ''}`
+            : tts.progress
+        }
+        defaultExpanded={translate.status === 'done' && tts.status !== 'done'}
+        headerExtra={
+          busyTTS ? (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm text-danger"
+              disabled={pendingCancel.tts}
+              onClick={() => cancelMutation.mutate('tts')}
+            >
+              {(cancelMutation.isPending && cancelMutation.variables === 'tts') || pendingCancel.tts ? 'Đang dừng...' : 'Dừng'}
+            </button>
+          ) : undefined
+        }
+      >
         <p className="mb-3 text-sm text-neutral-400">
           Đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
           {tts.engine && <> · lần chạy trước dùng <b>{tts.engine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}</b></>}
@@ -882,80 +1028,135 @@ export default function ProjectDetail() {
             </table>
           </div>
         )}
-      </section>
-      </>
+      </CollapsibleStageSection>
+        </div>
+      </div>
       )}
 
-      {!isSplit && (
-      <section className="card p-5">
-        <StageHeader
-          name="assemble"
-          record={assemble}
-          busy={busyAssemble}
-          cancelling={(cancelMutation.isPending && cancelMutation.variables === 'assemble') || pendingCancel.assemble}
-          onCancel={() => cancelMutation.mutate('assemble')}
-        />
-        <p className="mb-3 text-sm text-neutral-400">
-          {isMulti
-            ? 'Tách nhạc nền từng tập + ráp TẤT CẢ các tập nối tiếp nhau thành 1 draft CapCut duy nhất, ghi'
-            : 'Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi'}{' '}
-          thẳng vào thư mục CapCut thật:{' '}
-          <span className="mono text-xs">{settingsQuery.data?.capcut_drafts_dir ?? '...'}</span>
-        </p>
-        {isMulti && !allEpisodesTTSDone && (
-          <p className="mb-3 text-sm text-neutral-400">Cần mọi tập chạy xong TTS trước khi ráp draft chung.</p>
-        )}
-        {assemble.progress && <p className="mb-2 text-sm text-neutral-300">{assemble.progress}</p>}
-        {assemble.error && <p className="mb-2 text-sm text-danger">{assemble.error}</p>}
-        <label className="mb-3 block text-sm text-neutral-300">
-          Âm thanh gốc
-          <select
-            className={`${inputClass} max-w-sm`}
-            value={audioMode}
-            disabled={busyAny}
-            onChange={(e) => setAudioMode(e.target.value as AudioMode)}
+      {(() => {
+        const assembleBody = (
+          <>
+            <p className="mb-3 text-sm text-neutral-400">
+              {isMulti
+                ? 'Tách nhạc nền từng tập + ráp TẤT CẢ các tập nối tiếp nhau thành 1 draft CapCut duy nhất, ghi'
+                : 'Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi'}{' '}
+              thẳng vào thư mục CapCut thật:{' '}
+              <span className="mono text-xs">{settingsQuery.data?.capcut_drafts_dir ?? '...'}</span>
+            </p>
+            {isMulti && !allEpisodesTTSDone && (
+              <p className="mb-3 text-sm text-neutral-400">Cần mọi tập chạy xong TTS trước khi ráp draft chung.</p>
+            )}
+            {assemble.progress && <p className="mb-2 text-sm text-neutral-300">{assemble.progress}</p>}
+            {assemble.error && <p className="mb-2 text-sm text-danger">{assemble.error}</p>}
+            <details className="mb-3 rounded-lg border border-neutral-800 p-3">
+              <summary className="cursor-pointer text-sm text-neutral-300 select-none">Tuỳ chọn nâng cao</summary>
+              <label className="mt-3 mb-3 block text-sm text-neutral-300">
+                Âm thanh gốc
+                <select
+                  className={`${inputClass} max-w-sm`}
+                  value={audioMode}
+                  disabled={busyAny}
+                  onChange={(e) => setAudioMode(e.target.value as AudioMode)}
+                >
+                  <option value="separated">Tách nhạc nền/SFX bằng demucs (mặc định, khuyến nghị)</option>
+                  <option value="original">Giữ nguyên âm thanh gốc (không tách, không tắt — có cả thoại gốc)</option>
+                  <option value="mute">Tắt hoàn toàn âm thanh gốc (bỏ qua tách nhạc nền)</option>
+                </select>
+              </label>
+              <label className="block text-sm text-neutral-300">
+                Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc TTS)
+                <select
+                  className={`${inputClass} max-w-sm`}
+                  value={minVideoSpeed}
+                  disabled={busyAny}
+                  onChange={(e) => setMinVideoSpeed(Number(e.target.value))}
+                >
+                  {MIN_VIDEO_SPEED_OPTIONS.map((v) => (
+                    <option key={v} value={v}>
+                      Chậm tối đa {Math.round((1 - v) * 100)}% ({v.toFixed(2)}x)
+                      {v === DEFAULT_MIN_VIDEO_SPEED ? ' — mặc định' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </details>
+            <JobProgressBar job={assembleJob.data} />
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={(isMulti ? !allEpisodesTTSDone : tts.status !== 'done') || busyAny || assembleMutation.isPending}
+              onClick={() => assembleMutation.mutate()}
+            >
+              {busyAssemble ? 'Đang dựng...' : assemble.status === 'done' ? 'Dựng lại CapCut' : 'Dựng CapCut'}
+            </button>
+            {assembleMutation.error && <p className="mt-2 text-sm text-danger">{(assembleMutation.error as Error).message}</p>}
+            {assemble.status === 'done' && (
+              <p className="mt-2 text-sm text-accent-300">
+                Xong — mở CapCut, tìm project tên <span className="mono">{project.project_id}</span> trong danh sách.
+              </p>
+            )}
+          </>
+        )
+        const assembleCancelBtn = busyAssemble ? (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm text-danger"
+            disabled={pendingCancel.assemble}
+            onClick={() => cancelMutation.mutate('assemble')}
           >
-            <option value="separated">Tách nhạc nền/SFX bằng demucs (mặc định, khuyến nghị)</option>
-            <option value="original">Giữ nguyên âm thanh gốc (không tách, không tắt — có cả thoại gốc)</option>
-            <option value="mute">Tắt hoàn toàn âm thanh gốc (bỏ qua tách nhạc nền)</option>
-          </select>
-        </label>
-        <label className="mb-3 block text-sm text-neutral-300">
-          Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc TTS)
-          <select
-            className={`${inputClass} max-w-sm`}
-            value={minVideoSpeed}
-            disabled={busyAny}
-            onChange={(e) => setMinVideoSpeed(Number(e.target.value))}
+            {(cancelMutation.isPending && cancelMutation.variables === 'assemble') || pendingCancel.assemble ? 'Đang dừng...' : 'Dừng'}
+          </button>
+        ) : undefined
+
+        if (isSplit) return null
+        if (isMulti) {
+          return (
+            <section id="stage-assemble" className="card p-5">
+              <StageHeader
+                name="assemble"
+                record={assemble}
+                busy={busyAssemble}
+                cancelling={(cancelMutation.isPending && cancelMutation.variables === 'assemble') || pendingCancel.assemble}
+                onCancel={() => cancelMutation.mutate('assemble')}
+              />
+              {assembleBody}
+            </section>
+          )
+        }
+        return (
+          <CollapsibleStageSection
+            id="stage-assemble"
+            label={STAGE_LABELS.assemble}
+            status={assemble.status}
+            meta={assemble.status === 'done' ? 'draft CapCut đã ghi' : assemble.progress}
+            defaultExpanded={tts.status === 'done'}
+            headerExtra={assembleCancelBtn}
           >
-            {MIN_VIDEO_SPEED_OPTIONS.map((v) => (
-              <option key={v} value={v}>
-                Chậm tối đa {Math.round((1 - v) * 100)}% ({v.toFixed(2)}x)
-                {v === DEFAULT_MIN_VIDEO_SPEED ? ' — mặc định' : ''}
-              </option>
-            ))}
-          </select>
-        </label>
-        <JobProgressBar job={assembleJob.data} />
-        <button
-          type="button"
-          className={primaryButtonClass}
-          disabled={(isMulti ? !allEpisodesTTSDone : tts.status !== 'done') || busyAny || assembleMutation.isPending}
-          onClick={() => assembleMutation.mutate()}
+            {assembleBody}
+          </CollapsibleStageSection>
+        )
+      })()}
+
+      {!isMulti && !isSplit && (
+        <CollapsibleStageSection
+          id="stage-export"
+          label="Xuất video (không qua CapCut)"
+          status={project.export.status}
+          meta={project.export.status === 'done' ? 'final.mp4 đã ghi' : project.export.progress}
+          defaultExpanded={false}
         >
-          {busyAssemble ? 'Đang dựng...' : assemble.status === 'done' ? 'Dựng lại CapCut' : 'Dựng CapCut'}
-        </button>
-        {assembleMutation.error && <p className="mt-2 text-sm text-danger">{(assembleMutation.error as Error).message}</p>}
-        {assemble.status === 'done' && (
-          <p className="mt-2 text-sm text-accent-300">
-            Xong — mở CapCut, tìm project tên <span className="mono">{project.project_id}</span> trong danh sách.
-          </p>
-        )}
-      </section>
+          <DirectExportPanel
+            projectId={projectId}
+            project={project}
+            videoUrl={video_url}
+            ttsDone={tts.status === 'done'}
+            busyAny={busyAny}
+          />
+        </CollapsibleStageSection>
       )}
 
       {(cues.length > 0 || data.sub_zh) && (
-        <section className="card p-5">
+        <section id="stage-subtitles" className="card p-5">
           <div className="mb-4 flex flex-wrap gap-2">
             <button type="button" className={tab === 'table' ? primaryButtonClass : secondaryButtonClass} onClick={() => setTab('table')}>
               Đối chiếu
@@ -996,8 +1197,13 @@ export default function ProjectDetail() {
                     const rowBusySave = updateCueMutation.isPending && updateCueMutation.variables?.cueId === c.id
                     const rowBusy = rowBusyRetranslate || rowBusyTTS || rowBusySave
                     const actionsDisabled = translate.status !== 'done' || busyAny || rowBusy
+                    const isPlaying = currentTime >= srtTimeToSeconds(c.start) && currentTime < srtTimeToSeconds(c.end)
                     return (
-                      <tr key={c.id}>
+                      <tr
+                        key={c.id}
+                        onClick={() => seekTo(c.start)}
+                        className={['cursor-pointer', isPlaying ? 'bg-accent-900 shadow-[inset_3px_0_0_var(--color-accent)]' : ''].join(' ')}
+                      >
                         <td className="mono text-xs text-neutral-500">{c.id}</td>
                         <td className="mono text-xs text-neutral-400">
                           {c.start} → {c.end}
@@ -1119,7 +1325,7 @@ export default function ProjectDetail() {
       )}
 
       {data.logs.length > 0 && (
-        <section>
+        <section id="stage-log">
           <h2 className="mb-2 text-sm text-neutral-400">Log</h2>
           <ul className="space-y-1 font-mono text-xs text-neutral-500">
             {data.logs.map((l, i) => (
@@ -1130,6 +1336,9 @@ export default function ProjectDetail() {
           </ul>
         </section>
       )}
+
+      </div>
+      </div>
 
       <ConfirmDialog
         open={deletingEpisodeId !== null}

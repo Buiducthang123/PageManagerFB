@@ -31,6 +31,17 @@ class IngestUrlRequest(BaseModel):
     url: str
 
 
+class CreateDownloadRequest(BaseModel):
+    mode: str  # "single" | "profile" | "search" | "info"
+    title: str = ""
+    url: str = ""  # single & profile
+    modes: list[str] = []  # profile: post/like/mix/music
+    number: dict[str, int] = {}  # profile: giới hạn số lượng mỗi mode, 0 = không giới hạn
+    keyword: str = ""  # search
+    search_max: int = 20  # search
+    dest_dir: str = ""  # tuỳ chọn — trống thì lưu mặc định trong workspace/downloads/<id>/files
+
+
 class UpdateAutoPipelineRequest(BaseModel):
     enabled: bool
     engine: str = "whisper"
@@ -45,7 +56,11 @@ class SplitProjectRequest(BaseModel):
 
 
 class StartTranscribeRequest(BaseModel):
-    engine: str = "whisper"  # "whisper" | "sensevoice"
+    engine: str = "whisper"  # "whisper" | "sensevoice" | "ocr"
+    # Chỉ engine "ocr" dùng — vùng khoanh tay trên preview video, dạng phân số
+    # [x, y, w, h] (0-1). None/rỗng = engine "ocr" tự dùng mặc định 25% đáy
+    # khung hình (xem config.OCR_CROP_BOTTOM_FRACTION).
+    crop_region: Optional[list[float]] = None
 
 
 class StartTTSRequest(BaseModel):
@@ -71,6 +86,15 @@ class StartAssembleRequest(BaseModel):
     # giọng đọc TTS (0.7-1.0, mặc định 0.85 = chậm tối đa 15%) — xem
     # MIN_VIDEO_SPEED trong app/stages/assemble.py.
     min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
+
+
+class StartExportRequest(BaseModel):
+    audio_mode: AudioMode = "separated"
+    min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
+
+
+class UpdateExportBlurRegionRequest(BaseModel):
+    region: Optional[list[float]] = None  # [x,y,w,h] phân số 0-1, None = bỏ khoanh vùng
 
 
 class ProjectSummary(BaseModel):

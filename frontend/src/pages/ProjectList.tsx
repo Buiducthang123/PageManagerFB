@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, STAGE_LABELS, type ProjectSummary, type ProjectType } from '../lib/api'
 import { inputClass, primaryButtonClass } from '../lib/ui'
 import ConfirmDialog from '../components/ConfirmDialog'
-import VideoMergePanel from '../components/VideoMergePanel'
 
 function relativeTime(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime()
@@ -210,10 +209,6 @@ export default function ProjectList() {
       {bulkDeleteMutation.error && (
         <p className="mt-2 text-sm text-danger">{(bulkDeleteMutation.error as Error).message}</p>
       )}
-
-      <div className="mt-10">
-        <VideoMergePanel />
-      </div>
     </div>
   )
 }

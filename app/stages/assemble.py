@@ -8,6 +8,7 @@ from loguru import logger
 
 from .. import config
 from ..utils.srt import Cue, parse_ts
+from . import timing
 
 VIDEO_TRACK = "video"
 BACKGROUND_TRACK = "background"
@@ -126,80 +127,27 @@ def assemble_project(
         if on_progress:
             on_progress(done, total_steps, label)
 
-    # --- Bước 1: với mỗi câu có TTS, tính xem video có cần chậm lại không để
-    # câu đó có thêm thời gian (tối đa MIN_VIDEO_SPEED). Tốc độ GIỌNG ĐỌC
-    # KHÔNG tính ở đây — để dành tính ở Bước 3, dựa vào khoảng trống thật tới
-    # câu kế tiếp (câu này có thể chậm hết mức mà giọng vẫn không cần tăng tốc
-    # tí nào, nếu phía sau còn xa mới tới câu kế). ---
-    tts_windows: dict[int, dict] = {}
-    for entry in manifest:
-        if not entry.get("path"):
-            continue
-        audio_path = audio_dir / entry["path"]
-        material = cc.AudioMaterial(str(audio_path))
-        wanted_start_us = sec_to_us(parse_ts(entry["start"]))
-        wanted_end_us = sec_to_us(parse_ts(entry["end"]))
-        window_us = max(wanted_end_us - wanted_start_us, 1)
-        tts_dur_us = material.duration
+    # --- Bước 1+2: giãn video/nhạc nền theo timing dùng chung với export
+    # trực tiếp (app/stages/timing.py) — xem docstring ở đó cho công thức
+    # đầy đủ, KHÔNG lặp lại logic ở đây nữa. ---
+    tts_material_cache: dict[str, "cc.AudioMaterial"] = {}
 
-        needed_speed_full = tts_dur_us / window_us
-        if needed_speed_full <= 1.0:
-            video_speed = 1.0
-        else:
-            ideal_video_speed = window_us / tts_dur_us
-            video_speed = max(ideal_video_speed, min_video_speed)
+    def audio_duration_us(path: Path) -> int:
+        material = cc.AudioMaterial(str(path))
+        tts_material_cache[str(path)] = material
+        return material.duration
 
-        tts_windows[entry["id"]] = {
-            "material": material,
-            "start_us": wanted_start_us,
-            "end_us": wanted_end_us,
-            "tts_dur_us": tts_dur_us,
-            "video_speed": video_speed,
-        }
-
-    # Chỉ những câu THẬT SỰ cần chậm (video_speed < 1.0) mới tạo "khoảng giãn".
-    # Kẹp start >= end của khoảng trước để phòng hờ 2 cue kề nhau chồng biên
-    # nhỏ (dedup ở transcribe.py không bắt hết các trường hợp này).
-    stretch_intervals: list[tuple[int, int, float]] = []
-    for w in sorted(tts_windows.values(), key=lambda w: w["start_us"]):
-        if w["video_speed"] < 1.0:
-            s = max(w["start_us"], stretch_intervals[-1][1] if stretch_intervals else 0)
-            if w["end_us"] > s:
-                stretch_intervals.append((s, w["end_us"], w["video_speed"]))
-
-    def map_time(t_us: int) -> int:
-        """Quy đổi 1 mốc thời gian trên video GỐC sang mốc tương ứng trên
-        timeline draft đã giãn (do các khoảng bị chậm lại phía trước)."""
-        shift = 0
-        for s, e, spd in stretch_intervals:
-            if t_us <= s:
-                break
-            if t_us >= e:
-                orig = e - s
-                shift += round(orig / spd) - orig
-            else:
-                orig = e - s
-                frac = (t_us - s) / orig if orig else 0.0
-                new_full = round(orig / spd)
-                shift += round(new_full * frac) - round(orig * frac)
-                break
-        return t_us + shift
-
-    # --- Bước 2: dựng track video + nhạc nền theo `stretch_intervals` — đoạn
-    # cần bù giờ chậm lại, đoạn khác giữ nguyên tốc độ + đồng bộ 1-1. ---
     total_dur_us = video_material.duration
-    plan: list[tuple[int, int, float]] = []
-    cursor = 0
-    for s, e, spd in stretch_intervals:
-        s = max(s, cursor)
-        if e <= s:
-            continue
-        if s > cursor:
-            plan.append((cursor, s - cursor, 1.0))
-        plan.append((s, e - s, spd))
-        cursor = e
-    if cursor < total_dur_us:
-        plan.append((cursor, total_dur_us - cursor, 1.0))
+    plan_result = timing.compute_timeline_plan(
+        manifest=manifest,
+        vi_cues=vi_cues,
+        video_duration_us=total_dur_us,
+        audio_dir=audio_dir,
+        sec_per_unit=SEC,
+        audio_duration_us_fn=audio_duration_us,
+        min_video_speed=min_video_speed,
+    )
+    plan = plan_result.video_plan
 
     timeline_cursor_us = 0
     slowdown_count = 0
@@ -248,7 +196,6 @@ def assemble_project(
                 script.add_segment(bg_seg, track_name=BACKGROUND_TRACK)
 
         timeline_cursor_us += new_dur_us
-    total_dur_us_new = timeline_cursor_us
     step("video gốc")
     step("nhạc nền")
 
@@ -260,48 +207,45 @@ def assemble_project(
             min_video_speed,
         )
 
-    # --- Bước 3: giọng đọc TTS — đặt tại mốc ĐÃ QUY ĐỔI qua map_time(). Chỉ
-    # tăng tốc giọng ĐÚNG BẰNG mức cần thiết để không đè lên mốc bắt đầu dự
-    # kiến của câu TTS kế tiếp (nhìn trước 1 câu) — nếu phía sau còn khoảng
-    # trống (câu kế còn xa, hoặc đây là câu cuối), giữ nguyên tốc độ tự nhiên
-    # dù video đã chậm hết mức mà vẫn chưa đủ khung. Tối đa MAX_VOICE_SPEEDUP
-    # khi khoảng trống thật sự không đủ — phần thiếu hụt còn lại mới là
-    # "trôi timestamp" cần đẩy lùi câu sau (như cũ). ---
-    tts_order = [
-        {**tts_windows[entry["id"]], "entry": entry, "start_us": map_time(tts_windows[entry["id"]]["start_us"])}
-        for entry in manifest
-        if entry.get("path")
-    ]
-
+    # --- Bước 3: giọng đọc TTS — đặt theo `plan_result.voice_placement`/
+    # `voice_speed` đã tính sẵn (timing.py, dựa trên mốc ƯỚC TÍNH của cue kề
+    # trước/sau). NHƯNG start_us thật sự đưa vào từng AudioSegment vẫn phải
+    # kẹp lại theo `cursor_us` THẬT (từ `seg.target_timerange.duration` do
+    # CHÍNH pycapcut trả về) — pycapcut làm tròn duration hơi khác công thức
+    # ước tính của timing.py (lệch vài chục micro-giây/câu, cộng dồn), nếu
+    # tin thẳng mốc ước tính mà không kẹp lại theo cursor thật, 2 segment kề
+    # nhau có thể chồng lên nhau (pycapcut báo lỗi cứng SegmentOverlap) —
+    # phải giữ đúng kiểu kẹp tuần tự này như bản gốc trước khi tách hàm dùng
+    # chung (đã bắt được bằng cách so trực tiếp với 1 draft_content.json cũ
+    # thật, xem lịch sử sửa file này).
+    speedup_count = 0
     cursor_us = 0
     drift_us = 0
-    speedup_count = 0
-    # Mốc THẬT SỰ mà giọng đọc từng câu chiếm trên timeline — phụ đề phải
-    # khớp đúng khoảng này, không phải khung [start,end] gốc của cue (xem
-    # comment ở khối "Phụ đề" bên dưới để biết lý do).
     voice_placement: dict[int, tuple[int, int]] = {}
-    for i, item in enumerate(tts_order):
-        start_us = max(item["start_us"], cursor_us)
-        if start_us > item["start_us"]:
-            drift_us = max(drift_us, start_us - item["start_us"])
-
-        next_start_us = tts_order[i + 1]["start_us"] if i + 1 < len(tts_order) else total_dur_us_new
-        available_us = max(next_start_us - start_us, 1)
-        voice_speed = min(max(item["tts_dur_us"] / available_us, 1.0), MAX_VOICE_SPEEDUP)
+    for entry in manifest:
+        if not entry.get("path") or entry["id"] not in plan_result.voice_placement:
+            continue
+        cue_id = entry["id"]
+        material = tts_material_cache[str(audio_dir / entry["path"])]
+        wanted_start_us = plan_result.voice_placement[cue_id][0]
+        start_us = max(wanted_start_us, cursor_us)
+        if start_us > wanted_start_us:
+            drift_us = max(drift_us, start_us - wanted_start_us)
+        voice_speed = plan_result.voice_speed[cue_id]
         speedup_count += voice_speed > 1.0001
 
         if voice_speed > 1.0:
             seg = cc.AudioSegment(
-                item["material"],
+                material,
                 cc.Timerange(start_us, 0),
-                source_timerange=cc.Timerange(0, item["tts_dur_us"]),
+                source_timerange=cc.Timerange(0, material.duration),
                 speed=voice_speed,
             )
         else:
-            seg = cc.AudioSegment(item["material"], cc.Timerange(start_us, item["tts_dur_us"]))
+            seg = cc.AudioSegment(material, cc.Timerange(start_us, material.duration))
         script.add_segment(seg, track_name=VOICE_TRACK)
         cursor_us = start_us + seg.target_timerange.duration
-        voice_placement[item["entry"]["id"]] = (start_us, cursor_us)
+        voice_placement[cue_id] = (start_us, cursor_us)
 
     for entry in manifest:
         step(f"voice câu {entry['id']}")
@@ -340,8 +284,8 @@ def assemble_project(
             if placement is not None:
                 raw_start_us, raw_end_us = placement
             else:
-                raw_start_us = map_time(sec_to_us(parse_ts(cue.start)))
-                raw_end_us = map_time(sec_to_us(parse_ts(cue.end)))
+                raw_start_us = timing.map_time(plan_result.stretch_intervals, sec_to_us(parse_ts(cue.start)))
+                raw_end_us = timing.map_time(plan_result.stretch_intervals, sec_to_us(parse_ts(cue.end)))
             start_us = max(raw_start_us, text_cursor_us)
             end_us = max(raw_end_us, start_us)
             dur_us = max(end_us - start_us, 1)
@@ -425,68 +369,24 @@ def assemble_multi(
         video_material = first_video_material if ep_index == 0 else cc.VideoMaterial(str(src.video_path))
         bg_material = None if mute_original_audio else cc.AudioMaterial(str(src.background_path))
 
-        tts_windows: dict[int, dict] = {}
-        for entry in src.manifest:
-            if not entry.get("path"):
-                continue
-            audio_path = src.audio_dir / entry["path"]
-            material = cc.AudioMaterial(str(audio_path))
-            wanted_start_us = sec_to_us(parse_ts(entry["start"]))
-            wanted_end_us = sec_to_us(parse_ts(entry["end"]))
-            window_us = max(wanted_end_us - wanted_start_us, 1)
-            tts_dur_us = material.duration
+        tts_material_cache: dict[str, "cc.AudioMaterial"] = {}
 
-            needed_speed_full = tts_dur_us / window_us
-            if needed_speed_full <= 1.0:
-                video_speed = 1.0
-            else:
-                ideal_video_speed = window_us / tts_dur_us
-                video_speed = max(ideal_video_speed, min_video_speed)
-
-            tts_windows[entry["id"]] = {
-                "material": material,
-                "start_us": wanted_start_us,
-                "end_us": wanted_end_us,
-                "tts_dur_us": tts_dur_us,
-                "video_speed": video_speed,
-            }
-
-        stretch_intervals: list[tuple[int, int, float]] = []
-        for w in sorted(tts_windows.values(), key=lambda w: w["start_us"]):
-            if w["video_speed"] < 1.0:
-                s = max(w["start_us"], stretch_intervals[-1][1] if stretch_intervals else 0)
-                if w["end_us"] > s:
-                    stretch_intervals.append((s, w["end_us"], w["video_speed"]))
-
-        def map_time(t_us: int, _stretch_intervals=stretch_intervals) -> int:
-            shift = 0
-            for s, e, spd in _stretch_intervals:
-                if t_us <= s:
-                    break
-                if t_us >= e:
-                    orig = e - s
-                    shift += round(orig / spd) - orig
-                else:
-                    orig = e - s
-                    frac = (t_us - s) / orig if orig else 0.0
-                    new_full = round(orig / spd)
-                    shift += round(new_full * frac) - round(orig * frac)
-                    break
-            return t_us + shift
+        def audio_duration_us(path: Path, _cache=tts_material_cache) -> int:
+            material = cc.AudioMaterial(str(path))
+            _cache[str(path)] = material
+            return material.duration
 
         total_dur_us = video_material.duration
-        plan: list[tuple[int, int, float]] = []
-        cursor = 0
-        for s, e, spd in stretch_intervals:
-            s = max(s, cursor)
-            if e <= s:
-                continue
-            if s > cursor:
-                plan.append((cursor, s - cursor, 1.0))
-            plan.append((s, e - s, spd))
-            cursor = e
-        if cursor < total_dur_us:
-            plan.append((cursor, total_dur_us - cursor, 1.0))
+        plan_result = timing.compute_timeline_plan(
+            manifest=src.manifest,
+            vi_cues=src.vi_cues,
+            video_duration_us=total_dur_us,
+            audio_dir=src.audio_dir,
+            sec_per_unit=SEC,
+            audio_duration_us_fn=audio_duration_us,
+            min_video_speed=min_video_speed,
+        )
+        plan = plan_result.video_plan
 
         timeline_cursor_us = episode_offset_us
         slowdown_count = 0
@@ -535,7 +435,6 @@ def assemble_multi(
                     script.add_segment(bg_seg, track_name=BACKGROUND_TRACK)
 
             timeline_cursor_us += new_dur_us
-        total_dur_us_new = timeline_cursor_us
         step(f"video gốc (tập {ep_index + 1})")
         step(f"nhạc nền (tập {ep_index + 1})")
 
@@ -545,40 +444,39 @@ def assemble_multi(
                 draft_name, ep_index + 1, slowdown_count, min_video_speed,
             )
 
-        tts_order = [
-            {**tts_windows[entry["id"]], "entry": entry, "start_us": episode_offset_us + map_time(tts_windows[entry["id"]]["start_us"])}
-            for entry in src.manifest
-            if entry.get("path")
-        ]
-
+        # Kẹp start_us theo cursor THẬT (không chỉ tin mốc ước tính của
+        # timing.py) — xem comment chi tiết trong assemble_project() ở trên,
+        # lý do y hệt (đã bắt lỗi thật bằng cách so với 1 draft cũ).
+        speedup_count = 0
         cursor_us = episode_offset_us
         drift_us = 0
-        speedup_count = 0
         # Mốc THẬT SỰ giọng đọc từng câu chiếm — xem comment tương ứng trong
         # assemble_project(). Reset mỗi tập vì cue.id đánh số lại từ đầu.
         voice_placement: dict[int, tuple[int, int]] = {}
-        for i, item in enumerate(tts_order):
-            start_us = max(item["start_us"], cursor_us)
-            if start_us > item["start_us"]:
-                drift_us = max(drift_us, start_us - item["start_us"])
-
-            next_start_us = tts_order[i + 1]["start_us"] if i + 1 < len(tts_order) else total_dur_us_new
-            available_us = max(next_start_us - start_us, 1)
-            voice_speed = min(max(item["tts_dur_us"] / available_us, 1.0), MAX_VOICE_SPEEDUP)
+        for entry in src.manifest:
+            if not entry.get("path") or entry["id"] not in plan_result.voice_placement:
+                continue
+            cue_id = entry["id"]
+            material = tts_material_cache[str(src.audio_dir / entry["path"])]
+            wanted_start_us = episode_offset_us + plan_result.voice_placement[cue_id][0]
+            start_us = max(wanted_start_us, cursor_us)
+            if start_us > wanted_start_us:
+                drift_us = max(drift_us, start_us - wanted_start_us)
+            voice_speed = plan_result.voice_speed[cue_id]
             speedup_count += voice_speed > 1.0001
 
             if voice_speed > 1.0:
                 seg = cc.AudioSegment(
-                    item["material"],
+                    material,
                     cc.Timerange(start_us, 0),
-                    source_timerange=cc.Timerange(0, item["tts_dur_us"]),
+                    source_timerange=cc.Timerange(0, material.duration),
                     speed=voice_speed,
                 )
             else:
-                seg = cc.AudioSegment(item["material"], cc.Timerange(start_us, item["tts_dur_us"]))
+                seg = cc.AudioSegment(material, cc.Timerange(start_us, material.duration))
             script.add_segment(seg, track_name=VOICE_TRACK)
             cursor_us = start_us + seg.target_timerange.duration
-            voice_placement[item["entry"]["id"]] = (start_us, cursor_us)
+            voice_placement[cue_id] = (start_us, cursor_us)
 
         for entry in src.manifest:
             step(f"voice câu {entry['id']} (tập {ep_index + 1})")
@@ -602,8 +500,8 @@ def assemble_multi(
                 if placement is not None:
                     raw_start_us, raw_end_us = placement
                 else:
-                    raw_start_us = episode_offset_us + map_time(sec_to_us(parse_ts(cue.start)))
-                    raw_end_us = episode_offset_us + map_time(sec_to_us(parse_ts(cue.end)))
+                    raw_start_us = episode_offset_us + timing.map_time(plan_result.stretch_intervals, sec_to_us(parse_ts(cue.start)))
+                    raw_end_us = episode_offset_us + timing.map_time(plan_result.stretch_intervals, sec_to_us(parse_ts(cue.end)))
                 start_us = max(raw_start_us, text_cursor_us)
                 end_us = max(raw_end_us, start_us)
                 dur_us = max(end_us - start_us, 1)
@@ -613,7 +511,7 @@ def assemble_multi(
                 text_cursor_us = start_us + dur_us
             step(f"phụ đề câu {cue.id} (tập {ep_index + 1})")
 
-        episode_offset_us = total_dur_us_new
+        episode_offset_us += plan_result.total_dur_us
 
     script.save()
     return out_root / draft_name / "draft_content.json"

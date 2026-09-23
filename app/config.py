@@ -75,6 +75,37 @@ try:
 except ValueError:
     TTS_CONCURRENCY = 3
 
+# Engine transcribe thứ 3 (đọc phụ đề CỨNG in sẵn trên khung hình, không dựa
+# âm thanh — xem app/stages/transcribe_ocr.py). Đã đo thực tế: ~0.6-1.2s/khung
+# trên CPU (RapidOCR/onnxruntime) — 1 khung/giây là mốc cân bằng tốc độ/độ
+# chính xác chấp nhận được, 2 khung/giây thử nghiệm chậm gần gấp đôi mà phụ đề
+# thường hiển thị đủ lâu (>1s) để 1fps không bỏ sót câu nào.
+OCR_SAMPLE_FPS = 1.0
+# Vùng đáy khung hình để crop trước khi OCR (giảm hẳn pixel phải xử lý) — thử
+# crop hẹp hơn (12%) kèm resize nhỏ cho nhanh thì bị đọc sai chữ, nên giữ crop
+# rộng rãi (25%) đổi lấy độ chính xác đúng.
+OCR_CROP_BOTTOM_FRACTION = 0.25
+# Cue ngắn hơn mốc này bị loại — thường là OCR đọc lệch đúng 1 khung đơn lẻ
+# (nhiễu), không phải phụ đề thật (phụ đề thật luôn hiện đủ lâu để đọc được).
+OCR_MIN_CUE_DURATION_S = 0.3
+OCR_DEVICE = os.environ.get("OCR_DEVICE", "cpu").strip() or "cpu"
+# Phát hiện tự động vùng che phụ đề cũ (export trực tiếp) — chỉ cần TOẠ ĐỘ
+# vùng chữ, không cần đọc đúng nội dung câu, nên lấy mẫu thưa hơn hẳn OCR
+# transcribe bình thường (1fps) để nhanh trên video dài.
+OCR_DETECT_REGION_FPS = 0.3
+
+# Đường dẫn thư mục đã clone thủ công github.com/jiji262/douyin-downloader
+# (mặc định workspace/vendor/douyin-downloader/, cùng chỗ với capcut-tts-api
+# — xem install.md) — dùng để ingest link Douyin qua CLI (subprocess) thay vì
+# snaptiktok.to. Không có default tự động — chưa set thì ingest Douyin
+# fallback về snaptiktok.to như cũ (xem app/stages/fetch_url.py), TikTok luôn
+# dùng snaptiktok.to vì tool này không hỗ trợ TikTok.
+DOUYIN_DL_DIR = os.environ.get("DOUYIN_DL_DIR", "").strip()
+
+
+def douyin_dl_available() -> bool:
+    return bool(DOUYIN_DL_DIR) and (Path(DOUYIN_DL_DIR) / "run.py").exists()
+
 
 def sensevoice_cache_dir() -> Path:
     custom = os.environ.get("SENSEVOICE_CACHE_DIR", "").strip()

@@ -70,6 +70,19 @@ def is_job_running(key: str) -> bool:
     return job is not None and job.is_alive()
 
 
+def any_job_running(prefix: str) -> bool:
+    """True nếu có BẤT KỲ job nào (key bắt đầu bằng `prefix`) đang chạy —
+    dùng để giới hạn CHẠY 1 LƯỢT TẠI 1 THỜI ĐIỂM cho cả nhóm job (vd mọi job
+    "download:*"). Đã xác nhận thật: 2 lượt tải/quét douyin-downloader chạy
+    ĐỒNG THỜI (mỗi lượt tự spawn 1 trình duyệt headless riêng để lấy token)
+    làm 1 hoặc cả 2 lượt bị Douyin trả về thiếu/rỗng kết quả dù tiến trình
+    vẫn báo "thành công" — không phải lỗi cố định, là do quá tải tài
+    nguyên/rate-limit khi chạy song song."""
+    with _jobs_guard:
+        keys = [k for k in _jobs if k.startswith(prefix)]
+    return any(is_job_running(k) for k in keys)
+
+
 def request_cancel(key: str) -> bool:
     """Đánh dấu job cần dừng + kill ngay tiến trình con (nếu có, vd demucs)
     thay vì chỉ chờ cờ được check ở lần on_progress kế tiếp. Trả về False nếu

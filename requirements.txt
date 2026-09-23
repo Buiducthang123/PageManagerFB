@@ -27,3 +27,23 @@ pycapcut
 # TTS tiếng Việt local (thay thế/bổ sung cho CapCut TTS) — chạy CPU mặc định
 # (VIENEU_DEVICE=cpu), model tự tải lần đầu qua HuggingFace Hub
 vieneu
+
+# Ingest link Douyin — thay snaptiktok.to bằng vendor/douyin-downloader (clone
+# thủ công theo README, xem app/config.py DOUYIN_DL_DIR). Dep của chính tool đó,
+# cài chung vào venv này vì nó gọi qua CLI (subprocess), không phải qua PyPI.
+aiohttp>=3.9.0
+httpx>=0.25
+aiofiles>=23.2.1
+aiosqlite>=0.19.0
+rich>=13.7.0
+pyyaml>=6.0.1
+python-dateutil>=2.8.2
+gmssl>=3.2.2
+imageio-ffmpeg==0.6.0
+
+# Engine transcribe thứ 3 — đọc phụ đề cứng in sẵn trên khung hình video
+# (xem app/stages/transcribe_ocr.py). Model PP-OCR chạy qua ONNXRuntime, nhẹ
+# hơn hẳn cài PaddleOCR trực tiếp (không cần framework PaddlePaddle riêng,
+# tránh xung đột CUDA với torch đã dùng nhiều trong dự án).
+rapidocr
+onnxruntime
