@@ -47,3 +47,10 @@ imageio-ffmpeg==0.6.0
 # tránh xung đột CUDA với torch đã dùng nhiều trong dự án).
 rapidocr
 onnxruntime
+
+# Đăng video tự động lên TikTok (app/stages/social_publish.py) — browser
+# automation thật (Playwright điều khiển Chromium), KHÔNG dùng official
+# Content Posting API (quyết định đã chốt cùng người dùng — xem
+# social-auto-plan.md). Cần chạy `python -m playwright install chromium` sau
+# khi cài package này lần đầu trên máy mới.
+playwright

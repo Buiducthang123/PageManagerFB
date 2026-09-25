@@ -77,6 +77,7 @@ def assemble_project(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     mute_original_audio: bool = False,
     min_video_speed: float = MIN_VIDEO_SPEED,
+    background_volume: float = BACKGROUND_VOLUME,
 ) -> Path:
     """Ráp video gốc (tắt tiếng thoại) + nhạc nền/SFX đã tách (trừ khi
     `mute_original_audio=True` — bỏ hẳn, không cần tách) + giọng đọc TTS +
@@ -183,7 +184,7 @@ def assemble_project(
                         bg_material,
                         cc.Timerange(timeline_cursor_us, bg_source_dur_us),
                         source_timerange=cc.Timerange(source_start_us, bg_source_dur_us),
-                        volume=BACKGROUND_VOLUME,
+                        volume=background_volume,
                     )
                 else:
                     bg_seg = cc.AudioSegment(
@@ -191,7 +192,7 @@ def assemble_project(
                         cc.Timerange(timeline_cursor_us, 0),
                         source_timerange=cc.Timerange(source_start_us, bg_source_dur_us),
                         speed=spd,
-                        volume=BACKGROUND_VOLUME,
+                        volume=background_volume,
                     )
                 script.add_segment(bg_seg, track_name=BACKGROUND_TRACK)
 
@@ -314,6 +315,7 @@ def assemble_multi(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     mute_original_audio: bool = False,
     min_video_speed: float = MIN_VIDEO_SPEED,
+    background_volume: float = BACKGROUND_VOLUME,
 ) -> Path:
     """Ráp NHIỀU tập (episode) nối tiếp nhau vào 1 draft CapCut DUY NHẤT —
     dùng cho dự án dài tập. Mỗi tập được xử lý bằng đúng thuật toán stretch/
@@ -422,7 +424,7 @@ def assemble_multi(
                             bg_material,
                             cc.Timerange(timeline_cursor_us, bg_source_dur_us),
                             source_timerange=cc.Timerange(source_start_us, bg_source_dur_us),
-                            volume=BACKGROUND_VOLUME,
+                            volume=background_volume,
                         )
                     else:
                         bg_seg = cc.AudioSegment(
@@ -430,7 +432,7 @@ def assemble_multi(
                             cc.Timerange(timeline_cursor_us, 0),
                             source_timerange=cc.Timerange(source_start_us, bg_source_dur_us),
                             speed=spd,
-                            volume=BACKGROUND_VOLUME,
+                            volume=background_volume,
                         )
                     script.add_segment(bg_seg, track_name=BACKGROUND_TRACK)
 

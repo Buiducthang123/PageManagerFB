@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   api,
   DEFAULT_MIN_VIDEO_SPEED,
+  DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
   MIN_VIDEO_SPEED_OPTIONS,
   STAGE_LABELS,
   STAGE_ORDER,
@@ -81,7 +82,7 @@ export default function ProjectDetail() {
   const [ingestTab, setIngestTab] = useState<'file' | 'url'>('file')
   const [shareUrl, setShareUrl] = useState('')
   const [tab, setTab] = useState<'table' | 'zh' | 'vi' | 'entity'>('table')
-  const [engine, setEngine] = useState<TranscribeEngine>('whisper')
+  const [engine, setEngine] = useState<TranscribeEngine>('ocr')
   const [ocrCrop, setOcrCrop] = useState<CropRegion | null>(null)
   const [ttsEngine, setTtsEngine] = useState<TTSEngine>('capcut')
   const [voice, setVoice] = useState('')
@@ -89,7 +90,8 @@ export default function ProjectDetail() {
   const [previewNonce, setPreviewNonce] = useState(0)
   const [editingCueId, setEditingCueId] = useState<number | null>(null)
   const [draftText, setDraftText] = useState('')
-  const [audioMode, setAudioMode] = useState<AudioMode>('separated')
+  const [audioMode, setAudioMode] = useState<AudioMode>('original')
+  const [originalAudioVolumeDb, setOriginalAudioVolumeDb] = useState<number>(DEFAULT_ORIGINAL_AUDIO_VOLUME_DB)
   const [minVideoSpeed, setMinVideoSpeed] = useState<number>(DEFAULT_MIN_VIDEO_SPEED)
 
   const [voiceInitialized, setVoiceInitialized] = useState(false)
@@ -125,6 +127,7 @@ export default function ProjectDetail() {
     if (p.auto_engine) setEngine(p.auto_engine)
     if (p.auto_tts_engine) setTtsEngine(p.auto_tts_engine)
     if (p.auto_audio_mode) setAudioMode(p.auto_audio_mode)
+    if (p.auto_original_audio_volume_db !== undefined) setOriginalAudioVolumeDb(p.auto_original_audio_volume_db)
     if (p.auto_min_video_speed) setMinVideoSpeed(p.auto_min_video_speed)
     setVoiceInitialized(true)
   }, [detailQuery.data?.project, voiceInitialized])
@@ -233,7 +236,7 @@ export default function ProjectDetail() {
   })
 
   const assembleMutation = useMutation({
-    mutationFn: () => api.startAssemble(projectId, audioMode, minVideoSpeed),
+    mutationFn: () => api.startAssemble(projectId, audioMode, minVideoSpeed, originalAudioVolumeDb),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['job', projectId, 'assemble'] })
     },
@@ -273,6 +276,7 @@ export default function ProjectDetail() {
       voice?: string
       audioMode?: AudioMode
       minVideoSpeed?: number
+      originalAudioVolumeDb?: number
     }) =>
       api.updateAutoPipeline(
         projectId,
@@ -282,6 +286,7 @@ export default function ProjectDetail() {
         opts.voice ?? selectedVoice,
         opts.audioMode ?? audioMode,
         opts.minVideoSpeed ?? minVideoSpeed,
+        opts.originalAudioVolumeDb ?? originalAudioVolumeDb,
       ),
     onSuccess: () => refresh(),
   })
@@ -568,11 +573,23 @@ export default function ProjectDetail() {
                 value={audioMode}
                 onChange={(e) => setAudioMode(e.target.value as AudioMode)}
               >
+                <option value="original">Giữ nguyên âm thanh gốc (mặc định)</option>
                 <option value="separated">Tách nhạc nền/SFX (demucs)</option>
-                <option value="original">Giữ nguyên âm thanh gốc</option>
                 <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
               </select>
             </label>
+            {audioMode === 'original' && (
+              <label className="min-w-48 flex-1 text-sm text-neutral-300">
+                Âm lượng âm thanh gốc (dB)
+                <input
+                  type="number"
+                  step={1}
+                  className={`${inputClass} mt-0`}
+                  value={originalAudioVolumeDb}
+                  onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+                />
+              </label>
+            )}
             <label className="min-w-48 flex-1 text-sm text-neutral-300">
               Video chậm tối đa
               <select
@@ -601,6 +618,7 @@ export default function ProjectDetail() {
               movable={false}
               standaloneAssemble
               audioMode={audioMode}
+              originalAudioVolumeDb={originalAudioVolumeDb}
               minVideoSpeed={minVideoSpeed}
             />
           )}
@@ -1058,11 +1076,24 @@ export default function ProjectDetail() {
                   disabled={busyAny}
                   onChange={(e) => setAudioMode(e.target.value as AudioMode)}
                 >
-                  <option value="separated">Tách nhạc nền/SFX bằng demucs (mặc định, khuyến nghị)</option>
-                  <option value="original">Giữ nguyên âm thanh gốc (không tách, không tắt — có cả thoại gốc)</option>
+                  <option value="original">Giữ nguyên âm thanh gốc (mặc định — không tách, không tắt)</option>
+                  <option value="separated">Tách nhạc nền/SFX bằng demucs</option>
                   <option value="mute">Tắt hoàn toàn âm thanh gốc (bỏ qua tách nhạc nền)</option>
                 </select>
               </label>
+              {audioMode === 'original' && (
+                <label className="mt-3 mb-3 block text-sm text-neutral-300">
+                  Âm lượng âm thanh gốc (dB)
+                  <input
+                    type="number"
+                    step={1}
+                    className={`${inputClass} max-w-sm`}
+                    value={originalAudioVolumeDb}
+                    disabled={busyAny}
+                    onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+                  />
+                </label>
+              )}
               <label className="block text-sm text-neutral-300">
                 Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc TTS)
                 <select

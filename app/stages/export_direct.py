@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 import time
@@ -16,12 +17,25 @@ EXPORT_TIMEOUT_S = 3600.0
 # Nhạc nền/SFX gốc đã tách — tái dùng đúng mức trộn CapCut đang dùng
 # (assemble.py::BACKGROUND_VOLUME) để 2 đường xuất nghe cân bằng như nhau.
 BACKGROUND_VOLUME = 0.8
+# Mức âm lượng mặc định cho audio_mode="original" (giữ nguyên âm thanh gốc,
+# không tách nhạc nền) — người dùng chốt -13dB làm mặc định hệ thống, chỉnh
+# được riêng theo dự án qua field `original_audio_volume_db`.
+ORIGINAL_AUDIO_VOLUME_DB = -13.0
 MUSIC_VOLUME = 0.35
 LOGO_MARGIN_PX = 24
 LOGO_WIDTH_PX = 110
 # Đã test thật (xem app/stages/transcribe_ocr.py-style feasibility test trên
 # clip 25s test4): blur vừa đủ che chữ, không quá gắt.
 BLUR_STRENGTH = "18:4"
+# FontSize của filter `subtitles` được tính theo hệ toạ độ kịch bản MẶC ĐỊNH
+# CỦA LIBASS cho file .srt thuần — 288px chiều cao (xem docstring
+# `_marginv_units`) — KHÔNG phải theo chiều cao video thật. Giá trị cũ hardcode
+# (20) quy đổi ra ~133px thật trên video dọc 1920px (20 * 1920/288) — quá to,
+# gần 1/8 chiều cao khung hình MỖI DÒNG (đã xác nhận thật qua ảnh chụp khung
+# hình xuất ra, người dùng phản ánh "rất bất cân xứng"). Giờ cho chỉnh được
+# qua `subtitle_font_size` (render_video) — mặc định 6 theo yêu cầu người
+# dùng, quy đổi ra ~40px trên video 1920px.
+DEFAULT_SUBTITLE_FONT_SIZE = 6
 
 
 class ExportDirectError(RuntimeError):
@@ -90,16 +104,85 @@ def _marginv_units(desired_real_px: float, video_h_px: int) -> int:
     return max(2, round(desired_real_px * scale))
 
 
-def _ffprobe_height_px(path: Path) -> int:
+def _ffprobe_wh_px(path: Path) -> tuple[int, int]:
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", str(path)],
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
         capture_output=True,
         text=True,
     )
     try:
-        return int(result.stdout.strip().splitlines()[0])
+        w_str, h_str = result.stdout.strip().splitlines()[0].split(",")
+        return int(w_str), int(h_str)
     except (ValueError, IndexError) as err:
         raise ExportDirectError(f"ffprobe không đọc được độ phân giải: {path.name}") from err
+
+
+# Tỉ lệ cỡ chữ/chiều RỘNG video đã xác nhận thật (xem docstring `_marginv_units`)
+# — `subtitle_font_size=6` render trên video DỌC 1080x1920 ra chữ cao ~40px
+# thật, 40/1080 ≈ 3.7% chiều rộng, người dùng xác nhận nhìn cân xứng. Cỡ chữ cũ
+# (`FontSize` truyền thẳng cho filter `subtitles`) chỉ quy đổi theo CHIỀU CAO
+# video (hệ toạ độ kịch bản cố định 288px của libass) — cùng 1 số 6 áp cho
+# video NGANG 1920x1080 (chiều cao chỉ 1080, bằng hơn nửa video dọc) ra chữ
+# thật chỉ ~22.5px, nhỏ hẳn — không phải vì công thức áp dụng sai cho riêng
+# video đó (vẫn đúng % CHIỀU CAO của chính nó), mà vì video ngang nhúng vào
+# khung xem dọc (TikTok/feed) hiển thị ra màn hình THẤP hơn hẳn theo chiều cao
+# thật so với video dọc cùng chiều rộng — quy đổi theo chiều RỘNG (ổn định hơn
+# giữa các tỉ lệ khung hình khi cùng nhúng vào 1 khung xem) mới giữ được cỡ chữ
+# nhìn cân xứng dù video dọc hay ngang. Chỉ áp dụng auto này khi
+# `subtitle_font_size` còn nguyên giá trị mặc định (`DEFAULT_SUBTITLE_FONT_SIZE`)
+# — người dùng đã tự tay chỉnh số khác thì tôn trọng đúng số đó, không tự ý ghi đè.
+_REFERENCE_FONT_SIZE_AT_1080W = DEFAULT_SUBTITLE_FONT_SIZE / (1080 / 1920)
+
+
+def _auto_subtitle_font_size(video_w_px: int, video_h_px: int) -> int:
+    if video_h_px <= 0:
+        return DEFAULT_SUBTITLE_FONT_SIZE
+    return max(2, round(_REFERENCE_FONT_SIZE_AT_1080W * (video_w_px / video_h_px)))
+
+
+# Số câu thoại trộn chung 1 nhóm — mỗi nhóm là 1 lệnh ffmpeg riêng với chừng
+# này đầu vào (80 đường dẫn ~9.000 ký tự, dư xa giới hạn dòng lệnh Windows).
+VOICE_CHUNK_SIZE = 80
+
+
+def _premix_voices(
+    specs: list[tuple[Path, float, int]],
+    tmp_dir: Path,
+    job: Optional[jobs_mod.JobState],
+) -> list[tuple[Path, int]]:
+    """Trộn trước các câu giọng đọc theo nhóm `VOICE_CHUNK_SIZE` câu thành
+    file WAV trung gian. `specs` = (file giọng đọc, hệ số tăng tốc, mốc bắt
+    đầu ms trên timeline đầu ra). Mỗi file nhóm bắt đầu tại mốc câu ĐẦU của
+    nhóm — nơi gọi `adelay` đúng mốc đó. Kết quả trộn giống hệt trộn chung 1
+    lần: các câu không chồng nhau (mốc bắt đầu luôn ≥ lúc câu trước kết thúc)
+    và đều `normalize=0`, nên cộng theo nhóm hay cộng 1 lần là như nhau.
+    Trả [(file nhóm, mốc bắt đầu ms)]."""
+    chunks: list[tuple[Path, int]] = []
+    for k in range(0, len(specs), VOICE_CHUNK_SIZE):
+        if job is not None:
+            job.raise_if_cancelled()
+        group = specs[k : k + VOICE_CHUNK_SIZE]
+        base_ms = group[0][2]
+        args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        parts: list[str] = []
+        labels: list[str] = []
+        for j, (path, speed, start_ms) in enumerate(group):
+            args += ["-i", str(path)]
+            tempo = f"atempo={speed}," if speed > 1.0 else ""
+            parts.append(f"[{j}:a]{tempo}adelay={start_ms - base_ms}:all=1[v{j}]")
+            labels.append(f"[v{j}]")
+        if len(labels) == 1:
+            parts.append(f"{labels[0]}anull[out]")
+        else:
+            parts.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0[out]")
+        n = k // VOICE_CHUNK_SIZE
+        script = tmp_dir / f"voices_{n}.txt"
+        script.write_text(";".join(parts), encoding="utf-8")
+        out = tmp_dir / f"voices_{n}.wav"
+        args += ["-/filter_complex", str(script), "-map", "[out]", "-c:a", "pcm_s16le", str(out)]
+        _run_ffmpeg(args, job)
+        chunks.append((out, base_ms))
+    return chunks
 
 
 def render_video(
@@ -110,9 +193,18 @@ def render_video(
     audio_dir: Path,
     output_path: Path,
     blur_region: Optional[tuple[float, float, float, float]] = None,
+    # Mốc [start_s, end_s] (giây, THEO TIMELINE VIDEO GỐC — vd lấy thẳng từ
+    # sub_zh.srt) mà phụ đề cứng THẬT SỰ hiện trên khung hình — có giá trị
+    # thì chỉ che ĐÚNG những đoạn này (tự quy đổi sang timeline đầu ra đã
+    # giãn/chậm theo giọng đọc bên dưới), None = che SUỐT video như cũ (không
+    # có dữ liệu thời điểm, vd engine transcribe không phải OCR).
+    blur_active_ranges_s: Optional[list[tuple[float, float]]] = None,
     music_path: Optional[Path] = None,
     logo_path: Optional[Path] = None,
     min_video_speed: float = timing.MIN_VIDEO_SPEED,
+    background_volume_db: Optional[float] = None,
+    music_volume_db: Optional[float] = None,
+    subtitle_font_size: int = DEFAULT_SUBTITLE_FONT_SIZE,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     job: Optional[jobs_mod.JobState] = None,
 ) -> Path:
@@ -176,7 +268,9 @@ def render_video(
 
     # --- Bước 2: che vùng phụ đề cũ (nếu có khoanh vùng) ---
     v_label = "vfull"
-    video_h_px = _ffprobe_height_px(video_path)
+    video_w_px, video_h_px = _ffprobe_wh_px(video_path)
+    if subtitle_font_size == DEFAULT_SUBTITLE_FONT_SIZE:
+        subtitle_font_size = _auto_subtitle_font_size(video_w_px, video_h_px)
     # MarginV mặc định (không khoanh vùng che) — đổi từ hằng số cũ (36) sang
     # gọi `_marginv_units` để cùng đi qua phép quy đổi tỉ lệ bên dưới, tránh
     # lặp lại đúng bug margin cũ (xem docstring `_marginv_units`).
@@ -184,16 +278,40 @@ def render_video(
     if blur_region:
         x, y, w, h = blur_region
         filter_parts.append(f"[{v_label}]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},boxblur={BLUR_STRENGTH}[blurred]")
-        filter_parts.append(f"[{v_label}][blurred]overlay=W*{x}:H*{y}[vblur]")
+        overlay_enable = ""
+        if blur_active_ranges_s:
+            # Quy đổi mốc thời gian THEO VIDEO GỐC (vd lấy từ sub_zh.srt, lúc
+            # chữ thật sự hiện trên khung hình) sang timeline ĐẦU RA đã giãn/
+            # chậm theo giọng đọc (cùng phép quy đổi burn phụ đề mới bên
+            # dưới dùng) — chỉ bật blur ĐÚNG những đoạn này thay vì che suốt
+            # video, theo yêu cầu người dùng.
+            windows = []
+            for s_s, e_s in blur_active_ranges_s:
+                out_s = timing.map_time(plan_result.stretch_intervals, round(s_s * 1_000_000)) / 1_000_000
+                out_e = timing.map_time(plan_result.stretch_intervals, round(e_s * 1_000_000)) / 1_000_000
+                if out_e > out_s:
+                    windows.append(f"between(t,{out_s:.3f},{out_e:.3f})")
+            if windows:
+                overlay_enable = f":enable='{'+'.join(windows)}'"
+        filter_parts.append(f"[{v_label}][blurred]overlay=W*{x}:H*{y}{overlay_enable}[vblur]")
         v_label = "vblur"
         # Phụ đề mới phải NẰM TRONG vùng che (thay chữ cũ), không phải giữ
         # margin cố định tính từ đáy khung hình — đã xác nhận thật: vùng che
         # tự động phát hiện hiếm khi khớp đúng vị trí margin cố định, làm phụ
-        # đề mới nổi lên TRÊN dải che thay vì nằm đè lên nó. ASS Alignment=2
-        # neo MÉP DƯỚI của chữ cách đáy khung hình 1 khoảng — đặt khoảng đó
-        # cách đáy VÙNG CHE 1 khoảng đệm nhỏ, không phải cách đáy khung hình.
-        bottom_frac = 1 - (y + h)
-        desired_gap_px = bottom_frac * video_h_px + 8
+        # đề mới nổi lên TRÊN dải che thay vì nằm đè lên nó.
+        #
+        # Căn GIỮA vùng che theo chiều dọc (không neo theo đáy) — đã xác nhận
+        # thật bằng cách trích khung hình xuất ra rồi đo pixel: neo theo đáy
+        # (bản cũ) làm chữ dồn sát mép dưới dải che, lệch hẳn khỏi tâm, nhìn
+        # mất cân đối so với dải che. ASS Alignment=2 neo MÉP DƯỚI của chữ
+        # cách đáy khung hình 1 khoảng (MarginV) — để tâm dòng chữ trùng tâm
+        # dải che, margin đó phải trừ thêm nửa chiều cao dòng chữ. `subtitle_font_size`
+        # được khai theo hệ toạ độ kịch bản 288px (xem `_marginv_units`), quy
+        # đổi ra chiều cao dòng chữ THẬT theo hệ số dòng ~1.2x chuẩn ASS/libass.
+        LINE_HEIGHT_FACTOR = 1.2
+        text_line_height_px = subtitle_font_size * LINE_HEIGHT_FACTOR * video_h_px / 288
+        box_center_frac = y + h / 2
+        desired_gap_px = (1 - box_center_frac) * video_h_px - text_line_height_px / 2
         margin_v_units = _marginv_units(desired_gap_px, video_h_px)
 
     # --- Bước 3: burn phụ đề mới — mốc LẤY TỪ voice_placement (giống hệt
@@ -225,7 +343,7 @@ def render_video(
     # chuỗi filename mới parse đúng (đã xác nhận qua lỗi thật: escape dấu `:`
     # không thôi vẫn làm ffmpeg đọc lệch sang option `original_size`).
     srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-    style = f"FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV={margin_v_units}"
+    style = f"FontName=Arial,FontSize={subtitle_font_size},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV={margin_v_units}"
     filter_parts.append(f"[{v_label}]subtitles='{srt_escaped}':force_style='{style}'[vsub]")
     v_label = "vsub"
     progress(2, 5, "burn phụ đề mới")
@@ -245,8 +363,13 @@ def render_video(
     progress(3, 5, "chèn logo")
 
     # --- Bước 5: giọng đọc TTS đặt đúng mốc + trộn với nhạc nền/nhạc ngoài ---
-    voice_labels: list[str] = []
-    voice_input_start = len(inputs) // 2
+    # Trộn TRƯỚC giọng đọc theo từng nhóm (`_premix_voices`) rồi mới đưa vài
+    # file nhóm vào lệnh cuối — trước đây MỖI câu là 1 `-i` riêng: video dài
+    # nhiều câu làm dòng lệnh vượt giới hạn 32.767 ký tự của Windows
+    # ("[WinError 206] The filename or extension is too long", đã gặp thật với
+    # 147 đầu vào + 442 bộ lọc), và video 3 tiếng (~5800 câu) còn mở hàng
+    # nghìn file cùng lúc.
+    voice_specs: list[tuple[Path, float, int]] = []
     cursor_us = 0
     for entry in manifest:
         if not entry.get("path") or entry["id"] not in plan_result.voice_placement:
@@ -259,13 +382,20 @@ def render_video(
         tts_dur_us = plan_result.tts_duration_us[cue_id]
         dur_us = round(tts_dur_us / speed) if speed > 1.0 else tts_dur_us
         cursor_us = start_us + dur_us
+        voice_specs.append((audio_path, speed, round(start_us / 1000)))
 
+    progress(4, 5, "trộn giọng đọc")
+    voice_labels: list[str] = []
+    try:
+        voice_chunks = _premix_voices(voice_specs, tmp_dir, job)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    for c, (chunk_path, chunk_start_ms) in enumerate(voice_chunks):
         vi_idx = len(inputs) // 2
-        inputs += ["-i", str(audio_path)]
-        vlabel = f"voice{cue_id}"
-        tempo = f"atempo={speed}," if speed > 1.0 else ""
-        start_ms = round(start_us / 1000)
-        filter_parts.append(f"[{vi_idx}:a]{tempo}adelay={start_ms}:all=1[{vlabel}]")
+        inputs += ["-i", str(chunk_path)]
+        vlabel = f"voicechunk{c}"
+        filter_parts.append(f"[{vi_idx}:a]adelay={chunk_start_ms}:all=1[{vlabel}]")
         voice_labels.append(vlabel)
 
     has_music = music_path is not None and music_path.exists()
@@ -273,11 +403,16 @@ def render_video(
     if has_music:
         idx_music = len(inputs) // 2
         inputs += ["-stream_loop", "-1", "-i", str(music_path)]
-        filter_parts.append(f"[{idx_music}:a]volume={MUSIC_VOLUME}[music]")
+        music_volume_expr = f"{music_volume_db}dB" if music_volume_db is not None else str(MUSIC_VOLUME)
+        filter_parts.append(f"[{idx_music}:a]volume={music_volume_expr}[music]")
 
     audio_mix_labels: list[str] = []
     if has_bg:
-        filter_parts.append(f"[bgfull]volume={BACKGROUND_VOLUME}[bgvol]")
+        # `background_volume_db` (vd -13dB cho audio_mode="original") ghi đè
+        # hằng số tuyến tính mặc định — cho phép chỉnh riêng theo từng chế độ
+        # âm thanh nền thay vì 1 mức cố định chung cho mọi trường hợp.
+        bg_volume_expr = f"{background_volume_db}dB" if background_volume_db is not None else str(BACKGROUND_VOLUME)
+        filter_parts.append(f"[bgfull]volume={bg_volume_expr}[bgvol]")
         audio_mix_labels.append("bgvol")
     if has_music:
         audio_mix_labels.append("music")
@@ -298,9 +433,13 @@ def render_video(
     progress(4, 5, "trộn giọng đọc + nhạc nền")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filter_complex = ";".join(filter_parts)
+    # Bộ lọc ghi ra FILE (`-/filter_complex <file>`, cú pháp ffmpeg ≥ 7.1 thay
+    # cho `-filter_complex_script` đã bỏ) thay vì viết thẳng trên dòng lệnh —
+    # mỗi đoạn video giãn/chậm là 1-2 bộ lọc, video dài có hàng trăm đoạn.
+    graph_path = tmp_dir / "graph.txt"
+    graph_path.write_text(";".join(filter_parts), encoding="utf-8")
 
-    args = ["ffmpeg", "-y", *inputs, "-filter_complex", filter_complex, "-map", f"[{v_label}]"]
+    args = ["ffmpeg", "-y", *inputs, "-/filter_complex", str(graph_path), "-map", f"[{v_label}]"]
     if has_audio_out:
         args += ["-map", "[aout]"]
     args += ["-t", f"{total_dur_s:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
@@ -308,15 +447,14 @@ def render_video(
         args += ["-c:a", "aac"]
     args += [str(output_path)]
 
-    logger.info("export_direct: ffmpeg {} input(s), {} filter(s)", len(inputs) // 2, len(filter_parts))
+    logger.info(
+        "export_direct: ffmpeg {} input(s), {} filter(s), {} câu thoại trộn trong {} nhóm",
+        len(inputs) // 2, len(filter_parts), len(voice_specs), len(voice_labels),
+    )
     try:
         _run_ffmpeg(args, job)
     finally:
-        try:
-            srt_path.unlink(missing_ok=True)
-            tmp_dir.rmdir()
-        except OSError:
-            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     progress(5, 5, "xong")
     return output_path

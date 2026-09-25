@@ -42,12 +42,42 @@ class CreateDownloadRequest(BaseModel):
     dest_dir: str = ""  # tuỳ chọn — trống thì lưu mặc định trong workspace/downloads/<id>/files
 
 
+class CreateSocialProjectRequest(BaseModel):
+    title: str
+    douyin_profile_url: str
+    # Tối đa 3 bài/ngày/tài khoản — vượt mức này dễ bị nền tảng gắn cờ
+    # hành vi bất thường, nhất là tài khoản mới.
+    posts_per_day: int = Field(1, ge=1, le=3)
+
+
+class CrawlSocialRequest(BaseModel):
+    limit: Optional[int] = None  # số video MỚI NHẤT quét — None/0 = quét hết toàn bộ trang
+
+
+class UpdateSocialProjectRequest(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None  # "active" | "paused"
+    posts_per_day: Optional[int] = Field(None, ge=1, le=3)
+    engine: Optional[str] = None
+    tts_engine: Optional[str] = None
+    voice: Optional[str] = None
+    audio_mode: Optional[str] = None
+    original_audio_volume_db: Optional[float] = None
+    music_volume_db: Optional[float] = None
+    subtitle_font_size: Optional[int] = None
+    min_video_speed: Optional[float] = None
+    use_viesnap_fallback: Optional[bool] = None
+    crawl_via_browser: Optional[bool] = None
+
+
 class UpdateAutoPipelineRequest(BaseModel):
     enabled: bool
-    engine: str = "whisper"
+    engine: str = "ocr"
     tts_engine: str = "capcut"  # "capcut" | "vieneu"
     voice: str = ""
-    audio_mode: AudioMode = "separated"
+    audio_mode: AudioMode = "original"
+    # dB, chỉ áp dụng khi audio_mode="original" — xem export_direct.ORIGINAL_AUDIO_VOLUME_DB
+    original_audio_volume_db: float = -13.0
     min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
 
 
@@ -56,7 +86,7 @@ class SplitProjectRequest(BaseModel):
 
 
 class StartTranscribeRequest(BaseModel):
-    engine: str = "whisper"  # "whisper" | "sensevoice" | "ocr"
+    engine: str = "ocr"  # "whisper" | "sensevoice" | "ocr"
     # Chỉ engine "ocr" dùng — vùng khoanh tay trên preview video, dạng phân số
     # [x, y, w, h] (0-1). None/rỗng = engine "ocr" tự dùng mặc định 25% đáy
     # khung hình (xem config.OCR_CROP_BOTTOM_FRACTION).
@@ -81,7 +111,8 @@ class StartAssembleRequest(BaseModel):
     # "separated" = tách nhạc nền/SFX khỏi thoại gốc bằng demucs (mặc định)
     # "original" = giữ nguyên âm thanh gốc (thoại + nhạc nền), không tách, không tắt
     # "mute" = tắt hẳn âm thanh gốc, bỏ qua bước tách
-    audio_mode: AudioMode = "separated"
+    audio_mode: AudioMode = "original"
+    original_audio_volume_db: float = -13.0
     # Tốc độ video tối thiểu khi cần chậm lại để nhường thêm thời gian cho
     # giọng đọc TTS (0.7-1.0, mặc định 0.85 = chậm tối đa 15%) — xem
     # MIN_VIDEO_SPEED trong app/stages/assemble.py.
@@ -89,11 +120,20 @@ class StartAssembleRequest(BaseModel):
 
 
 class StartExportRequest(BaseModel):
-    audio_mode: AudioMode = "separated"
+    audio_mode: AudioMode = "original"
+    original_audio_volume_db: float = -13.0
+    # Cỡ chữ phụ đề mới — tính theo hệ toạ độ kịch bản 288px libass (KHÔNG
+    # phải px thật, xem export_direct.DEFAULT_SUBTITLE_FONT_SIZE), 6 = mặc
+    # định người dùng chốt.
+    subtitle_font_size: int = Field(6, ge=1, le=100)
     min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
 
 
 class UpdateExportBlurRegionRequest(BaseModel):
+    region: Optional[list[float]] = None  # [x,y,w,h] phân số 0-1, None = bỏ khoanh vùng
+
+
+class UpdateOcrCropRegionRequest(BaseModel):
     region: Optional[list[float]] = None  # [x,y,w,h] phân số 0-1, None = bỏ khoanh vùng
 
 

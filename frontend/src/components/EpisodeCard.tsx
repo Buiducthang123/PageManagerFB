@@ -29,6 +29,7 @@ export default function EpisodeCard({
   canMoveDown,
   standaloneAssemble = false,
   audioMode,
+  originalAudioVolumeDb,
   minVideoSpeed,
 }: {
   projectId: string
@@ -48,6 +49,7 @@ export default function EpisodeCard({
   // "Ráp CapCut" ngay trong từng EpisodeCard.
   standaloneAssemble?: boolean
   audioMode?: AudioMode
+  originalAudioVolumeDb?: number
   minVideoSpeed?: number
 }) {
   const queryClient = useQueryClient()
@@ -110,7 +112,8 @@ export default function EpisodeCard({
   })
 
   const assembleMutation = useMutation({
-    mutationFn: () => api.startEpisodeAssemble(projectId, episodeId, audioMode ?? 'separated', minVideoSpeed ?? 0.85),
+    mutationFn: () =>
+      api.startEpisodeAssemble(projectId, episodeId, audioMode ?? 'original', minVideoSpeed ?? 0.85, originalAudioVolumeDb ?? -13),
     onSuccess: () => invalidateJob('assemble'),
   })
 

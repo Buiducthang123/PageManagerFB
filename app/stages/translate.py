@@ -102,7 +102,7 @@ def _is_daily_free_tier(err: BaseException) -> bool:
     return "free_tier" in s.lower() or "FreeTier" in s or "PerDayPerProjectPerModel-FreeTier" in s
 
 
-def _retry_after_s(err: BaseException) -> Optional[float]:
+def _retry_after_s(err: BaseException, attempt: int) -> Optional[float]:
     if _is_daily_free_tier(err):
         return None
     m = re.search(r"retry in ([\d.]+)\s*s", _err_text(err), re.I)
@@ -112,7 +112,14 @@ def _retry_after_s(err: BaseException) -> Optional[float]:
     if "429" in s or "resource_exhausted" in s:
         return 30.0
     if any(tok in s for tok in ("503", "unavailable", "high demand", "try again")):
-        return 8.0
+        # "503 UNAVAILABLE — model đang quá tải" — LỖI TẠM THỜI PHÍA GOOGLE,
+        # không phải lỗi code/quota — với job nền tự động (không ai đứng chờ
+        # trước màn hình) đáng kiên nhẫn chờ lâu hơn hẳn mức cũ (8s x 4 lần =
+        # 32s tổng, thường không đủ khi Google quá tải kéo dài) hơn là bỏ
+        # cuộc rồi bắt cả video tải+transcribe lại từ đầu (tốn hơn hẳn việc
+        # chờ thêm vài phút). Backoff tăng dần theo lần thử: 8s, 16s, 24s...
+        # tối đa 60s/lần.
+        return min(8.0 * (attempt + 1), 60.0)
     return None
 
 
@@ -196,7 +203,11 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
 
     last: BaseException | None = None
     thinking = True
-    for attempt in range(4):
+    # 8 lần thử (trước đây 4) — job nền tự động không ai đứng chờ, đáng kiên
+    # nhẫn hơn với lỗi tạm thời phía Google (503 UNAVAILABLE) thay vì bỏ
+    # cuộc sớm rồi bắt cả video tải+transcribe lại từ đầu (xem `_retry_after_s`).
+    _MAX_ATTEMPTS = 8
+    for attempt in range(_MAX_ATTEMPTS):
         try:
             return call(with_thinking=thinking)
         except Exception as err:
@@ -208,13 +219,43 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
                 thinking = False
                 logger.warning("Bỏ thinking_config rồi gọi lại")
                 continue
-            wait = _retry_after_s(err)
-            if wait is None or attempt == 3:
+            wait = _retry_after_s(err, attempt)
+            if wait is None or attempt == _MAX_ATTEMPTS - 1:
                 raise
-            logger.warning("Gemini retry sau {:.0f}s ({})", wait, err)
+            logger.warning("Gemini retry sau {:.0f}s (lần {}/{}) ({})", wait, attempt + 1, _MAX_ATTEMPTS, err)
             time.sleep(wait)
     assert last is not None
     raise last
+
+
+_TITLE_SCHEMA = {
+    "type": "object",
+    "properties": {"vi": {"type": "string"}},
+    "required": ["vi"],
+}
+
+
+def translate_title(title: str) -> str:
+    """Dịch nhanh 1 tiêu đề ngắn (vd title video Douyin) sang tiếng Việt —
+    dùng cho "Dự án tự động" (caption đăng TikTok + tên dự án hiển thị), tách
+    riêng khỏi `process_llm`/`_one_shot` vì đó là dịch NGUYÊN 1 danh sách cue
+    dài theo batch, không hợp cho 1 câu ngắn lẻ. Trả nguyên `title` nếu rỗng
+    hoặc Gemini lỗi (không chặn luồng crawl/kích hoạt vì lỗi dịch tiêu đề)."""
+    title = (title or "").strip()
+    if not title:
+        return title
+    prompt = (
+        "Dịch tiêu đề video ngắn sau đây sang tiếng Việt tự nhiên, giữ nguyên "
+        "văn phong ngắn gọn kiểu tiêu đề mạng xã hội, không thêm giải thích:\n\n"
+        f"{title}"
+    )
+    try:
+        result = _generate(prompt, schema=_TITLE_SCHEMA)
+        vi = str(result.get("vi") or "").strip()
+        return vi or title
+    except Exception as err:
+        logger.warning("translate_title: dịch tiêu đề thất bại, giữ nguyên bản gốc: {}", err)
+        return title
 
 
 def _one_shot(

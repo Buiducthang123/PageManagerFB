@@ -8,6 +8,11 @@ export type AudioMode = 'separated' | 'original' | 'mute'
 // — khớp range 0.7-1.0 mà backend chấp nhận (StartAssembleRequest.min_video_speed).
 export const MIN_VIDEO_SPEED_OPTIONS = [0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
 export const DEFAULT_MIN_VIDEO_SPEED = 0.85
+// dB, chỉ áp dụng khi audioMode="original" — xem export_direct.ORIGINAL_AUDIO_VOLUME_DB
+export const DEFAULT_ORIGINAL_AUDIO_VOLUME_DB = -13
+// Cỡ chữ phụ đề mới — theo hệ toạ độ kịch bản 288px libass, KHÔNG phải px
+// thật (xem app/stages/export_direct.py::DEFAULT_SUBTITLE_FONT_SIZE).
+export const DEFAULT_SUBTITLE_FONT_SIZE = 6
 
 export const STAGE_ORDER: StageName[] = ['ingest', 'transcribe', 'translate', 'tts', 'assemble']
 
@@ -63,6 +68,8 @@ export interface ProjectState {
   auto_tts_engine: TTSEngine
   auto_voice: string
   auto_audio_mode: AudioMode
+  auto_original_audio_volume_db: number
+  auto_subtitle_font_size: number
   auto_min_video_speed: number
   split_mode: boolean
   // "Xuất video trực tiếp" (ffmpeg, không qua CapCut) — hành động PHỤ, tách
@@ -182,6 +189,195 @@ export interface ModelOption {
   label: string
 }
 
+export type QueueItemStatus = 'pending' | 'processing' | 'ready' | 'posted' | 'failed' | 'skipped'
+
+export interface QueueItem {
+  aweme_id: string
+  title: string
+  title_vi: string | null
+  play_url: string
+  share_url: string
+  thumb_url: string | null
+  duration_sec: number
+  discovered_at: string
+  status: QueueItemStatus
+  project_id: string | null
+  posted_at: string | null
+  platform_post_id: string | null
+  error: string | null
+  failed_stage: 'activate' | 'publish' | null
+  files_cleaned_at?: string | null
+}
+
+export interface SocialProjectSummary {
+  id: string
+  title: string
+  douyin_profile_url: string
+  status: 'active' | 'paused'
+  created_at: string
+}
+
+export interface SocialProjectState extends SocialProjectSummary {
+  posts_per_day: number
+  engine: string
+  ocr_crop_region: number[] | null
+  tts_engine: string
+  voice: string
+  audio_mode: string
+  original_audio_volume_db: number
+  music_volume_db: number
+  subtitle_font_size: number
+  min_video_speed: number
+  use_viesnap_fallback: boolean
+  crawl_via_browser: boolean
+  queue: QueueItem[]
+  last_crawl_at: string | null
+  last_post_at: string | null
+  next_post_at: string | null
+  douyin_backoff_until: string | null
+  douyin_backoff_level: number
+  tiktok_session_path: string
+  facebook_page_id: string
+  facebook_page_token: string
+}
+
+export type MonitorDailyStatus =
+  | 'paused'
+  | 'processing'
+  | 'stopped_failed'
+  | 'done_today'
+  | 'prepared'
+  | 'resting'
+  | 'no_pending'
+  | 'waiting'
+
+export interface MonitorPipelineEntry {
+  order: number
+  social_id: string
+  social_title: string
+  aweme_id: string | null
+  video_title: string
+  duration_sec: number | null
+  posts_per_day: number
+  posted_today: number
+  need_today: number
+  ready_count: number
+  pending_count: number
+  failed_count: number
+  next_post_at: string | null
+  status: MonitorDailyStatus
+  reason: string | null
+  ahead?: boolean
+}
+
+export interface MonitorPublishEntry {
+  social_id: string
+  social_title: string
+  next_post_at: string | null
+  last_post_at: string | null
+  posts_per_day: number
+  posted_today: number
+  ready_count: number
+  aweme_id: string | null
+  video_title: string
+  status: 'no_ready' | 'scheduled' | 'waiting_window' | 'due' | 'done_today'
+}
+
+export interface MonitorJobRow {
+  social_id: string
+  social_title: string
+  aweme_id: string | null
+  label: string | null
+}
+
+export interface CleanupPlanEntry {
+  project_id: string
+  social_id: string
+  social_title: string
+  aweme_id: string
+  video_title: string
+  size_mb: number
+  is_current: boolean
+  due_at: string | null
+  protected_reason: string | null
+  rule: string
+  rule_label: string
+  kept_by_user: boolean
+}
+
+export type SocialCleanupPlan = Record<
+  string,
+  {
+    due_at: string | null
+    size_mb: number
+    rule_label: string
+    protected_reason: string | null
+    project_id: string
+    kept_by_user: boolean
+  }
+>
+
+export interface CleanupOverview {
+  free_gb: number
+  min_free_gb: number
+  low_disk: boolean
+  cleanup_after_hours: number
+  last_cleanup: { at: string; projects_cleaned: number; freed_mb: number; free_gb: number } | null
+  plan: CleanupPlanEntry[]
+}
+
+export interface SocialMonitor {
+  now: string
+  in_posting_window: boolean
+  posting_windows: string[]
+  processing: {
+    social_id: string
+    social_title: string
+    aweme_id: string
+    video_title: string
+    project_id: string | null
+    duration_sec: number | null
+    stage: string | null
+    stage_label: string
+    progress: { done: number; total: number; label: string | null } | null
+  }[]
+  publishing: MonitorJobRow[]
+  crawling: MonitorJobRow[]
+  pipeline_queue: MonitorPipelineEntry[]
+  daily_plan: MonitorPipelineEntry[]
+  storage: {
+    free_gb: number
+    min_free_gb: number
+    low_disk: boolean
+    cleanup_after_hours: number
+    last_cleanup: { at: string; projects_cleaned: number; freed_mb: number; free_gb: number } | null
+    plan_summary: { due_count: number; due_mb: number; kept_count: number }
+  }
+  publish_plan: MonitorPublishEntry[]
+  crawl_plan: {
+    social_id: string
+    social_title: string
+    last_crawl_at: string | null
+    next_crawl_at: string | null
+    active: boolean
+  }[]
+  stats: {
+    projects: number
+    projects_active: number
+    pending: number
+    processing: number
+    ready: number
+    failed: number
+    posted_today: number
+  }
+}
+
+export interface DouyinBrowserStatus {
+  logged_in: boolean
+  checked_at: string | null
+  profile_ready: boolean
+}
+
 export interface AppSettings {
   workspace_dir: string
   gemini_api_key_masked: string
@@ -255,6 +451,7 @@ export const api = {
     voice: string,
     audioMode: AudioMode,
     minVideoSpeed: number,
+    originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
   ) =>
     request<ProjectSummary>(`/api/projects/${id}/auto-pipeline`, {
       method: 'PATCH',
@@ -264,6 +461,7 @@ export const api = {
         tts_engine: ttsEngine,
         voice,
         audio_mode: audioMode,
+        original_audio_volume_db: originalAudioVolumeDb,
         min_video_speed: minVideoSpeed,
       }),
     }),
@@ -282,10 +480,16 @@ export const api = {
     postJson<SrtCue>(`/api/projects/${id}/cues/${cueId}/retranslate`),
   ttsCue: (id: string, cueId: number, voice: string) =>
     postJson<TTSManifestEntry>(`/api/projects/${id}/cues/${cueId}/tts`, { voice }),
-  startAssemble: (id: string, audioMode: AudioMode, minVideoSpeed: number) =>
+  startAssemble: (
+    id: string,
+    audioMode: AudioMode,
+    minVideoSpeed: number,
+    originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
+  ) =>
     postJson<{ status: string }>(`/api/projects/${id}/assemble`, {
       audio_mode: audioMode,
       min_video_speed: minVideoSpeed,
+      original_audio_volume_db: originalAudioVolumeDb,
     }),
   jobStatus: (id: string, stage: StageName | 'export') =>
     request<JobStatus>(`/api/projects/${id}/jobs/${stage}`),
@@ -293,10 +497,18 @@ export const api = {
     postJson<{ status: string }>(`/api/projects/${id}/jobs/${stage}/cancel`),
 
   // --- Xuất video trực tiếp (ffmpeg, không qua CapCut) ---
-  startExport: (id: string, audioMode: AudioMode, minVideoSpeed: number) =>
+  startExport: (
+    id: string,
+    audioMode: AudioMode,
+    minVideoSpeed: number,
+    originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
+    subtitleFontSize: number = DEFAULT_SUBTITLE_FONT_SIZE,
+  ) =>
     postJson<{ status: string }>(`/api/projects/${id}/export`, {
       audio_mode: audioMode,
       min_video_speed: minVideoSpeed,
+      original_audio_volume_db: originalAudioVolumeDb,
+      subtitle_font_size: subtitleFontSize,
     }),
   updateExportBlurRegion: (id: string, region: number[] | null) =>
     postJson<{ status: string }>(`/api/projects/${id}/export/blur-region`, { region }),
@@ -350,10 +562,17 @@ export const api = {
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/tts`, { voice, engine }),
   retryEpisodeTTS: (id: string, episodeId: string, voice: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/tts`, { voice, retry_failed_only: true }),
-  startEpisodeAssemble: (id: string, episodeId: string, audioMode: AudioMode, minVideoSpeed: number) =>
+  startEpisodeAssemble: (
+    id: string,
+    episodeId: string,
+    audioMode: AudioMode,
+    minVideoSpeed: number,
+    originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
+  ) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/assemble`, {
       audio_mode: audioMode,
       min_video_speed: minVideoSpeed,
+      original_audio_volume_db: originalAudioVolumeDb,
     }),
   splitProject: (id: string, splitPointsS: number[]) =>
     postJson<EpisodeDetail[]>(`/api/projects/${id}/split`, { split_points_s: splitPointsS }),
@@ -421,6 +640,77 @@ export const api = {
     `/api/downloads/${downloadId}/files/${encodeURIComponent(filename)}`,
   revealDownload: (downloadId: string) => postJson<{ status: string }>(`/api/downloads/${downloadId}/reveal`),
   deleteDownload: (downloadId: string) => request<void>(`/api/downloads/${downloadId}`, { method: 'DELETE' }),
+
+  listSocial: () => request<SocialProjectSummary[]>('/api/social'),
+  createSocial: (title: string, douyinProfileUrl: string, postsPerDay = 1) =>
+    postJson<SocialProjectState>('/api/social', { title, douyin_profile_url: douyinProfileUrl, posts_per_day: postsPerDay }),
+  getSocial: (id: string) => request<SocialProjectState>(`/api/social/${id}`),
+  updateSocial: (
+    id: string,
+    body: Partial<{
+      title: string
+      status: 'active' | 'paused'
+      posts_per_day: number
+      engine: string
+      tts_engine: string
+      voice: string
+      audio_mode: string
+      original_audio_volume_db: number
+      music_volume_db: number
+      subtitle_font_size: number
+      min_video_speed: number
+      use_viesnap_fallback: boolean
+      crawl_via_browser: boolean
+    }>,
+  ) => request<SocialProjectState>(`/api/social/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteSocial: (id: string) => request<void>(`/api/social/${id}`, { method: 'DELETE' }),
+  updateSocialOcrCropRegion: (id: string, region: number[] | null) =>
+    postJson<{ status: string }>(`/api/social/${id}/ocr-crop-region`, { region }),
+  uploadSocialMusic: (id: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<{ status: string }>(`/api/social/${id}/music`, { method: 'POST', body: form })
+  },
+  deleteSocialMusic: (id: string) => request<void>(`/api/social/${id}/music`, { method: 'DELETE' }),
+  uploadSocialLogo: (id: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<{ status: string }>(`/api/social/${id}/logo`, { method: 'POST', body: form })
+  },
+  deleteSocialLogo: (id: string) => request<void>(`/api/social/${id}/logo`, { method: 'DELETE' }),
+  socialMusicUrl: (id: string) => `/api/social/${id}/music`,
+  socialLogoUrl: (id: string) => `/api/social/${id}/logo`,
+  crawlSocial: (id: string, limit: number | null = null) =>
+    postJson<{ status: string }>(`/api/social/${id}/crawl`, { limit }),
+  socialCrawlJobStatus: (id: string) => request<JobStatus>(`/api/social/${id}/jobs/crawl`),
+  cancelSocialCrawl: (id: string) => postJson<{ status: string }>(`/api/social/${id}/jobs/crawl/cancel`),
+  activateQueueItem: (id: string, awemeId: string) =>
+    postJson<{ status: string; project_id: string }>(`/api/social/${id}/queue/${awemeId}/activate`),
+  skipQueueItem: (id: string, awemeId: string) => postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/skip`),
+  unskipQueueItem: (id: string, awemeId: string) =>
+    postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/unskip`),
+  socialMonitor: () => request<SocialMonitor>('/api/social-monitor'),
+  socialCleanupPlan: (id: string) => request<SocialCleanupPlan>(`/api/social/${id}/cleanup-plan`),
+  cleanupOverview: () => request<CleanupOverview>('/api/cleanup'),
+  cleanupDelete: (projectIds: string[], mode: 'files' | 'project') =>
+    postJson<{
+      results: { project_id: string; ok: boolean; error?: string; freed_mb?: number }[]
+      deleted: number
+      freed_mb: number
+    }>('/api/cleanup/delete', { project_ids: projectIds, mode }),
+  setCleanupKeep: (projectId: string, keep: boolean) =>
+    postJson<{ status: string }>('/api/cleanup/keep', { project_id: projectId, keep }),
+  douyinBrowserStatus: () => request<DouyinBrowserStatus>('/api/douyin-browser/status'),
+  douyinBrowserLogin: () => postJson<{ status: string }>('/api/douyin-browser/login'),
+  douyinBrowserLoginJob: () => request<JobStatus>('/api/douyin-browser/login-job'),
+  tiktokLoginStatus: (id: string) => request<{ logged_in: boolean }>(`/api/social/${id}/tiktok/status`),
+  tiktokLogin: (id: string) => postJson<{ status: string }>(`/api/social/${id}/tiktok/login`),
+  tiktokLoginJobStatus: (id: string) => request<JobStatus>(`/api/social/${id}/jobs/tiktok_login`),
+  cancelTiktokLogin: (id: string) => postJson<{ status: string }>(`/api/social/${id}/jobs/tiktok_login/cancel`),
+  publishQueueItem: (id: string, awemeId: string) =>
+    postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/publish`),
+  publishQueueItemJobStatus: (id: string, awemeId: string) =>
+    request<JobStatus>(`/api/social/${id}/queue/${awemeId}/jobs/publish`),
 
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (

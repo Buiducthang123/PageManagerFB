@@ -37,6 +37,32 @@ function DownloadIcon() {
   )
 }
 
+function AutomatedIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <circle cx="10" cy="10" r="7" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M10 6v4l2.6 2.6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function MonitorIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <path d="M2.5 10h3l2-5 3 10 2-5h5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function CleanupIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <path d="M4 6h12M8 6V4.5h4V6M5.5 6l.8 10h7.4l.8-10" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8.5 9v4.5M11.5 9v4.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function SettingsIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
@@ -55,6 +81,9 @@ const NAV_ITEMS = [
   { to: '/', end: true, label: 'Dự án', icon: <ProjectsIcon /> },
   { to: '/merge', end: false, label: 'Ghép video', icon: <MergeIcon /> },
   { to: '/download', end: false, label: 'Tải video', icon: <DownloadIcon /> },
+  { to: '/automated', end: false, label: 'Dự án tự động', icon: <AutomatedIcon /> },
+  { to: '/monitor', end: false, label: 'Giám sát tiến trình', icon: <MonitorIcon /> },
+  { to: '/cleanup', end: false, label: 'Tự dọn ổ đĩa', icon: <CleanupIcon /> },
   { to: '/settings', end: false, label: 'Cài đặt', icon: <SettingsIcon /> },
 ]
 

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type AudioMode, type ProjectState } from '../lib/api'
+import { api, DEFAULT_ORIGINAL_AUDIO_VOLUME_DB, DEFAULT_SUBTITLE_FONT_SIZE, type AudioMode, type ProjectState } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import JobProgressBar from './JobProgressBar'
 import OcrCropSelector, { type CropRegion } from './OcrCropSelector'
@@ -22,8 +22,20 @@ export default function DirectExportPanel({
   const queryClient = useQueryClient()
   const musicRef = useRef<HTMLInputElement>(null)
   const logoRef = useRef<HTMLInputElement>(null)
-  const [audioMode, setAudioMode] = useState<AudioMode>('separated')
-  const [minVideoSpeed, setMinVideoSpeed] = useState(0.85)
+  // Project chạy tự động (auto pipeline / dự án tự động) xuất bằng cấu hình
+  // `auto_*` đã lưu — form phải hiện ĐÚNG cấu hình đó, không phải mặc định cố
+  // định. Trước đây form luôn hiện "Giữ nguyên âm thanh gốc" trong khi bản
+  // xuất tự động đang chạy "separated" (tách nhạc nền bằng demucs), gây hiểu
+  // nhầm là app chạy sai cấu hình.
+  const useAuto = project.auto_pipeline
+  const [audioMode, setAudioMode] = useState<AudioMode>(useAuto ? project.auto_audio_mode ?? 'original' : 'original')
+  const [originalAudioVolumeDb, setOriginalAudioVolumeDb] = useState(
+    useAuto ? project.auto_original_audio_volume_db ?? DEFAULT_ORIGINAL_AUDIO_VOLUME_DB : DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
+  )
+  const [subtitleFontSize, setSubtitleFontSize] = useState(
+    useAuto ? project.auto_subtitle_font_size ?? DEFAULT_SUBTITLE_FONT_SIZE : DEFAULT_SUBTITLE_FONT_SIZE,
+  )
+  const [minVideoSpeed, setMinVideoSpeed] = useState(useAuto ? project.auto_min_video_speed ?? 0.85 : 0.85)
 
   const exportRecord = project.export
   const busyExport = exportRecord.status === 'running'
@@ -77,7 +89,7 @@ export default function DirectExportPanel({
   })
 
   const startMutation = useMutation({
-    mutationFn: () => api.startExport(projectId, audioMode, minVideoSpeed),
+    mutationFn: () => api.startExport(projectId, audioMode, minVideoSpeed, originalAudioVolumeDb, subtitleFontSize),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['job', projectId, 'export'] }),
   })
 
@@ -160,10 +172,35 @@ export default function DirectExportPanel({
             disabled={busyAny}
             onChange={(e) => setAudioMode(e.target.value as AudioMode)}
           >
-            <option value="separated">Tách nhạc nền/SFX bằng demucs (mặc định)</option>
-            <option value="original">Giữ nguyên âm thanh gốc</option>
+            <option value="original">Giữ nguyên âm thanh gốc (mặc định)</option>
+            <option value="separated">Tách nhạc nền/SFX bằng demucs</option>
             <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
           </select>
+        </label>
+        {audioMode === 'original' && (
+          <label className="mt-3 mb-3 block text-sm text-neutral-300">
+            Âm lượng âm thanh gốc (dB)
+            <input
+              type="number"
+              step={1}
+              className={`${inputClass} max-w-sm`}
+              value={originalAudioVolumeDb}
+              disabled={busyAny}
+              onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+            />
+          </label>
+        )}
+        <label className="mt-3 mb-3 block text-sm text-neutral-300">
+          Cỡ chữ phụ đề mới
+          <input
+            type="number"
+            step={1}
+            min={1}
+            className={`${inputClass} max-w-sm`}
+            value={subtitleFontSize}
+            disabled={busyAny}
+            onChange={(e) => setSubtitleFontSize(Number(e.target.value))}
+          />
         </label>
         <label className="block text-sm text-neutral-300">
           Video được chậm tối đa

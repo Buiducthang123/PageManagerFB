@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import html
+import json
 import re
 import shutil
 from pathlib import Path
@@ -115,23 +117,19 @@ def _download_via_douyin_dl(
     return dest, title, duration
 
 
-def _download_via_snaptiktok(
-    project_root: Path,
-    share_text: str,
+def _stream_download(
+    video_url: str,
+    dest: Path,
     on_progress: Optional[ProgressCallback] = None,
-) -> tuple[Path, str, float | None]:
-    if on_progress:
-        on_progress(0, 1, "Đang resolve link...")
-    video_url, title = resolve_download_link(share_text)
-
-    dest = project_root / "video.mp4"
+    headers: Optional[dict[str, str]] = None,
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    for old in project_root.glob("video.*"):
+    for old in dest.parent.glob("video.*"):
         if old.suffix.lower() in VIDEO_EXTENSIONS and old.resolve() != dest.resolve():
             old.unlink(missing_ok=True)
-
+    req_headers = headers if headers is not None else {"user-agent": _HEADERS["user-agent"]}
     try:
-        with requests.get(video_url, headers={"user-agent": _HEADERS["user-agent"]}, stream=True, timeout=60) as r:
+        with requests.get(video_url, headers=req_headers, stream=True, timeout=60) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length") or 0)
             downloaded = 0
@@ -148,6 +146,106 @@ def _download_via_snaptiktok(
         dest.unlink(missing_ok=True)
         raise FetchUrlError(f"Tải video thất bại: {err}") from err
 
+
+def _download_via_snaptiktok(
+    project_root: Path,
+    share_text: str,
+    on_progress: Optional[ProgressCallback] = None,
+) -> tuple[Path, str, float | None]:
+    if on_progress:
+        on_progress(0, 1, "Đang resolve link...")
+    video_url, title = resolve_download_link(share_text)
+    dest = project_root / "video.mp4"
+    _stream_download(video_url, dest, on_progress)
+    duration = probe_duration(dest)
+    return dest, title, duration
+
+
+VIESNAP_ENDPOINT = "https://api3.viesnap.com/douyin/info"
+# Origin/Referer giả — cùng kiểu bypass đã dùng cho snaptiktok.to ở trên
+# (backend viesnap.com có vẻ chỉ chặn theo Origin, không xác thực thật) —
+# đã xác nhận thật bằng test trực tiếp: endpoint trả 200 kèm cdn_url tải
+# được ngay (HTTP 206, đủ byte) mà không cần cookie Douyin của mình.
+_VIESNAP_HEADERS = {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "origin": "https://alldublinfarmpainters.ie",
+    "referer": "https://alldublinfarmpainters.ie/",
+    "user-agent": _HEADERS["user-agent"],
+}
+
+
+def fetch_douyin_info_viesnap(video_url: str) -> Optional[dict]:
+    """Gọi dịch vụ bên thứ 3 (api3.viesnap.com) để lấy `play_url` MỚI cho 1
+    video Douyin — KHÔNG dùng cookie/API Douyin của mình, nên không tốn hạn
+    mức/không góp phần bị risk-control (xem social-auto-plan.md, mục "biện
+    pháp giảm risk-control"). Nhận được cả URL trần dạng
+    `douyin.com/video/{aweme_id}` (không cần link share có token) — tiện hơn
+    hẳn `share_url` (không phải video nào cũng có sẵn). Không raise — dịch
+    vụ bên thứ 3 không có SLA, lỗi bất kỳ đâu (mạng/parse/thiếu field) đều
+    trả None êm, nơi gọi tự rơi xuống tầng dự phòng kế tiếp."""
+    try:
+        resp = requests.post(VIESNAP_ENDPOINT, headers=_VIESNAP_HEADERS, json={"url": video_url}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        best = (data.get("qualities") or {}).get("best") or {}
+        cdn_url = best.get("cdn_url")
+        if not cdn_url:
+            return None
+        cdn_headers_b64 = best.get("cdn_headers") or ""
+        dl_headers: dict[str, str] = {}
+        if cdn_headers_b64:
+            try:
+                dl_headers = json.loads(base64.b64decode(cdn_headers_b64).decode("utf-8"))
+            except Exception:
+                dl_headers = {}
+        return {
+            "play_url": cdn_url,
+            "headers": dl_headers or {"user-agent": _HEADERS["user-agent"]},
+            "title": data.get("title") or "",
+        }
+    except Exception:
+        return None
+
+
+def download_from_viesnap(
+    project_root: Path,
+    video_url: str,
+    title: str,
+    on_progress: Optional[ProgressCallback] = None,
+) -> Optional[tuple[Path, str, float | None]]:
+    """Tầng dự phòng TRƯỚC KHI cần gọi lại API Douyin trực tiếp — xem
+    `fetch_douyin_info_viesnap`. Trả None (không raise) nếu dịch vụ bên thứ 3
+    không dùng được, để nơi gọi rơi xuống tầng dự phòng cuối (Douyin API)."""
+    info = fetch_douyin_info_viesnap(video_url)
+    if info is None:
+        return None
+    dest = project_root / "video.mp4"
+    try:
+        _stream_download(info["play_url"], dest, on_progress, headers=info["headers"])
+    except FetchUrlError:
+        return None
+    duration = probe_duration(dest)
+    return dest, (info.get("title") or title), duration
+
+
+def download_from_direct_url(
+    project_root: Path,
+    video_url: str,
+    title: str,
+    on_progress: Optional[ProgressCallback] = None,
+) -> tuple[Path, str, float | None]:
+    """Tải thẳng từ 1 URL CDN đã có sẵn (vd `play_url` từ `douyin_dl.read_video_info`)
+    — không đi qua bước resolve share-link/gọi lại douyin-downloader CLI như
+    `download_video_from_share`, vì URL này đã là link tải trực tiếp rồi."""
+    dest = project_root / "video.mp4"
+    # CDN Douyin (douyinvod.com) trả 403 nếu thiếu Referer douyin.com — đã xác
+    # nhận thật với play_url bắt từ trình duyệt: không Referer → 403 text/html,
+    # có Referer → 200 video/mp4 đủ byte.
+    _stream_download(
+        video_url, dest, on_progress,
+        headers={"user-agent": _HEADERS["user-agent"], "referer": "https://www.douyin.com/"},
+    )
     duration = probe_duration(dest)
     return dest, title, duration
 

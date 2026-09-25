@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+import base64
+import re
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from loguru import logger
+from playwright.sync_api import Page, sync_playwright
+
+# Đăng video lên TikTok bằng browser automation THẬT (Playwright điều khiển
+# Chromium, KHÔNG dùng official Content Posting API) — quyết định đã chốt
+# cùng người dùng (xem social-auto-plan.md). Luồng thao tác + heuristic tìm
+# nút Publish dịch lại từ `Katzca/AutoSocial` (github.com/Katzca/AutoSocial,
+# src/tiktok-uploader.js, 1263 sao, MIT) — repo Node.js, không cài làm
+# dependency, chỉ đọc code để lấy đúng thứ tự thao tác/heuristic rồi viết lại
+# bằng Python cho khớp vào hệ thống job/queue sẵn có của app này.
+
+TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
+
+# Nhãn nút đa ngôn ngữ — TikTok Studio hiển thị theo ngôn ngữ tài khoản, tài
+# khoản VN thường là tiếng Việt hoặc tiếng Anh tuỳ cấu hình trình duyệt.
+_PUBLISH_LABELS = ["publish", "post", "đăng", "đăng bài", "đăng tải"]
+_CONFIRM_LABELS = ["publish", "post", "confirm", "continue", "đăng", "tiếp tục", "xác nhận"]
+# Bỏ hẳn "success"/"post" đơn lẻ khỏi danh sách này — quá chung chung, dễ
+# khớp nhầm chữ không liên quan gì tới việc đăng bài thành công (đã xác nhận
+# thật: "success" xém dính vào nội dung khác trên trang khi đang ở màn soạn
+# thảo, chưa hề bấm Publish).
+_PUBLISHED_CUES = ["published", "posted", "scheduled", "đã đăng", "thành công", "đăng tải thành công"]
+_FAILED_CUES = ["failed", "error", "could not", "retry", "lỗi", "thất bại", "không thành công"]
+# Đã bỏ "cancel" khỏi danh sách này (xem lịch sử sửa lỗi trong
+# social-auto-plan.md, mục "Bug 4") — đó mới là từ nguy hiểm thật (khớp
+# trúng nút Cancel THẬT của thanh upload), không phải việc quét toàn trang.
+# Đã thử giới hạn phạm vi tìm kiếm về trong khối modal/dialog để né việc đó,
+# nhưng lại bỏ sót popup gợi ý thật (vd "Preview your video on your phone" —
+# không nằm trong khối có class modal/dialog chuẩn) — bỏ giới hạn phạm vi,
+# chỉ cần bỏ đúng từ nguy hiểm là đủ, các từ còn lại (không phải "cancel")
+# an toàn để quét toàn trang.
+_DISMISS_LABELS = ["got it", "continue", "later", "not now", "skip", "close", "ok", "đã hiểu", "để sau", "bỏ qua", "đóng"]
+
+
+class SocialPublishError(RuntimeError):
+    pass
+
+
+def _label_regex(labels: list[str]) -> re.Pattern:
+    return re.compile("|".join(re.escape(lbl) for lbl in labels), re.IGNORECASE)
+
+
+def login_tiktok_interactive(
+    profile_dir: Path,
+    timeout_s: float = 900.0,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Mở 1 cửa sổ Chrome THẬT (persistent context — giữ nguyên cookie/local
+    storage như 1 Chrome profile bình thường, KHÔNG phải storage_state.json
+    tạm — đúng theo cách `Katzca/AutoSocial` làm, `launchPersistentContext`)
+    tới trang upload TikTok, để người dùng tự đăng nhập tay (kể cả 2FA/
+    captcha). Hàm CHẶN tới khi người dùng ĐÓNG cửa sổ (tín hiệu "xong rồi")
+    hoặc hết `timeout_s`. Các lần đăng bài sau tái dùng đúng `profile_dir`
+    này, không cần đăng nhập lại."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+            viewport={"width": 1400, "height": 1000},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(TIKTOK_UPLOAD_URL, wait_until="domcontentloaded")
+            closed = {"value": False}
+            context.on("close", lambda: closed.__setitem__("value", True))
+            start = time.time()
+            while not closed["value"] and time.time() - start < timeout_s:
+                if should_stop is not None and should_stop():
+                    break
+                time.sleep(1)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+def has_logged_in_session(profile_dir: Path) -> bool:
+    """Account này đã TỪNG mở qua luồng đăng nhập ít nhất 1 lần chưa — chỉ
+    kiểm tra thư mục Chrome profile có tồn tại, KHÔNG khẳng định đăng nhập
+    thật sự thành công. Đã thử 3 cách để phát hiện đăng nhập thật (tên cookie
+    `sessionid`/`uid_tt`, nội dung trang, biến JS `SIGI_STATE`) và xác nhận cả
+    3 đều KHÔNG đáng tin — TikTok set những cookie/trạng thái y hệt cho cả
+    khách vãng lai lẫn tài khoản đã đăng nhập, không phân biệt được từ bên
+    ngoài. Vì vậy chỉ coi đây là gợi ý yếu ("account này đã setup chưa"), phép
+    thử THẬT SỰ đáng tin duy nhất là bấm đăng và xem `publish_tiktok` có chạy
+    được hết luồng hay không."""
+    return profile_dir.exists() and any(profile_dir.iterdir())
+
+
+def _dismiss_overlays(page: Page) -> None:
+    # Trước đây có 1 bug thật: danh sách nhãn có "cancel" khớp trúng nút
+    # Cancel THẬT của thanh upload (đã bỏ từ đó khỏi `_DISMISS_LABELS` —
+    # xem chú thích tại đó). Từng thử giới hạn phạm vi quét vào khối
+    # modal/dialog để né việc này, nhưng lại bỏ sót popup gợi ý thật không
+    # nằm trong khối chuẩn — bỏ giới hạn, quét lại toàn trang như cũ (an
+    # toàn vì danh sách nhãn giờ không còn từ nguy hiểm nào).
+    pattern = _label_regex(_DISMISS_LABELS)
+    for _ in range(3):
+        clicked = False
+        buttons = page.get_by_role("button", name=pattern)
+        count = min(buttons.count(), 5)
+        for i in range(count):
+            btn = buttons.nth(i)
+            try:
+                if btn.is_visible() and not btn.is_disabled():
+                    btn.click(timeout=1200)
+                    clicked = True
+                    page.wait_for_timeout(400)
+            except Exception:
+                continue
+        if not clicked:
+            break
+
+
+def _confirm_post_now(page: Page) -> bool:
+    """Bấm nút Publish trong lúc "Content check lite" CHƯA xong (chỉ mới
+    kiểm tra bản quyền nhạc xong — "Music copyright check: No issues found")
+    làm TikTok hiện thêm 1 hộp thoại hỏi lại: "Continue to post? ... Do you
+    want to continue posting before the check is complete?" với 2 nút
+    "Cancel"/"Post now" — đã xác nhận thật qua ảnh chụp người dùng gửi, KHÔNG
+    nằm trong luồng đã xử lý trước đó (không khớp `_DISMISS_LABELS` lẫn cụm
+    xác nhận thành công/thất bại nào), khiến code đứng im chờ vô ích. Bấm
+    thẳng "Post now" nếu thấy — người dùng đã xác nhận chỉ cần đợi xong
+    Music copyright check là đủ, không cần chờ hết Content check lite (có
+    thể mất thêm nhiều phút)."""
+    btn = page.get_by_role("button", name=re.compile(r"^post now$", re.IGNORECASE)).first
+    if btn.count() == 0:
+        return False
+    try:
+        if btn.is_visible() and not btn.is_disabled():
+            btn.click(timeout=2000)
+            logger.info("social_publish: gặp hộp thoại 'Continue to post?' — đã bấm 'Post now'")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Truyền file vào trang THEO TỪNG PHẦN (mỗi phần vài MB, giải mã ngay thành
+# Uint8Array rồi ghép thành File ở cuối) thay vì 1 chuỗi base64 cả file: đã
+# xác nhận thật với video 216MB — cách cũ đẩy 1 chuỗi ~290MB qua 1 lần
+# `page.evaluate`, trong trang còn nhân bản thêm (chuỗi atob UTF-16 + mảng
+# byte) lên cỡ 1GB → tab TikTok sập giữa chừng ("Target page, context or
+# browser has been closed"), 2 lần liên tiếp. Video nhỏ vẫn chạy được với
+# cách cũ nên trước đó không lộ ra.
+_UPLOAD_CHUNK_BYTES = 6 * 1024 * 1024  # bội số của 3 → mỗi phần base64 giải mã độc lập được
+
+_INIT_CHUNKS_JS = "() => { window.__reupChunks = []; window.__reupFile = null; }"
+
+_PUSH_CHUNK_JS = """
+(b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    window.__reupChunks.push(bytes);
+    return window.__reupChunks.length;
+}
+"""
+
+_DROP_FILE_JS = """
+([name, mimeType]) => {
+    if (!window.__reupFile) {
+        window.__reupFile = new File(window.__reupChunks || [], name, { type: mimeType });
+        window.__reupChunks = null;
+    }
+    const file = window.__reupFile;
+    if (!file.size) return { ok: false, reason: 'empty file' };
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const marker = Array.from(document.querySelectorAll('div')).find(
+        (el) => (el.textContent || '').trim() === 'Or drag and drop it here'
+    );
+    const dropzone = marker ? (marker.closest('div[class*="upload"]') || marker.parentElement) : null;
+    if (!dropzone) return { ok: false, reason: 'dropzone not found' };
+    const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
+    dropzone.dispatchEvent(new DragEvent('dragenter', opts));
+    dropzone.dispatchEvent(new DragEvent('dragover', opts));
+    dropzone.dispatchEvent(new DragEvent('drop', opts));
+    return { ok: true };
+}
+"""
+
+
+_UNSAVED_DRAFT_RE = re.compile(r"wasn.t saved|chưa được lưu|continue editing", re.IGNORECASE)
+
+
+def _discard_unsaved_draft(page: Page) -> None:
+    """Lần đăng trước bị gián đoạn giữa chừng → TikTok Studio hiện thanh "A
+    video you were editing wasn't saved. Continue editing?" (Discard/Continue)
+    ngay trên khung upload — đã gặp thật, lúc đó file kéo-thả mới không được
+    nhận. Bấm "Discard" để bỏ bản nháp cũ (không phải bài đã đăng), kèm hộp
+    thoại xác nhận nếu TikTok hỏi lại. Chỉ gọi ở màn upload TRƯỚC khi thả file
+    mới — "Discard" ở màn chỉnh sửa sẽ huỷ luôn video đang upload."""
+    page.wait_for_timeout(1500)
+    try:
+        banner = page.get_by_text(_UNSAVED_DRAFT_RE).first
+        if banner.count() == 0 or not banner.is_visible():
+            return
+    except Exception:
+        return
+    discard_re = re.compile(r"^(discard|bỏ|huỷ bỏ|hủy bỏ)$", re.IGNORECASE)
+    for _ in range(2):
+        btn = page.get_by_role("button", name=discard_re).last
+        try:
+            if btn.count() == 0 or not btn.is_visible():
+                break
+            btn.click(timeout=3000)
+            logger.info("social_publish: gặp bản nháp chưa lưu từ lần trước — đã bấm Discard")
+            page.wait_for_timeout(1200)
+        except Exception:
+            break
+
+
+def _set_video_file(page: Page, video_path: Path) -> None:
+    # Đã thử LẦN LƯỢT 2 cách "đúng chuẩn Playwright" trước — cả 2 đều gán
+    # được vào input KHÔNG BÁO LỖI nhưng `input.files` vẫn luôn rỗng:
+    # (1) `set_input_files` thẳng vào input ẩn (bug đầu: bấm phải 1 khối
+    #     decoy trùng tên "Select video", đã sửa bằng match chính xác, nhưng
+    #     files vẫn rỗng sau khi sửa).
+    # (2) Bấm đúng nút thật + chặn `expect_file_chooser` (đúng khuyến nghị
+    #     chính thức của Playwright cho input ẩn) — VẪN rỗng.
+    # → Kết luận: TikTok Studio hiện không đọc file qua `<input>.files` nữa
+    # (rất có thể chuyển sang cơ chế khác nội bộ), CHỈ nhận file qua sự kiện
+    # `drop` thật với `DataTransfer` chứa File — đúng như UI có ghi "Or drag
+    # and drop it here". Đã test trực tiếp: giả lập `drop` với DataTransfer
+    # tự tạo (encode file ra base64, dựng lại `File` trong browser) THÀNH
+    # CÔNG — trang chuyển hẳn sang màn chỉnh sửa thật (thấy "Duration:
+    # 0m32s", % tiến độ upload, ô Description/Hashtags/Cover). Đổi hẳn sang
+    # cách này, không dùng input.files nữa.
+    page.evaluate(_INIT_CHUNKS_JS)
+    total = video_path.stat().st_size
+    sent = 0
+    with video_path.open("rb") as fh:
+        while True:
+            chunk = fh.read(_UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            page.evaluate(_PUSH_CHUNK_JS, base64.b64encode(chunk).decode("ascii"))
+            sent += len(chunk)
+    logger.info("social_publish: đã nạp file {} ({:.1f}MB) vào trang theo từng phần", video_path.name, total / 1e6)
+    if sent != total:
+        raise SocialPublishError(f"Nạp file vào trang thiếu dữ liệu ({sent}/{total} byte)")
+    for attempt in range(3):
+        result = page.evaluate(_DROP_FILE_JS, [video_path.name, "video/mp4"])
+        if result.get("ok"):
+            logger.info("social_publish: đã kéo-thả file video vào khung upload (lần thử {})", attempt + 1)
+            return
+        logger.warning("social_publish: kéo-thả file lần {} không thành công ({}), thử lại", attempt + 1, result)
+        page.wait_for_timeout(2000)
+    raise SocialPublishError("Không kéo-thả được file video vào khung upload của TikTok sau 3 lần thử")
+
+
+_CAPTION_SELECTORS = ['div[contenteditable="true"]', 'textarea[placeholder*="caption" i]', "textarea"]
+
+
+def _wait_for_upload_processed(page: Page, timeout_s: float = 180.0) -> None:
+    """TikTok cần thời gian upload + xử lý video thật trước khi chuyển từ màn
+    "Select video to upload" sang màn chỉnh sửa (nơi có ô caption) — đã xác
+    nhận thật qua screenshot lỗi: đợi cố định 15s là KHÔNG ĐỦ cho video qua
+    mạng thật (15s vẫn còn đang quay spinner Upload), khiến bước điền caption
+    chạy hụt vì element chưa tồn tại. Đổi hẳn sang chờ ĐÚNG TÍN HIỆU (ô
+    caption thật sự xuất hiện) thay vì đoán thời gian cố định."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+        for selector in _CAPTION_SELECTORS:
+            if page.locator(selector).first.count() > 0:
+                return
+        page.wait_for_timeout(1000)
+    raise SocialPublishError(
+        f"Video chưa xử lý xong sau {timeout_s:.0f}s chờ (không thấy màn chỉnh sửa) — có thể mạng chậm hoặc TikTok đổi giao diện"
+    )
+
+
+def _wait_for_upload_complete(page: Page, timeout_s: float = 180.0) -> None:
+    """Chờ thêm cho tới khi thanh tiến độ upload biến mất hẳn (không còn chữ
+    "seconds left"/"Uploading") trước khi bấm Publish — đã xác nhận thật gặp
+    hộp thoại "Sure you want to cancel your upload?" khi thao tác lúc video
+    còn đang tải dở (99%, "0 seconds left") — an toàn hơn là chờ thêm 1 nhịp
+    nữa trước khi bấm nút cuối cùng."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+        body_text = ""
+        try:
+            body_text = (page.locator("body").inner_text() or "").lower()
+        except Exception:
+            pass
+        if "seconds left" not in body_text and "uploading" not in body_text:
+            return
+        page.wait_for_timeout(1000)
+    logger.warning("social_publish: vẫn thấy dấu hiệu đang upload sau {}s chờ, vẫn tiếp tục thử bấm Publish", timeout_s)
+
+
+def _wait_for_content_check(page: Page, timeout_s: float = 90.0) -> None:
+    # Nút Post chỉ bị khoá CỨNG một lúc NGẮN ngay sau khi upload xong (kiểm
+    # tra sơ bộ) — KHÔNG phải khoá suốt cả "Content check lite" (~10 phút,
+    # chạy nền). Đã xác nhận thật qua ảnh người dùng gửi: bấm Post trong lúc
+    # "Content check lite" còn "Checking in progress" (chỉ "Music copyright
+    # check" xong) vẫn bấm được, TikTok chỉ hỏi lại xác nhận qua hộp thoại
+    # "Continue to post?" (xem `_confirm_post_now`) chứ không chặn hẳn. Trước
+    # đây hiểu nhầm phải chờ đủ ~10-12 phút — không cần, chỉ cần chờ qua đúng
+    # khoảng khoá ngắn ban đầu rồi bấm thử, để `_confirm_post_now` xử lý nốt
+    # hộp thoại xác nhận nếu content check thật sự chưa xong.
+    post_button = page.get_by_role("button", name=re.compile(r"^(publish|post|đăng)$", re.IGNORECASE)).first
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            if post_button.count() > 0 and not post_button.is_disabled():
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
+    logger.warning(
+        "social_publish: nút Post vẫn khoá sau {}s chờ content check, vẫn tiếp tục thử (có thể selector khác đổi)",
+        timeout_s,
+    )
+
+
+def _set_caption(page: Page, caption: str) -> None:
+    if not caption:
+        return
+    for selector in _CAPTION_SELECTORS:
+        target = page.locator(selector).first
+        if target.count() == 0:
+            continue
+        try:
+            target.click(timeout=8000)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            target.type(caption, delay=10)
+            return
+        except Exception:
+            continue
+    raise SocialPublishError("Không tìm thấy ô nhập caption")
+
+
+# JS heuristic tìm nút Publish thật — dịch trực tiếp từ `tryClickPublishButton`
+# (chiến lược cuối, brute-force qua page.evaluate) trong tiktok-uploader.js
+# tham khảo: né nút "Post" ở sidebar/nav (dễ nhầm với menu điều hướng), ưu
+# tiên nút nằm ở nửa dưới màn hình (khớp vị trí thật của nút Publish trên
+# TikTok Studio) và có class gợi ý publish/submit.
+_FIND_PUBLISH_JS = """
+(labels) => {
+  const normalize = (v) => String(v || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  const wanted = labels.map(normalize).filter(Boolean);
+  const isLikely = (btn) => {
+    const text = normalize(btn.textContent || btn.getAttribute('aria-label'));
+    if (!text || text === 'posts') return false;
+    const exact = wanted.includes(text);
+    const loose = wanted.filter((l) => l !== 'post').some((l) => text.includes(l));
+    if (!exact && !loose) return false;
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+    if (btn.closest("nav, aside, [role='navigation'], [class*='sidebar' i], [class*='menu' i]")) return false;
+    return true;
+  };
+  const score = (btn) => {
+    const rect = btn.getBoundingClientRect();
+    const className = normalize(btn.className || '');
+    let s = 0;
+    if (/\\b(post|publish|submit)\\b/.test(className)) s += 20;
+    if (rect.width >= 80 && rect.height >= 28) s += 15;
+    if (window.innerHeight > 0 && rect.top >= window.innerHeight * 0.5) s += 60;
+    return s;
+  };
+  const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+  const candidates = buttons.filter(isLikely).map((btn) => ({ btn, s: score(btn) })).sort((a, b) => b.s - a.s);
+  if (candidates.length > 0) {
+    candidates[0].btn.scrollIntoView({ block: 'center' });
+    candidates[0].btn.click();
+    return true;
+  }
+  return false;
+}
+"""
+
+
+def _click_publish(page: Page) -> None:
+    # Đã xác nhận thật (test trực tiếp có account thật): nhãn "post" trong
+    # `_PUBLISH_LABELS` khớp CHUỖI CON vào mục điều hướng sidebar "Posts"
+    # (quản lý bài đã đăng) — nếu dùng `page.get_by_role("button", name=...)`
+    # so khớp chuỗi con đơn giản, nó bấm NHẦM sang "Posts" (điều hướng sang
+    # trang khác), rồi chính việc đổi URL đó bị `_wait_for_publish_confirmation`
+    # coi nhầm là dấu hiệu "đã đăng thành công" — báo THÀNH CÔNG GIẢ dù video
+    # chưa hề được gửi đi. CHỈ dùng `_FIND_PUBLISH_JS` (có loại trừ hẳn
+    # nav/sidebar + chỉ nhận "post" khi khớp CHÍNH XÁC, không khớp chuỗi con)
+    # — không còn dùng `get_by_role` chuỗi con nữa cho bước này.
+    _dismiss_overlays(page)
+    for attempt in range(6):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(500)
+
+        try:
+            clicked = bool(page.evaluate(_FIND_PUBLISH_JS, _PUBLISH_LABELS))
+        except Exception:
+            clicked = False
+
+        if clicked:
+            logger.info("social_publish: đã bấm nút Publish (lần thử {})", attempt + 1)
+            return
+        _dismiss_overlays(page)
+        page.wait_for_timeout(2000)
+    raise SocialPublishError("Không tìm thấy/bấm được nút Publish sau 6 lần thử")
+
+
+def _wait_for_publish_confirmation(page: Page, timeout_s: float = 60.0) -> None:
+    published_pattern = _label_regex(_PUBLISHED_CUES)
+    failed_pattern = _label_regex(_FAILED_CUES)
+    started_url = page.url
+    api_success = {"value": False}
+    api_failure: dict[str, Optional[str]] = {"value": None}
+
+    def _on_response(response) -> None:
+        # Đã xác nhận thật: pattern URL rộng ("/creator", "/studio", "/aweme",
+        # "/upload") khớp trúng vô số API nền SPA gọi liên tục (load thông
+        # tin tài khoản, gợi ý, thống kê...) — không liên quan gì tới việc
+        # BẤM PUBLISH, khiến `api_success` bật lên gần như ngay lập tức bất
+        # kể có bấm Publish thật hay chưa, góp phần vào lần báo "thành công"
+        # giả trước đó. Thu hẹp CHỈ còn đúng cụm "/publish" (endpoint gửi bài
+        # đăng thật) — không đủ tự tin cho các cụm chung chung còn lại.
+        method = response.request.method
+        if method not in ("POST", "PUT", "PATCH"):
+            return
+        url = response.url.lower()
+        if "/publish" not in url:
+            return
+        if 200 <= response.status < 300:
+            api_success["value"] = True
+        elif response.status >= 400:
+            api_failure["value"] = f"API trả {response.status}: {response.url}"
+
+    page.on("response", _on_response)
+    try:
+        start = time.time()
+        while time.time() - start < timeout_s:
+            _confirm_post_now(page)
+            _dismiss_overlays(page)
+            body_text = ""
+            try:
+                body_text = (page.locator("body").inner_text() or "").lower()
+            except Exception:
+                pass
+            if failed_pattern.search(body_text):
+                raise SocialPublishError("TikTok báo lỗi sau khi bấm Publish")
+            if api_failure["value"]:
+                raise SocialPublishError(api_failure["value"])
+            if api_success["value"] or published_pattern.search(body_text):
+                return
+            if page.url != started_url and "/upload" not in page.url:
+                return
+            page.wait_for_timeout(2000)
+        raise SocialPublishError("Không xác nhận được kết quả đăng bài sau khi chờ")
+    finally:
+        page.remove_listener("response", _on_response)
+
+
+def publish_tiktok(
+    video_path: Path,
+    caption: str,
+    profile_dir: Path,
+    screenshot_dir: Optional[Path] = None,
+) -> None:
+    """Đăng 1 video lên TikTok qua account đã đăng nhập sẵn trong
+    `profile_dir` (xem `login_tiktok_interactive`). Ném `SocialPublishError`
+    nếu thất bại — chụp màn hình lại lúc lỗi (và lúc thành công) vào
+    `screenshot_dir` để biết chính xác TikTok đổi UI ở bước nào nếu selector
+    có ngày nào đó không còn khớp."""
+    if not video_path.exists():
+        raise SocialPublishError(f"Không thấy file video: {video_path}")
+    if not has_logged_in_session(profile_dir):
+        raise SocialPublishError("Account TikTok này chưa đăng nhập — bấm 'Đăng nhập TikTok' trước")
+
+    console_log: list[str] = []
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+            viewport={"width": 1400, "height": 1000},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            # Ghi lại console browser + request lỗi ra 1 file log riêng mỗi
+            # lần đăng — lần trước phải đoán mò qua ảnh chụp tĩnh mới tìm ra
+            # nguyên nhân thật (file không gán được vào input), có log này
+            # thì lần sau biết ngay không cần dựng lại kịch bản debug riêng.
+            page.on("console", lambda msg: console_log.append(f"[console:{msg.type}] {msg.text[:300]}"))
+            page.on(
+                "requestfailed",
+                lambda req: console_log.append(f"[request-failed] {req.url[:200]} — {req.failure}"),
+            )
+            try:
+                page.goto(TIKTOK_UPLOAD_URL, wait_until="domcontentloaded")
+                _discard_unsaved_draft(page)
+                _set_video_file(page, video_path)
+                _wait_for_upload_processed(page)
+                _set_caption(page, caption)
+                _wait_for_upload_complete(page)
+                _wait_for_content_check(page)
+                _click_publish(page)
+                _wait_for_publish_confirmation(page)
+                if screenshot_dir:
+                    screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(screenshot_dir / "last-publish-success.png"), full_page=True)
+                    try:
+                        (screenshot_dir / "last-publish-success.log").write_text(
+                            "\n".join(console_log[-300:]), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+                logger.info("social_publish: đăng TikTok thành công — {}", video_path.name)
+            except Exception as err:
+                if screenshot_dir:
+                    screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        page.screenshot(path=str(screenshot_dir / "last-publish-error.png"), full_page=True)
+                    except Exception:
+                        pass
+                    try:
+                        (screenshot_dir / "last-publish-error.log").write_text(
+                            "\n".join(console_log[-300:]), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+                if isinstance(err, SocialPublishError):
+                    raise
+                raise SocialPublishError(f"Đăng TikTok lỗi: {err}") from err
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass

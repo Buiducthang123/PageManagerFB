@@ -83,6 +83,15 @@ def any_job_running(prefix: str) -> bool:
     return any(is_job_running(k) for k in keys)
 
 
+def running_keys() -> list[str]:
+    """Key của mọi job đang chạy — dùng cho hàng đợi chung của bộ lập lịch
+    "Dự án tự động" (vd có job ":publish"/":crawl" nào đang chạy ở BẤT KỲ dự
+    án nào không) và màn giám sát tiến trình."""
+    with _jobs_guard:
+        items = list(_jobs.items())
+    return [k for k, job in items if job.is_alive()]
+
+
 def request_cancel(key: str) -> bool:
     """Đánh dấu job cần dừng + kill ngay tiến trình con (nếu có, vd demucs)
     thay vì chỉ chờ cờ được check ở lần on_progress kế tiếp. Trả về False nếu

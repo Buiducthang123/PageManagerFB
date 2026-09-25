@@ -5,6 +5,10 @@ import ProjectDetail from './pages/ProjectDetail'
 import MergePage from './pages/MergePage'
 import DownloadPage from './pages/DownloadPage'
 import SettingsPage from './pages/SettingsPage'
+import AutomatedPage from './pages/AutomatedPage'
+import AutomatedDetailPage from './pages/AutomatedDetailPage'
+import MonitorPage from './pages/MonitorPage'
+import CleanupPage from './pages/CleanupPage'
 
 export default function App() {
   return (
@@ -16,6 +20,10 @@ export default function App() {
           <Route path="/projects/:projectId" element={<ProjectDetail />} />
           <Route path="/merge" element={<MergePage />} />
           <Route path="/download" element={<DownloadPage />} />
+          <Route path="/automated" element={<AutomatedPage />} />
+          <Route path="/automated/:socialId" element={<AutomatedDetailPage />} />
+          <Route path="/monitor" element={<MonitorPage />} />
+          <Route path="/cleanup" element={<CleanupPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

@@ -185,14 +185,21 @@ def _ocr_text(engine, frame_path: Path) -> str:
 def detect_subtitle_region(
     video_path: Path,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
+    search_region: Optional[tuple[float, float, float, float]] = None,
 ) -> Optional[tuple[float, float, float, float]]:
     """Tự động dò vùng che phụ đề cũ cho tính năng "Xuất video trực tiếp" —
     OCR nguyên khung hình (không crop trước, vì chưa biết vùng chữ ở đâu) trên
-    1 số khung lấy mẫu thưa (xem OCR_DETECT_REGION_FPS), gộp (hợp) toạ độ mọi
-    box chữ Hán phát hiện được thành 1 khung chữ nhật duy nhất che suốt video —
-    đã chốt với người dùng: chấp nhận che dư nếu phụ đề cũ nhảy vị trí, đổi
-    lấy đơn giản (không cần vùng che đổi theo thời gian). Trả None nếu không
-    phát hiện được chữ nào (video không có phụ đề cứng, hoặc chữ quá nhỏ/mờ)."""
+    1 số khung lấy mẫu thưa (xem OCR_DETECT_REGION_FPS), gộp toạ độ mọi box
+    chữ Hán phát hiện được (đã lọc độ tin cậy + logo tĩnh + phụ đề di động,
+    xem các bước lọc bên dưới) thành 1 khung chữ nhật che suốt video. Trả
+    None nếu: không phát hiện được chữ nào (video không có phụ đề cứng, chữ
+    quá nhỏ/mờ), hoặc phụ đề phát hiện được là chữ DI ĐỘNG (không có 1 vùng
+    cố định hợp lý để che). `search_region` (x,y,w,h phân số 0-1, tuỳ chọn) —
+    thu hẹp vùng OCR quét TỪ ĐẦU (không phải lọc sau) — giảm hẳn khả năng đọc
+    nhầm hình ảnh phức tạp (giáp/hoạ tiết nhân vật...) ở ngoài dải phụ đề
+    thành 'chữ giả' (đã xác nhận thật: model OCR có thể đọc nhầm hoạ tiết góc
+    cạnh phức tạp thành ký tự Hán với độ tin cậy CAO, không lọc được bằng
+    ngưỡng confidence). None = quét nguyên khung hình như cũ."""
     if not video_path.exists():
         raise TranscribeOCRError(f"Không thấy video: {video_path}")
 
@@ -207,22 +214,33 @@ def detect_subtitle_region(
     # loại chữ hiệu ứng này (ít quan trọng hơn để dịch, che sẽ làm vùng che
     # rộng quá mức cần thiết).
     _MAX_BOX_HEIGHT_FRAC = 0.15
+    # Ngưỡng độ tin cậy nhận diện chữ (RapidOCR trả `result.scores`, 0-1) —
+    # box đọc từ khung hình đang GIỮA HIỆU ỨNG CHUYỂN ĐỘNG (mờ dần/nhoè khi
+    # phụ đề xuất hiện/biến mất) luôn có score thấp hẳn so với khung đã rõ
+    # nét, VÀ hình dạng box cũng méo/to hơn thật — bỏ trước khi tính vùng che
+    # thay vì tự dựng cơ chế chọn "khung nét nhất" (tốn kém hơn nhiều, đạt
+    # hiệu quả tương đương cho mục đích riêng của hàm này: chỉ cần TOẠ ĐỘ
+    # đúng, không cần đọc đúng NỘI DUNG chữ).
+    _MIN_CONFIDENCE = 0.7
+
+    # LƯU Ý: `crop_region=None` cho `_extract_frames` KHÔNG có nghĩa "không
+    # crop" — `_crop_filter` coi None là "chưa chọn tay, dùng mặc định crop
+    # đáy 25%" (đúng ý cho transcribe_video, sai hoàn toàn ở đây nếu không
+    # truyền `search_region` vì mình đang cần quét NGUYÊN khung hình để tìm
+    # vị trí chữ). Phải truyền rõ (0,0,1,1) khi không có `search_region` —
+    # vùng full-frame thật, không phải "để trống" — mới tắt được crop mặc
+    # định (đã xác nhận thật: thiếu dòng này khiến mọi toạ độ box tính sai
+    # theo tỉ lệ dải crop 25% đáy thay vì theo khung hình gốc).
+    crop_used = search_region or (0.0, 0.0, 1.0, 1.0)
+    sx, sy, sw, sh = crop_used
 
     with tempfile.TemporaryDirectory(prefix="ocr_region_") as tmp:
-        # LƯU Ý: `crop_region=None` cho `_extract_frames` KHÔNG có nghĩa "không
-        # crop" — `_crop_filter` coi None là "chưa chọn tay, dùng mặc định crop
-        # đáy 25%" (đúng ý cho transcribe_video, sai hoàn toàn ở đây vì mình
-        # đang cần quét NGUYÊN khung hình để tìm vị trí chữ). Phải truyền rõ
-        # (0,0,1,1) — vùng full-frame thật, không phải "để trống" — mới tắt
-        # được crop mặc định (đã xác nhận thật: thiếu dòng này khiến mọi toạ độ
-        # box tính sai theo tỉ lệ dải crop 25% đáy thay vì theo khung hình gốc,
-        # ra kết quả vùng che sai be bét).
-        frames = _extract_frames(video_path, Path(tmp), fps, crop_region=(0.0, 0.0, 1.0, 1.0))
+        frames = _extract_frames(video_path, Path(tmp), fps, crop_region=crop_used)
         total = len(frames)
         if total == 0:
             raise TranscribeOCRError("Không lấy được khung hình nào từ video")
 
-        boxes: list[tuple[float, float, float, float]] = []  # (bx0, bx1, by0, by1)
+        boxes: list[tuple[float, float, float, float, str]] = []  # (bx0, bx1, by0, by1, text) — toạ độ FULL-FRAME
         for i, frame in enumerate(frames):
             if on_progress:
                 on_progress(i, total, f"Dò vùng chữ {i + 1}/{total}")
@@ -233,8 +251,12 @@ def detect_subtitle_region(
             result = engine(str(frame))
             if not result.txts:
                 continue
-            for box, text in zip(result.boxes, result.txts):
-                if not _has_cjk(text.strip()):
+            scores = result.scores or [1.0] * len(result.txts)
+            for box, text, score in zip(result.boxes, result.txts, scores):
+                text = text.strip()
+                if not _has_cjk(text):
+                    continue
+                if score is not None and score < _MIN_CONFIDENCE:
                     continue
                 bx0, bx1 = float(box[:, 0].min()) / w, float(box[:, 0].max()) / w
                 by0, by1 = float(box[:, 1].min()) / h, float(box[:, 1].max()) / h
@@ -248,7 +270,10 @@ def detect_subtitle_region(
                 # ngưỡng này.
                 if (bx1 - bx0) > 0.9 or (by1 - by0) > _MAX_BOX_HEIGHT_FRAC:
                     continue
-                boxes.append((bx0, bx1, by0, by1))
+                # Quy đổi từ toạ độ TRONG VÙNG QUÉT (đã crop bởi ffmpeg) sang
+                # toạ độ FULL-FRAME thật — mọi nơi khác trong hàm (và giá trị
+                # trả về) đều tính theo full-frame.
+                boxes.append((sx + bx0 * sw, sx + bx1 * sw, sy + by0 * sh, sy + by1 * sh, text))
 
     if not boxes:
         return None
@@ -258,45 +283,164 @@ def detect_subtitle_region(
     # khung hình — đã xác nhận thật, vd đọc nhầm '中'/'新'/'江' ở nhiều vị trí y
     # khác hẳn nhau) — phụ đề THẬT luôn lặp lại ở gần đúng 1 DẢI Y cố định
     # xuyên suốt video, còn nhiễu thì rải rác không lặp lại đúng chỗ. Gộp theo
-    # cụm y-center đông nhất (histogram 20 bin) thay vì hợp mù quáng mọi box.
+    # cụm y-center (histogram 20 bin) thay vì hợp mù quáng mọi box.
     _NUM_BINS = 20
     bin_counts = [0] * _NUM_BINS
-    for bx0, bx1, by0, by1 in boxes:
+    for bx0, bx1, by0, by1, text in boxes:
         yc = (by0 + by1) / 2
         bin_idx = min(_NUM_BINS - 1, int(yc * _NUM_BINS))
         bin_counts[bin_idx] += 1
-    dominant_bin = max(range(_NUM_BINS), key=lambda b: bin_counts[b])
-    # Cửa sổ dung sai quanh bin đông nhất — đủ rộng để không cắt rời phụ đề
-    # THẬT rơi ở bin liền kề do sai số làm tròn, không đủ rộng để lẫn nhiễu.
-    # Đã xác nhận thật trên video mẫu: dải phụ đề thật cực kỳ ổn định
-    # (y-center chỉ dao động ~0.005 giữa các khung, rơi gọn trong 1 bin), còn
-    # cụm nhiễu gần nhất cũng đã cách xa hơn 1 bin — dung sai 2 bin (thử ban
-    # đầu) đủ rộng để NUỐT LUÔN cụm nhiễu liền kề, phải hạ xuống 1.
+    # Cửa sổ dung sai quanh 1 bin — đủ rộng để không cắt rời phụ đề THẬT rơi ở
+    # bin liền kề do sai số làm tròn, không đủ rộng để lẫn nhiễu (đã xác nhận
+    # thật trên video mẫu: dải phụ đề thật cực kỳ ổn định, y-center chỉ dao
+    # động ~0.005 giữa các khung, rơi gọn trong 1 bin).
     _TOLERANCE_BINS = 1
-    lo = (dominant_bin - _TOLERANCE_BINS) / _NUM_BINS
-    hi = (dominant_bin + 1 + _TOLERANCE_BINS) / _NUM_BINS
 
-    min_x = min_y = 1.0
-    max_x = max_y = 0.0
-    found_any = False
-    for bx0, bx1, by0, by1 in boxes:
-        yc = (by0 + by1) / 2
-        if not (lo <= yc <= hi):
+    def _boxes_in_bin(bin_idx: int) -> list[tuple[float, float, float, float, str]]:
+        lo = (bin_idx - _TOLERANCE_BINS) / _NUM_BINS
+        hi = (bin_idx + 1 + _TOLERANCE_BINS) / _NUM_BINS
+        return [b for b in boxes if lo <= (b[2] + b[3]) / 2 <= hi]
+
+    # Logo/watermark tĩnh (tên kênh, tag studio...) thường in y NGUYÊN VĂN ở
+    # MỌI khung hình lấy mẫu — khác phụ đề lời thoại LUÔN đổi nội dung theo
+    # từng câu. Xét từng bin theo thứ tự đông nhất trước, bỏ qua bin nào chữ
+    # bị lặp lại gần như y hệt (logo), lấy bin ĐẦU TIÊN có nội dung đủ đa dạng
+    # (phụ đề thật) — tránh nhầm che logo thay vì phụ đề (đã gặp thật: logo
+    # xuất hiện ở MỌI khung nên đếm còn đông hơn cả phụ đề, nếu chỉ đếm số
+    # lượng thô sẽ chọn nhầm logo làm "dải chữ chính").
+    _MAX_REPEAT_FRAC = 0.6  # > 60% box cùng 1 nội dung y hệt → coi là logo tĩnh
+    candidate_bins = sorted(range(_NUM_BINS), key=lambda b: bin_counts[b], reverse=True)
+    matched: list[tuple[float, float, float, float, str]] = []
+    for bin_idx in candidate_bins:
+        if bin_counts[bin_idx] == 0:
+            break
+        group = _boxes_in_bin(bin_idx)
+        if not group:
             continue
-        found_any = True
-        min_x = min(min_x, bx0)
-        max_x = max(max_x, bx1)
-        min_y = min(min_y, by0)
-        max_y = max(max_y, by1)
+        texts = [b[4] for b in group]
+        most_common_count = max(texts.count(t) for t in set(texts))
+        if most_common_count / len(texts) > _MAX_REPEAT_FRAC and len(group) >= 3:
+            continue  # nghi logo tĩnh — thử bin đông kế tiếp
+        matched = group
+        break
 
-    if not found_any:
+    if not matched:
         return None
 
-    x0 = max(0.0, min_x - _PAD_FRAC)
-    y0 = max(0.0, min_y - _PAD_FRAC)
-    x1 = min(1.0, max_x + _PAD_FRAC)
-    y1 = min(1.0, max_y + _PAD_FRAC)
+    # Phụ đề DI ĐỘNG (chữ hiệu ứng bay/nhảy khắp khung hình, karaoke động...)
+    # khác phụ đề hội thoại thường: dù đổi độ dài câu, TÂM ngang (center-x)
+    # của phụ đề hội thoại vẫn dao động RẤT ít quanh 1 vị trí quen thuộc
+    # (thường giữa khung hoặc lề trái cố định) — còn chữ di động thì tâm-x
+    # trải rộng/rải rác. 1 box che TĨNH DUY NHẤT không hợp cho trường hợp
+    # này (che sai vị trí phần lớn thời gian) — bỏ qua auto-che, để người
+    # dùng tự khoanh tay nếu cần (không cố ép che sai).
+    _MAX_CENTER_X_STD = 0.12  # phân số chiều rộng khung hình
+    if len(matched) >= 4:
+        center_xs = [(b[0] + b[1]) / 2 for b in matched]
+        std_x = float(np.std(center_xs))
+        if std_x > _MAX_CENTER_X_STD:
+            logger.warning(
+                "detect_subtitle_region: phụ đề nghi DI ĐỘNG (std tâm-X={:.3f} > {}) — bỏ qua auto-che",
+                std_x, _MAX_CENTER_X_STD,
+            )
+            return None
+
+    def _percentile(values: list[float], p: float) -> float:
+        s = sorted(values)
+        idx = min(len(s) - 1, max(0, round(p * (len(s) - 1))))
+        return s[idx]
+
+    # Che KHÍT theo phân vị 10-90% thay vì hợp min/max thô — 1 khung lấy mẫu
+    # hoạ hoằn có câu dài/lệch bất thường trước đây kéo giãn cả vùng che cho
+    # SUỐT video, dù đa số khung hình chữ hẹp hơn nhiều — nhìn "che quá to"
+    # đúng như người dùng phản ánh. Đổi coordinate thấp nhất/cao nhất thành
+    # phân vị 10%/90% giữ vùng che sát với kích cỡ chữ THỰC TẾ ở phần lớn
+    # khung hình, chấp nhận có thể hụt vài khung ngoại lệ (đổi lấy khít hơn).
+    x0 = max(0.0, _percentile([b[0] for b in matched], 0.10) - _PAD_FRAC)
+    x1 = min(1.0, _percentile([b[1] for b in matched], 0.90) + _PAD_FRAC)
+    y0 = max(0.0, _percentile([b[2] for b in matched], 0.10) - _PAD_FRAC)
+    y1 = min(1.0, _percentile([b[3] for b in matched], 0.90) + _PAD_FRAC)
     return (x0, y0, x1 - x0, y1 - y0)
+
+
+def detect_subtitle_visibility(
+    video_path: Path,
+    region: tuple[float, float, float, float],
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+) -> list[tuple[float, float]]:
+    """Dò các khoảng thời gian [start_s, end_s] mà phụ đề cứng THẬT SỰ hiện
+    trên khung hình trong `region` đã dò được (`detect_subtitle_region`) —
+    chỉ cần biết CÓ/KHÔNG có chữ, KHÔNG cần đọc đúng nội dung. Cố tình TÁCH
+    HẲN khỏi `transcribe_video` (đọc lời THOẠI) — đã xác nhận thật có video
+    lời thoại kể 1 chuyện, chữ trên màn hình lại là chuyện khác hẳn (audio
+    và phụ đề cứng không đồng bộ nội dung) — nên KHÔNG dùng mốc thời gian
+    của transcribe (dù bằng Whisper hay OCR) để suy ra lúc chữ hiện/ẩn, phải
+    tự dò riêng. Dùng cho tính năng che phụ đề THEO THỜI GIAN, hoạt động với
+    MỌI engine transcribe (khác hẳn hạn chế trước đây: chỉ áp dụng được khi
+    engine transcribe là OCR). Trả [] nếu không dò được khoảng nào (không
+    chặn export — gọi nơi dùng tự hiểu [] = che suốt video như cũ)."""
+    if not video_path.exists():
+        raise TranscribeOCRError(f"Không thấy video: {video_path}")
+
+    engine = _load_region_engine()
+    fps = config.OCR_SAMPLE_FPS
+    frame_dur = 1.0 / fps
+    _MIN_CONFIDENCE = 0.7
+
+    with tempfile.TemporaryDirectory(prefix="ocr_visibility_") as tmp:
+        # Crop THẲNG vào region đã dò được — vừa nhanh (ít pixel hơn hẳn quét
+        # full-frame) vừa chính xác hơn (không lẫn chữ/hoạ tiết ngoài vùng).
+        frames = _extract_frames(video_path, Path(tmp), fps, crop_region=region)
+        total = len(frames)
+        if total == 0:
+            return []
+
+        presence: list[bool] = []
+        for i, frame in enumerate(frames):
+            if on_progress:
+                on_progress(i, total, f"Dò thời điểm hiện chữ {i + 1}/{total}")
+            img = cv2.imread(str(frame))
+            if img is None:
+                presence.append(False)
+                continue
+            result = engine(str(frame))
+            has_text = False
+            if result.txts:
+                scores = result.scores or [1.0] * len(result.txts)
+                for text, score in zip(result.txts, scores):
+                    if _has_cjk(text.strip()) and (score is None or score >= _MIN_CONFIDENCE):
+                        has_text = True
+                        break
+            presence.append(has_text)
+
+    windows: list[tuple[float, float]] = []
+    start_idx: Optional[int] = None
+    for i, has in enumerate(presence):
+        if has and start_idx is None:
+            start_idx = i
+        elif not has and start_idx is not None:
+            windows.append((start_idx * frame_dur, i * frame_dur))
+            start_idx = None
+    if start_idx is not None:
+        windows.append((start_idx * frame_dur, len(presence) * frame_dur))
+    if not windows:
+        return []
+
+    # Đệm nhỏ 2 đầu mỗi khoảng — OCR đôi khi trễ đúng 1 khung mẫu lúc chữ
+    # bắt đầu/kết thúc hiện (cùng lý do `_PAD_FRAC` ở detect_subtitle_region).
+    pad_s = frame_dur * 0.5
+    padded = [(max(0.0, s - pad_s), e + pad_s) for s, e in windows]
+
+    # Gộp các khoảng cách nhau dưới 1 khung mẫu — tránh chớp tắt liên tục do
+    # OCR đọc trượt đúng 1 khung giữa 2 câu phụ đề liền kề (ở fps lấy mẫu
+    # này không đủ để phân biệt khoảng trống thật sự ngắn).
+    merged: list[tuple[float, float]] = []
+    for s, e in padded:
+        if merged and s - merged[-1][1] <= frame_dur:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
 
 
 def transcribe_video(

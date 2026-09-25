@@ -141,6 +141,19 @@ def read_video_info(json_path: Path) -> Optional[dict]:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
+    return parse_aweme_info(data)
+
+
+def parse_aweme_info(data: dict) -> dict:
+    """Bóc các field hiển thị/tải từ 1 object aweme gốc của Douyin — dùng
+    chung cho file `_data.json` của douyin-downloader (`read_video_info`) lẫn
+    response API bắt được trong trình duyệt thật (`douyin_browser.py`), cả 2
+    đều cùng cấu trúc aweme. API web không phải lúc nào cũng có `share_url` ở
+    cấp ngoài cùng — thử thêm `share_info.share_url`. KHÔNG tự dựng link trần
+    khi thiếu: `share_url` rỗng là tín hiệu để luồng kích hoạt KHÔNG gọi API
+    Douyin dò lại link (xem `_start_social_activate`), giữ đúng hành vi cũ."""
     stats = data.get("statistics") or {}
     video = data.get("video") or {}
     # Douyin không có field "title" riêng — desc/caption chính là tiêu đề
@@ -149,11 +162,14 @@ def read_video_info(json_path: Path) -> Optional[dict]:
     # tự tải về, ảnh này ký hết hạn rất xa (nhiều năm) nên dùng thẳng an toàn.
     thumb_url = ((video.get("cover") or {}).get("url_list") or [None])[0]
     caption = data.get("desc") or ""
+    aweme_id = str(data.get("aweme_id") or "")
+    share_url = data.get("share_url") or (data.get("share_info") or {}).get("share_url") or ""
     return {
+        "aweme_id": aweme_id,
         "title": caption,
         "caption": caption,
         "author": (data.get("author") or {}).get("nickname") or "",
-        "share_url": data.get("share_url") or "",
+        "share_url": share_url,
         "thumb_url": thumb_url,
         "duration_sec": round((data.get("duration") or 0) / 1000, 1),
         "likes": stats.get("digg_count"),
