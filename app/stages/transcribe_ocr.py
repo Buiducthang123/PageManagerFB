@@ -138,21 +138,39 @@ def _extract_frames(
 # là các pixel RẤT SÁNG (trắng/near-white, có viền đen dày để dễ đọc trên
 # nền bất kỳ) — nhị phân hoá theo ngưỡng sáng rồi chỉ so khung "mặt nạ chữ"
 # này, gần như miễn nhiễm với nền ảnh tự nhiên thay đổi liên tục.
-_MASK_DIFF_FRACTION = 0.02
+#
+# Sửa lần 2 (đo thật trên video 4K 3840x2160): bản cũ thu nhỏ vùng crop về
+# 160x32 TRƯỚC rồi mới lọc pixel sáng — ở 4K co ~24 lần, nét chữ trắng mảnh bị
+# trộn với viền đen thành xám, mặt nạ gần như luôn RỖNG kể cả khi có phụ đề →
+# mọi khung "giống nhau" → dùng lại chữ cũ: 90s đầu sai 52/90 khung (mất câu,
+# câu cũ kéo dài). Giờ lọc ở độ phân giải GỐC trước, chỉ giữ pixel sáng nằm
+# sát viền tối (chữ phụ đề luôn có viền đen — trời/nền sáng không có, không
+# làm nhiễu), rồi mới thu nhỏ; so theo tỉ lệ trên phần có chữ thay vì trên cả
+# khung (câu ngắn chỉ chiếm vài % khung, so trên cả khung dễ lọt ngưỡng).
+# Đo lại: 4K sai 52 → 0 câu, 720p sai 7 → 0, 1080p dọc/576p không đổi (0).
+_SIG_SIZE = (320, 64)
+_SIG_EMPTY_CELLS = 12  # ít hơn ngần này ô có chữ ở cả 2 khung = cùng "không có phụ đề"
+_SIG_DIFF_RATIO = 0.3
 
 
 def _frame_signature(frame_path: Path) -> np.ndarray:
     img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return np.zeros((32, 160), dtype=np.uint8)
-    small = cv2.resize(img, (160, 32), interpolation=cv2.INTER_AREA)
-    _, mask = cv2.threshold(small, 200, 255, cv2.THRESH_BINARY)
-    return mask
+        return np.zeros((_SIG_SIZE[1], _SIG_SIZE[0]), dtype=bool)
+    bright = (img >= 200).astype(np.uint8)
+    dark = (img <= 70).astype(np.uint8)
+    k = max(3, round(img.shape[0] / 60)) | 1  # độ dày viền tỉ lệ theo độ phân giải
+    near_dark = cv2.dilate(dark, np.ones((k, k), np.uint8))
+    text = (bright & near_dark) * 255
+    small = cv2.resize(text, _SIG_SIZE, interpolation=cv2.INTER_AREA)
+    return small > 20
 
 
 def _frames_similar(a: np.ndarray, b: np.ndarray) -> bool:
-    diff_frac = float(np.count_nonzero(a != b)) / a.size
-    return diff_frac < _MASK_DIFF_FRACTION
+    union = int(np.count_nonzero(a | b))
+    if union < _SIG_EMPTY_CELLS:
+        return True
+    return np.count_nonzero(a ^ b) / union < _SIG_DIFF_RATIO
 
 
 def _has_cjk(text: str) -> bool:
@@ -356,10 +374,19 @@ def detect_subtitle_region(
     # đúng như người dùng phản ánh. Đổi coordinate thấp nhất/cao nhất thành
     # phân vị 10%/90% giữ vùng che sát với kích cỡ chữ THỰC TẾ ở phần lớn
     # khung hình, chấp nhận có thể hụt vài khung ngoại lệ (đổi lấy khít hơn).
+    # Đệm DỌC theo chiều cao dòng chữ thật (không theo chiều cao khung hình):
+    # đệm cũ 1.5% khung hình MỖI cạnh = ~61px tổng trên video cao 2048px, gần
+    # bằng cả dòng chữ (~73px) — người dùng phản ánh dải che "quá rộng về
+    # chiều cao so với text cũ". Đo thật trên video xam-xi-du: dải che 155px =
+    # 2.1x dòng chữ; đệm 15% chiều cao chữ → 118px (1.6x), vẫn che trọn 94%
+    # box chữ gốc (các phương án chặt hơn lọt chữ nhiều hơn: 86-88%).
+    _PAD_Y_TEXT_FRAC = 0.15
+    median_h = float(np.median([b[3] - b[2] for b in matched]))
+    pad_y = _PAD_Y_TEXT_FRAC * median_h
     x0 = max(0.0, _percentile([b[0] for b in matched], 0.10) - _PAD_FRAC)
     x1 = min(1.0, _percentile([b[1] for b in matched], 0.90) + _PAD_FRAC)
-    y0 = max(0.0, _percentile([b[2] for b in matched], 0.10) - _PAD_FRAC)
-    y1 = min(1.0, _percentile([b[3] for b in matched], 0.90) + _PAD_FRAC)
+    y0 = max(0.0, _percentile([b[2] for b in matched], 0.10) - pad_y)
+    y1 = min(1.0, _percentile([b[3] for b in matched], 0.90) + pad_y)
     return (x0, y0, x1 - x0, y1 - y0)
 
 

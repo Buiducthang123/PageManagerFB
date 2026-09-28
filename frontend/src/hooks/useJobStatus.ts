@@ -33,7 +33,11 @@ export function useJobStatus(
   useEffect(() => {
     const status = query.data?.status ?? null
     const prev = prevStatus.current
-    const justSettled = prev === 'running' && (status === 'done' || status === 'failed' || status === 'cancelled')
+    // `status === null` sau "running": job hết chạy nhưng backend không còn
+    // giữ (vd server tự nạp lại code) — vẫn phải làm mới project, nếu không
+    // nút cứ đứng ở "Đang chạy..." tới khi tải lại trang.
+    const justSettled =
+      prev === 'running' && (status === 'done' || status === 'failed' || status === 'cancelled' || status === null)
     // Làm mới project ngay khi job CHUYỂN sang "running" (không chỉ lúc xong)
     // — nếu không, badge trạng thái trên header (đọc từ project.stages, được
     // fetch riêng) cứ đứng ở "chờ" cho tới khi job xong hẳn, dù khung tiến độ

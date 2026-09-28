@@ -30,6 +30,7 @@ import PinnedVideoPanel from '../components/PinnedVideoPanel'
 import HorizontalStepper from '../components/HorizontalStepper'
 import CollapsibleStageSection from '../components/CollapsibleStageSection'
 import DirectExportPanel from '../components/DirectExportPanel'
+import TikTokPublishPanel from '../components/TikTokPublishPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
 
 // Trạng thái tổng hợp của 1 tập/đoạn — dùng cho chấm màu ở sidebar: có bước
@@ -1183,6 +1184,22 @@ export default function ProjectDetail() {
             ttsDone={tts.status === 'done'}
             busyAny={busyAny}
           />
+        </CollapsibleStageSection>
+      )}
+
+      {!isMulti && !isSplit && project.export.status === 'done' && (
+        <CollapsibleStageSection
+          id="stage-tiktok"
+          label="Đăng TikTok"
+          status={project.tiktok_posts?.length ? 'done' : 'pending'}
+          meta={
+            project.tiktok_posts?.length
+              ? `Đã đăng ${project.tiktok_posts.length} lần`
+              : 'Chọn tài khoản, dán caption rồi đăng'
+          }
+          defaultExpanded={false}
+        >
+          <TikTokPublishPanel projectId={projectId} project={project} />
         </CollapsibleStageSection>
       )}
 

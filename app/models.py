@@ -74,6 +74,9 @@ class ProjectState(BaseModel):
     # video trực tiếp") — xem export_direct.MUSIC_VOLUME (mặc định cũ khi
     # None). None = dùng mặc định cũ (project tạo tay, chưa từng chỉnh).
     auto_music_volume_db: Optional[float] = None
+    # Độ mờ nền vùng che phụ đề cũ — xem SocialProjectState.blur_strength.
+    # None = mặc định hệ thống (export_direct.BLUR_SIGMA_RATIO).
+    auto_blur_strength: Optional[float] = None
     # Cỡ chữ phụ đề mới — xem export_direct.DEFAULT_SUBTITLE_FONT_SIZE.
     auto_subtitle_font_size: int = 6
     # Dự án đơn đã được cắt thành nhiều đoạn (mỗi đoạn 1 draft CapCut riêng,
@@ -99,6 +102,17 @@ class ProjectState(BaseModel):
     # dùng để hook sau assemble/export biết cần báo ngược lại đúng hàng đợi
     # social nào (xem `_maybe_chain_social` trong main.py).
     social_link: Optional["SocialLink"] = None
+    # Đăng tay lên TikTok từ dự án đơn (không qua hàng đợi dự án tự động):
+    # caption người dùng dán lần gần nhất + lịch sử các lần đăng thành công.
+    tiktok_caption: str = ""
+    tiktok_posts: list["TikTokPostRecord"] = Field(default_factory=list)
+
+
+class TikTokPostRecord(BaseModel):
+    account_id: str
+    username: str = ""
+    caption: str = ""
+    posted_at: datetime
 
 
 class SocialLink(BaseModel):
@@ -149,6 +163,18 @@ class QueueItem(BaseModel):
     # Đã tự dọn file nặng (video gốc/thành phẩm/audio WAV) của project gắn
     # với video này — xem app/social_cleanup.py. Còn giữ phụ đề/cấu hình.
     files_cleaned_at: Optional[datetime] = None
+    # Lỗi lần ĐĂNG gần nhất — video đã xử lý xong (có video thành phẩm) mà đăng
+    # TikTok lỗi thì VẪN là "sẵn sàng đăng" (người dùng chốt), không chuyển
+    # sang "lỗi": không làm dừng dự án, bộ lập lịch tự thử lại sau
+    # SOCIAL_PUBLISH_RETRY_MIN phút, tối đa SOCIAL_PUBLISH_MAX_AUTO_RETRY lần
+    # liên tiếp rồi chờ người dùng bấm "Đăng lại".
+    publish_error: Optional[str] = None
+    publish_failed_at: Optional[datetime] = None
+    publish_fail_count: int = 0
+    # Caption đăng bài (tiêu đề thu hút + đoạn mô tả + câu hỏi + hashtag), viết
+    # bằng `translate.generate_caption` lần đầu đăng rồi lưu lại dùng cho các
+    # lần đăng lại; người dùng sửa được trước khi đăng.
+    caption_vi: Optional[str] = None
 
 
 class SocialProjectSummary(BaseModel):
@@ -196,10 +222,23 @@ class SocialProjectState(BaseModel):
     # thẳng trong `ProjectState` vì mỗi lần kích hoạt tạo project mới hoàn
     # toàn (project cũ không giữ file export cũ).
     music_volume_db: float = -13.0
+    # Độ mờ nền vùng che phụ đề cũ: hệ số độ mờ Gaussian theo chiều cao vùng
+    # chữ gốc (0.3 = mặc định, càng lớn càng mờ). Copy sang
+    # ProjectState.auto_blur_strength mỗi lần kích hoạt video.
+    blur_strength: float = 0.3
+    # Hashtag cố định luôn thêm vào caption mọi video của dự án (vd "#Pokemon
+    # #AIContent"), cách nhau bằng dấu cách/phẩy.
+    caption_hashtags: str = ""
     # Cỡ chữ phụ đề mới — xem ProjectState.auto_subtitle_font_size.
     subtitle_font_size: int = 6
     queue: list[QueueItem] = Field(default_factory=list)
     last_crawl_at: Optional[datetime] = None
+    # Crawl lỗi/bị huỷ liên tiếp — bộ lập lịch nghỉ tăng dần trước khi tự crawl
+    # lại (xem SOCIAL_CRAWL_RETRY_HOURS), thay vì mở Chrome lại mỗi vài phút
+    # vì `last_crawl_at` (chỉ ghi khi thành công) vẫn đang "tới hạn".
+    crawl_fail_count: int = 0
+    last_crawl_failed_at: Optional[datetime] = None
+    last_crawl_error: Optional[str] = None
     # Mốc đăng bài THÀNH CÔNG gần nhất — bộ lập lịch nền (`_social_scheduler_loop`
     # trong main.py) dùng để giãn cách các lần đăng theo đúng `posts_per_day`
     # (khoảng cách mục tiêu = 24h / posts_per_day), không đăng dồn dập.
@@ -226,8 +265,37 @@ class SocialProjectState(BaseModel):
     # cách `Katzca/AutoSocial` làm) — rỗng = chưa gán, mặc định
     # `<social_dir>/tiktok_profile` khi cần dùng lần đầu.
     tiktok_session_path: str = ""
+    # Tài khoản TikTok gán cho dự án (id trong app/accounts.py) — có thì
+    # profile Chrome lấy theo tài khoản, `tiktok_session_path` chỉ còn là
+    # đường dẫn cũ trước khi có trang Tài khoản.
+    tiktok_account_id: str = ""
     facebook_page_id: str = ""
     facebook_page_token: str = ""
+
+
+AccountStatus = Literal["unknown", "ok", "expired", "mismatch", "error"]
+
+
+class TikTokAccount(BaseModel):
+    """1 tài khoản TikTok = 1 thư mục Chrome profile đã đăng nhập tay. Thông
+    tin nhận dạng (username/uid...) đọc từ API `/passport/web/account/info/`
+    mà chính trang TikTok dùng — xem social_publish.check_tiktok_account."""
+
+    id: str
+    # Ghi chú người dùng tự đặt (vd "Kênh Pokemon phụ") — không bắt buộc.
+    label: str = ""
+    profile_dir: str
+    username: str = ""
+    screen_name: str = ""
+    uid: str = ""
+    avatar_url: str = ""
+    # unknown = chưa kiểm tra lần nào; ok = đang đăng nhập; expired = hết
+    # phiên/chưa đăng nhập; mismatch = profile đang đăng nhập 1 tài khoản KHÁC
+    # tài khoản đã ghi nhận (chặn đăng); error = không kiểm tra được (mạng...).
+    status: AccountStatus = "unknown"
+    status_detail: Optional[str] = None
+    checked_at: Optional[datetime] = None
+    created_at: datetime
 
 
 def empty_stages() -> dict[str, StageRecord]:

@@ -723,6 +723,145 @@ theo để xác nhận logic rơi tầng đúng như thiết kế.
 - Test giả lập 100 dự án: 1 tick chỉ kích hoạt 1 video/đăng 1 bài/crawl 1
   kênh; có video đang xử lý → không kích hoạt thêm; 3h sáng → không đăng.
 
+## 2026-09-25 — Dải che mỏng hơn + viền chữ phụ đề mảnh hơn
+
+- `detect_subtitle_region`: đệm DỌC đổi từ 1.5% chiều cao khung hình mỗi
+  cạnh sang 15% chiều cao dòng chữ (trung vị box OCR). Đo thật xam-xi-du
+  (khung 2048px): chữ gốc 73px, dải che cũ 155px (2.1x, riêng đệm 61px) → mới
+  116px, vẫn che trọn ~94% box chữ gốc. Đệm ngang giữ nguyên. Project cũ giữ
+  vùng che đã lưu — chỉ project dò mới (hoặc dò lại) mới dùng mức này.
+- `export_direct`: viền chữ `Outline` = 12% cỡ chữ (cỡ 6 → 0.72 ≈ 5px thật
+  trên video cao 1920px) thay vì Outline=2 cố định (~13px) — người dùng phản
+  ánh "đổ bóng quá nhiều".
+- Đã dò lại vùng che + xuất lại video xam-xi-du (17:17, vẫn ready, trước
+  khung đăng 19h).
+- Nút "Tự động phát hiện" (trang project, phần xuất video): trước chạy đồng
+  bộ trong 1 request — 2 lượt OCR mất tới hơn 10 phút, giao diện chỉ hiện
+  "Đang dò..." không tiến độ; server tự nạp lại giữa chừng là request mất,
+  giao diện treo (tái hiện thật: kẹt 15 phút). Giờ chạy NỀN (job
+  `{project_id}:blur_detect`, route `.../detect-blur-region/status`), giao
+  diện hiện tiến độ từng bước và tự làm mới khung khoanh vùng khi dò xong.
+  Nút giờ dò giống luồng tự động: tôn trọng vùng quét OCR đã khoanh + dò lại
+  cả khoảng thời gian chữ hiện.
+- Video đã xuất: thêm mốc `export.at` vào URL + `key` cho thẻ video — trước
+  URL luôn là .../final.mp4 nên trình duyệt giữ bản cũ trong cache, xuất lại
+  xong vẫn xem video cũ tới khi tải lại trang.
+
+## 2026-09-26 — Giao diện upload TikTok mới (nhiều video) làm hỏng kéo-thả
+
+- con-bo-biet-bay đăng lỗi "Không kéo-thả được file video...": tài khoản này
+  được TikTok cho giao diện upload mới — chữ "Or drag and drop them here. You
+  can upload up to 30 videos." thay cho "Or drag and drop it here"; code cũ
+  tìm khung thả file bằng ĐÚNG nguyên văn câu cũ.
+- Sửa `_DROP_FILE_JS`: tìm phần tử nhỏ nhất có chữ bắt đầu bằng cụm kéo-thả
+  (tiếng Anh/tiếng Việt), rồi lấy khối cha có lớp "upload" hoặc chứa nút chọn
+  video. Test mock 4 kiểu giao diện + chạy thử thật trên tài khoản
+  con-bo-biet-bay (video 106MB): thả file OK, vào màn chỉnh sửa, không bấm đăng.
+
+## 2026-09-26 — Caption đăng bài viết mới theo mẫu người dùng
+
+- Trước: caption = dịch nguyên văn tiêu đề Douyin (`translate_title`) — giữ
+  hashtag đặc thù Douyin, phiên âm có dấu, dài lê thê (#hiếuthảophảisớm...),
+  không kể nội dung, không câu kéo tương tác.
+- Giờ `translate.generate_caption`: dòng tiêu đề thu hút + emoji, 2-3 đoạn
+  ngắn kể nội dung (dựa trên PHỤ ĐỀ TIẾNG VIỆT của video + bảng tên riêng để
+  khớp lời thuyết minh), 1 câu hỏi cuối, 6-8 hashtag. Hashtag chuẩn hoá bằng
+  code: bỏ dấu, viết liền HoaChuCaiDau, 2-24 ký tự, bỏ trùng, bỏ tag đặc thù
+  Douyin; cấm phiên âm pinyin/Hán Việt. `clean_douyin_title` bỏ rác đoạn share
+  (link, "复制此链接...", mã/giờ đầu đoạn).
+- Hashtag cố định theo dự án: `SocialProjectState.caption_hashtags`.
+- Caption viết 1 lần lúc đăng (trong job đăng), lưu `QueueItem.caption_vi`,
+  đăng lại dùng lại. Route viết lại / lưu sửa tay; hộp "Caption" trên từng
+  video (xem, sửa, viết lại) — `CaptionDialog`.
+- Test thật: mẫu mực vây lớn và video Pokemon Aggron/Steelix ra đúng cấu trúc,
+  tên Pokemon khớp lời thuyết minh.
+
+## 2026-09-26 — Đăng lỗi vẫn là "Sẵn sàng đăng", không phải video lỗi
+
+- Người dùng chốt: video đã xử lý xong (có video thành phẩm) mà đăng TikTok
+  lỗi thì vẫn là sẵn sàng đăng. Trước đây bị chuyển sang "lỗi" → lọt bộ lọc
+  "Lỗi", làm DỪNG cả dự án (quy tắc dừng khi có video lỗi), không tự đăng lại,
+  và bị TỰ DỌN file sau 24h như video lỗi (7 video pokemon mất video thành
+  phẩm theo cách này).
+- Giờ: đăng lỗi → giữ `ready`, ghi `publish_error` / `publish_failed_at` /
+  `publish_fail_count`. Bộ lập lịch tự thử lại sau 30 phút
+  (`SOCIAL_PUBLISH_RETRY_MIN`), tới 3 lần liên tiếp
+  (`SOCIAL_PUBLISH_MAX_AUTO_RETRY`) thì ngừng, trạng thái "needs_manual", chờ
+  bấm "Đăng lại" (bấm tay đặt lại bộ đếm). Vẫn giữ thứ tự: không nhảy sang
+  video sau. Video ready được bảo vệ khỏi tự dọn.
+- Chuyển đổi tự động: video "lỗi ở bước đăng" còn video thành phẩm → về
+  ready; không còn → lỗi ở bước kích hoạt (nút "Thử lại" xử lý lại từ đầu).
+- Giao diện: dòng "Đăng lỗi lần N: ..." dưới video sẵn sàng, nút "Đăng lại";
+  màn Giám sát thêm trạng thái chờ tự thử / cần bấm Đăng lại.
+
+## 2026-09-26 — SỰ CỐ: tài khoản TikTok pokemon bị đăng xuất
+
+- pokemon đăng lỗi "Không kéo-thả được file video..." — ảnh chụp lúc lỗi là
+  trang "Log in to TikTok". Cookie sessionid/sid_guard vẫn còn, hạn 03/2027
+  → phiên bị huỷ từ phía TikTok.
+- Ban đầu nghi lượt tự dọn profile (xoá IndexedDB tiktok.com lúc 25/9 14:11)
+  — ĐÃ BÁC BỎ: test-ai bị xoá y hệt mà vẫn đăng nhập, xam_xi_du cũng còn
+  (người dùng xác nhận). Từ lần đăng thành công cuối (25/9 13:47) tới lúc lỗi,
+  app không mở profile pokemon lần nào (dự án tạm dừng). Nguyên nhân khả dĩ
+  phía TikTok: đăng xuất thiết bị khác/đổi mật khẩu, nghi tự động hoá (3 bài
+  trong ~21 giờ), kiểm tra bảo mật tài khoản mới.
+- Vẫn giữ: `_clean_profile` chỉ xoá cache thuần (không đụng IndexedDB/Local
+  Storage/Service Worker/cookie) cho an toàn. Thêm `_ensure_logged_in` phát
+  hiện trang đăng nhập ngay khi mở trang upload → báo "Tài khoản TikTok đã bị
+  đăng xuất — bấm Đăng nhập TikTok".
+
+## 2026-09-26 — Nhạc nền: lặp lại + âm lượng -13dB cho mọi project
+
+- Lặp lại: đã có sẵn (`-stream_loop -1`, cắt theo `-t` độ dài video). Thêm
+  nhỏ dần 2s cuối video (`afade`) để không cắt cụt giữa bài.
+- Âm lượng: dự án tự động đã chỉnh được (mặc định -13dB). Project tạo tay
+  trước dùng cố định hệ số 0.35 (≈ -9dB) → giờ mặc định `MUSIC_VOLUME_DB =
+  -13`, chỉnh được ở khung xuất video (`StartExportRequest.music_volume_db`,
+  lưu vào `ProjectState.auto_music_volume_db` cho lần sau).
+- Đo thật (nhạc thử 5s, video 325s): nhạc gốc -21.1dB → trong video -33.6dB
+  (≈ -12.5dB) đều ở đầu/giữa/cuối (lặp đủ), 0.6s cuối -46.8dB (đang nhỏ dần).
+
+## 2026-09-26 — Tuỳ chỉnh "Độ mờ nền" theo dự án
+
+- `SocialProjectState.blur_strength` (mặc định 0.3 = BLUR_SIGMA_RATIO) → copy
+  sang `ProjectState.auto_blur_strength` lúc kích hoạt → `_start_export` →
+  `render_video(blur_strength=...)`. Xuất tay: `StartExportRequest.blur_strength`
+  (lưu lại vào project cho lần sau). Giới hạn 0.05–1.0 ở schema.
+- Giao diện: thanh trượt dùng chung `BlurStrengthControl` (0.1–0.6, nhãn
+  Nhẹ/Vừa/Mạnh) trong "Cài đặt xử lý video" của dự án tự động và trong khung
+  xuất video của project (chỉ hiện khi có vùng che).
+
+## 2026-09-26 — LỖI LỚN: hình nền lệch tiếng/phụ đề ở mọi bản xuất có che mờ
+
+- Triệu chứng người dùng thấy: dải mờ hiện vệt tối "không khớp thực tế",
+  "nền mờ chậm hơn video". Video gốc ở đó không có hộp nền đen nào.
+- Nguyên nhân: bước che mờ dùng CÙNG 1 nhãn luồng hình (`[vfull]`) cho 2
+  nhánh (nền + làm mờ) mà không `split`. ffmpeg 8 vẫn chạy nhưng lấy nhầm
+  VIDEO GỐC CHƯA GIÃN TỐC ĐỘ làm nền, còn nhánh làm mờ + phụ đề + giọng đọc
+  theo timeline đã giãn. Đo thật: nền bản xuất cũ trùng video gốc cùng thời
+  điểm (mse ~3) ở 30s/47s/100s/200s → hình lệch dần so với tiếng + phụ đề.
+- Phạm vi: MỌI bản xuất có vùng che (gần như mọi video dự án tự động) từ khi
+  có tính năng che. Bản xuất không che không bị.
+- Sửa: `split=2[vbase][vforblur]`. Đã dựng lại xam-xi-du-7125031204708961549:
+  dải mờ khớp nền, nền theo đúng timeline giãn.
+
+## 2026-09-26 — Che mờ kiểu CapCut + sửa nút xuất kẹt "Đang xuất..."
+
+- Người dùng: dải che "vẫn quá cao", nền trong dải "như chậm hơn video", muốn
+  làm mờ như CapCut. Phân tích: bản xuất đã dùng vùng che mới (113px); dải
+  trông cao vì so với chữ Việt mới (~35px nét) nhỏ hơn chữ Trung gốc (~72px)
+  + chữ gốc xê dịch ~28px. Đo độ trễ bằng video thử có số khung: nội dung
+  trong dải KHÔNG trễ khung nào (16/16) — cảm giác chậm do boxblur 18:4 xoá
+  gần hết chi tiết + mép cứng.
+- `export_direct`: bỏ boxblur mép cứng → gblur (sigma = 0.3 × chiều cao vùng
+  chữ) + mặt nạ mép mềm (smoothstep, dải chuyển tiếp 0.45 × chiều cao vùng
+  chữ, vẽ sẵn 1 ảnh PNG, `alphamerge` + overlay). So 3 bản (cũ / sigma 0.18 /
+  0.3) trên xam-xi-du: 0.3 xoá vệt chữ tốt nhất. Mẫu: workspace/_samples/.
+- Nút "Xuất lại video" kẹt "Đang xuất..." tới khi tải lại trang: route
+  `/jobs/{stage}` coi MỌI job đã hết chạy là "không có job" (status null) →
+  giao diện không thấy "done" để làm mới. Giờ chỉ coi là mồ côi khi thread
+  chết mà status vẫn "running"; `useJobStatus` cũng làm mới khi running → null.
+
 ## 2026-09-25 — Tự dọn ổ đĩa (`app/social_cleanup.py`)
 
 Người dùng chốt: thiên hướng tự dọn, mốc 1 ngày. Số đo thật 1 video 7 phút:

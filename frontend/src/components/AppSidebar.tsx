@@ -46,6 +46,15 @@ function AutomatedIcon() {
   )
 }
 
+function AccountsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <circle cx="10" cy="7" r="3" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M4 16.5c.8-3 3.2-4.5 6-4.5s5.2 1.5 6 4.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function MonitorIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
@@ -82,6 +91,7 @@ const NAV_ITEMS = [
   { to: '/merge', end: false, label: 'Ghép video', icon: <MergeIcon /> },
   { to: '/download', end: false, label: 'Tải video', icon: <DownloadIcon /> },
   { to: '/automated', end: false, label: 'Dự án tự động', icon: <AutomatedIcon /> },
+  { to: '/accounts', end: false, label: 'Tài khoản', icon: <AccountsIcon /> },
   { to: '/monitor', end: false, label: 'Giám sát tiến trình', icon: <MonitorIcon /> },
   { to: '/cleanup', end: false, label: 'Tự dọn ổ đĩa', icon: <CleanupIcon /> },
   { to: '/settings', end: false, label: 'Cài đặt', icon: <SettingsIcon /> },

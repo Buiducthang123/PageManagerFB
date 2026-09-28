@@ -9,6 +9,7 @@ import AutomatedPage from './pages/AutomatedPage'
 import AutomatedDetailPage from './pages/AutomatedDetailPage'
 import MonitorPage from './pages/MonitorPage'
 import CleanupPage from './pages/CleanupPage'
+import AccountsPage from './pages/AccountsPage'
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
           <Route path="/automated/:socialId" element={<AutomatedDetailPage />} />
           <Route path="/monitor" element={<MonitorPage />} />
           <Route path="/cleanup" element={<CleanupPage />} />
+          <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

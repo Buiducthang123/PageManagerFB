@@ -21,12 +21,42 @@ BACKGROUND_VOLUME = 0.8
 # không tách nhạc nền) — người dùng chốt -13dB làm mặc định hệ thống, chỉnh
 # được riêng theo dự án qua field `original_audio_volume_db`.
 ORIGINAL_AUDIO_VOLUME_DB = -13.0
-MUSIC_VOLUME = 0.35
+# Âm lượng nhạc nền người dùng tự thêm — mặc định -13dB (người dùng chốt),
+# chỉnh được theo dự án/lần xuất. Trước đây project tạo tay dùng cố định
+# hệ số 0.35 (≈ -9dB, to hơn mức mong muốn).
+MUSIC_VOLUME_DB = -13.0
+# Nhạc nền nhỏ dần trong ngần này giây cuối video.
+MUSIC_FADE_OUT_S = 2.0
 LOGO_MARGIN_PX = 24
 LOGO_WIDTH_PX = 110
-# Đã test thật (xem app/stages/transcribe_ocr.py-style feasibility test trên
-# clip 25s test4): blur vừa đủ che chữ, không quá gắt.
-BLUR_STRENGTH = "18:4"
+# Che mờ phụ đề cũ kiểu CapCut (xem `render_video`, bước 2): độ mờ Gaussian và
+# bề rộng dải mép mềm, tính theo chiều cao vùng chữ gốc để tự co giãn theo độ
+# phân giải video.
+# 0.3 — so thật trên video xam-xi-du (chữ trắng trên áo đen): 0.18 còn thấy
+# rõ vệt chữ gốc, 0.3 xoá mịn hơn mà vẫn giữ nền.
+BLUR_SIGMA_RATIO = 0.3
+BLUR_FEATHER_RATIO = 0.45
+
+
+def _write_feather_mask(
+    path: Path, width: int, height: int, core: tuple[float, float, float, float], feather: int
+) -> None:
+    """Mặt nạ độ trong suốt cho vùng che mờ: 255 (mờ kín) trong lõi `core`
+    (x, y, w, h — pixel, tính trong khung crop), giảm mượt về 0 theo khoảng
+    cách tới lõi trên dải rộng `feather` px (đường cong smoothstep, không gãy
+    khúc). Vẽ 1 lần thành ảnh — rẻ hơn hẳn tính biểu thức cho từng pixel ở
+    mọi khung hình."""
+    import cv2
+    import numpy as np
+
+    cx, cy, cw, ch = core
+    xs = np.arange(width, dtype=np.float32)[None, :]
+    ys = np.arange(height, dtype=np.float32)[:, None]
+    dx = np.maximum(np.maximum(cx - xs, xs - (cx + cw)), 0)
+    dy = np.maximum(np.maximum(cy - ys, ys - (cy + ch)), 0)
+    t = np.clip(np.sqrt(dx**2 + dy**2) / max(feather, 1), 0, 1)
+    alpha = 1 - t * t * (3 - 2 * t)
+    cv2.imwrite(str(path), (alpha * 255).round().astype(np.uint8))
 # FontSize của filter `subtitles` được tính theo hệ toạ độ kịch bản MẶC ĐỊNH
 # CỦA LIBASS cho file .srt thuần — 288px chiều cao (xem docstring
 # `_marginv_units`) — KHÔNG phải theo chiều cao video thật. Giá trị cũ hardcode
@@ -36,6 +66,8 @@ BLUR_STRENGTH = "18:4"
 # qua `subtitle_font_size` (render_video) — mặc định 6 theo yêu cầu người
 # dùng, quy đổi ra ~40px trên video 1920px.
 DEFAULT_SUBTITLE_FONT_SIZE = 6
+# Độ dày viền đen quanh chữ phụ đề mới, theo tỉ lệ cỡ chữ.
+SUBTITLE_OUTLINE_RATIO = 0.12
 
 
 class ExportDirectError(RuntimeError):
@@ -205,6 +237,9 @@ def render_video(
     background_volume_db: Optional[float] = None,
     music_volume_db: Optional[float] = None,
     subtitle_font_size: int = DEFAULT_SUBTITLE_FONT_SIZE,
+    # Độ mờ nền vùng che (hệ số theo chiều cao vùng chữ) — None = mặc định
+    # hệ thống BLUR_SIGMA_RATIO. Chỉnh theo từng dự án/lần xuất.
+    blur_strength: Optional[float] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     job: Optional[jobs_mod.JobState] = None,
 ) -> Path:
@@ -275,9 +310,9 @@ def render_video(
     # gọi `_marginv_units` để cùng đi qua phép quy đổi tỉ lệ bên dưới, tránh
     # lặp lại đúng bug margin cũ (xem docstring `_marginv_units`).
     margin_v_units = _marginv_units(36, video_h_px)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="export_direct_"))
     if blur_region:
         x, y, w, h = blur_region
-        filter_parts.append(f"[{v_label}]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},boxblur={BLUR_STRENGTH}[blurred]")
         overlay_enable = ""
         if blur_active_ranges_s:
             # Quy đổi mốc thời gian THEO VIDEO GỐC (vd lấy từ sub_zh.srt, lúc
@@ -293,7 +328,34 @@ def render_video(
                     windows.append(f"between(t,{out_s:.3f},{out_e:.3f})")
             if windows:
                 overlay_enable = f":enable='{'+'.join(windows)}'"
-        filter_parts.append(f"[{v_label}][blurred]overlay=W*{x}:H*{y}{overlay_enable}[vblur]")
+        # Che mờ kiểu CapCut: làm mờ Gaussian + mặt nạ MÉP MỀM (lông vũ) —
+        # phần lõi (đúng vùng chữ gốc) mờ kín, rồi nhạt dần ra ngoài qua 1 dải
+        # chuyển tiếp, không còn đường viền chữ nhật cứng. Thay cho boxblur
+        # 18:4 mép cứng cũ: người dùng phản ánh dải "quá cao", nền bên trong
+        # "như chậm hơn video" (đã đo: KHÔNG trễ khung nào — do làm mờ hộp lặp
+        # 4 lần xoá gần hết chi tiết, chỉ còn mảng màu lớn trôi chậm).
+        core_x0, core_y0, core_w, core_h = x * video_w_px, y * video_h_px, w * video_w_px, h * video_h_px
+        feather = max(8, round(core_h * BLUR_FEATHER_RATIO))
+        cx0 = max(0, int(core_x0 - feather))
+        cy0 = max(0, int(core_y0 - feather))
+        cw = (min(video_w_px, int(core_x0 + core_w + feather)) - cx0) // 2 * 2
+        ch = (min(video_h_px, int(core_y0 + core_h + feather)) - cy0) // 2 * 2
+        mask_path = tmp_dir / "blur_mask.png"
+        _write_feather_mask(mask_path, cw, ch, (core_x0 - cx0, core_y0 - cy0, core_w, core_h), feather)
+        sigma = max(3.0, round(core_h * (blur_strength or BLUR_SIGMA_RATIO), 1))
+        idx_mask = len(inputs) // 2
+        inputs += ["-i", str(mask_path)]
+        # PHẢI `split` luồng hình thành 2 bản sao đồng bộ (1 làm nền, 1 để
+        # làm mờ) — trước đây dùng thẳng cùng 1 nhãn cho cả 2 nhánh: ffmpeg
+        # vẫn chạy nhưng nhánh làm mờ lấy hình LỆCH THỜI ĐIỂM so với nền (đã
+        # xác nhận thật: dải mờ hiện vệt tối từ cảnh khác trong khi video gốc
+        # ở đó là áo xanh nhạt, không hề có hộp nền đen — người dùng phản ánh
+        # "nền mờ chậm hơn video", "không khớp thực tế").
+        filter_parts.append(f"[{v_label}]split=2[vbase][vforblur]")
+        filter_parts.append(f"[vforblur]crop={cw}:{ch}:{cx0}:{cy0},gblur=sigma={sigma},format=yuva420p[blurcrop]")
+        filter_parts.append(f"[{idx_mask}:v]format=gray[blurmask]")
+        filter_parts.append("[blurcrop][blurmask]alphamerge[blurred]")
+        filter_parts.append(f"[vbase][blurred]overlay={cx0}:{cy0}{overlay_enable}[vblur]")
         v_label = "vblur"
         # Phụ đề mới phải NẰM TRONG vùng che (thay chữ cũ), không phải giữ
         # margin cố định tính từ đáy khung hình — đã xác nhận thật: vùng che
@@ -316,7 +378,6 @@ def render_video(
 
     # --- Bước 3: burn phụ đề mới — mốc LẤY TỪ voice_placement (giống hệt
     # assemble.py, không dùng lại [cue.start, cue.end] gốc). ---
-    tmp_dir = Path(tempfile.mkdtemp(prefix="export_direct_"))
     srt_path = tmp_dir / "burn.srt"
     burn_cues: list[Cue] = []
     text_cursor_us = 0
@@ -343,7 +404,12 @@ def render_video(
     # chuỗi filename mới parse đúng (đã xác nhận qua lỗi thật: escape dấu `:`
     # không thôi vẫn làm ffmpeg đọc lệch sang option `original_size`).
     srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-    style = f"FontName=Arial,FontSize={subtitle_font_size},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV={margin_v_units}"
+    # Viền chữ tính theo cỡ chữ, cùng hệ toạ độ 288px với FontSize (xem
+    # `_marginv_units`) — Outline=2 cố định cũ quy ra ~13px viền đen trên video
+    # cao 1920px, người dùng phản ánh "đổ bóng quá nhiều". 12% cỡ chữ → cỡ 6
+    # mặc định ra Outline 0.72 ≈ 5px thật.
+    outline = round(max(0.4, subtitle_font_size * SUBTITLE_OUTLINE_RATIO), 2)
+    style = f"FontName=Arial,FontSize={subtitle_font_size},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline={outline},Shadow=0,Alignment=2,MarginV={margin_v_units}"
     filter_parts.append(f"[{v_label}]subtitles='{srt_escaped}':force_style='{style}'[vsub]")
     v_label = "vsub"
     progress(2, 5, "burn phụ đề mới")
@@ -402,9 +468,16 @@ def render_video(
     idx_music: Optional[int] = None
     if has_music:
         idx_music = len(inputs) // 2
+        # `-stream_loop -1`: nhạc nền LẶP LẠI liên tục, cắt đúng độ dài video
+        # (-t ở lệnh cuối). Nhỏ dần ở cuối video để không bị cắt cụt đột ngột
+        # giữa bài khi đang lặp.
         inputs += ["-stream_loop", "-1", "-i", str(music_path)]
-        music_volume_expr = f"{music_volume_db}dB" if music_volume_db is not None else str(MUSIC_VOLUME)
-        filter_parts.append(f"[{idx_music}:a]volume={music_volume_expr}[music]")
+        music_db = music_volume_db if music_volume_db is not None else MUSIC_VOLUME_DB
+        fade_d = min(MUSIC_FADE_OUT_S, max(total_dur_s / 4, 0.1))
+        fade_st = max(total_dur_s - fade_d, 0)
+        filter_parts.append(
+            f"[{idx_music}:a]volume={music_db}dB,afade=t=out:st={fade_st:.3f}:d={fade_d:.3f}[music]"
+        )
 
     audio_mix_labels: list[str] = []
     if has_bg:

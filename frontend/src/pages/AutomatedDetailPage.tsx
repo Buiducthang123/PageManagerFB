@@ -13,6 +13,9 @@ import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import JobProgressBar from '../components/JobProgressBar'
 import OcrCropSelector, { type CropRegion } from '../components/OcrCropSelector'
 import DouyinBrowserPanel from '../components/DouyinBrowserPanel'
+import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from '../components/BlurStrengthControl'
+import CaptionDialog from '../components/CaptionDialog'
+import TikTokAccountIdentity from '../components/TikTokAccountIdentity'
 
 const STATUS_LABEL: Record<QueueItemStatus, string> = {
   pending: 'Chờ xử lý',
@@ -30,6 +33,66 @@ const STATUS_TAG_CLASS: Record<QueueItemStatus, string> = {
   posted: 'tag-outline',
   failed: 'tag-danger',
   skipped: 'tag-neutral',
+}
+
+const QUEUE_PAGE_SIZE = 30
+
+function QueuePager({
+  page,
+  pageCount,
+  total,
+  onChange,
+}: {
+  page: number
+  pageCount: number
+  total: number
+  onChange: (page: number) => void
+}) {
+  // Hiện trang đầu, trang cuối và 2 trang quanh trang hiện tại; chỗ bị lược
+  // bỏ thay bằng "…".
+  const pages: (number | '…')[] = []
+  for (let n = 1; n <= pageCount; n++) {
+    if (n === 1 || n === pageCount || Math.abs(n - page) <= 2) pages.push(n)
+    else if (pages[pages.length - 1] !== '…') pages.push('…')
+  }
+  const from = (page - 1) * QUEUE_PAGE_SIZE + 1
+  const to = Math.min(page * QUEUE_PAGE_SIZE, total)
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 text-sm">
+      <span className="text-xs text-neutral-500">
+        Video {from}–{to} / {total}
+      </span>
+      <div className="flex flex-wrap items-center gap-1">
+        <button type="button" className="btn btn-ghost btn-sm" disabled={page <= 1} onClick={() => onChange(page - 1)}>
+          ← Trước
+        </button>
+        {pages.map((n, idx) =>
+          n === '…' ? (
+            <span key={`gap-${idx}`} className="px-1 text-neutral-500">
+              …
+            </span>
+          ) : (
+            <button
+              key={n}
+              type="button"
+              className={`btn btn-sm min-w-8 ${n === page ? 'btn-primary' : 'btn-ghost'}`}
+              onClick={() => onChange(n)}
+            >
+              {n}
+            </button>
+          ),
+        )}
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          disabled={page >= pageCount}
+          onClick={() => onChange(page + 1)}
+        >
+          Sau →
+        </button>
+      </div>
+    </div>
+  )
 }
 
 // So sánh theo NGÀY ĐĂNG TRÊN DOUYIN (cũ trước): aweme_id tăng dần theo thời
@@ -50,6 +113,11 @@ export default function AutomatedDetailPage() {
   const logoRef = useRef<HTMLInputElement>(null)
   const musicRef = useRef<HTMLInputElement>(null)
   const [errorDialogItem, setErrorDialogItem] = useState<QueueItem | null>(null)
+  const [captionItem, setCaptionItem] = useState<QueueItem | null>(null)
+  const [queuePage, setQueuePage] = useState(1)
+  // Video đang tích chọn để bỏ qua hàng loạt — chỉ trong trang đang xem.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkMessage, setBulkMessage] = useState<string | null>(null)
   const [crawlAll, setCrawlAll] = useState(false)
   const [crawlLimit, setCrawlLimit] = useState(100)
   const [statusFilter, setStatusFilter] = useState<QueueItemStatus | 'all'>('all')
@@ -64,6 +132,8 @@ export default function AutomatedDetailPage() {
   const [audioMode, setAudioMode] = useState<'original' | 'separated' | 'mute'>('original')
   const [originalVolumeDb, setOriginalVolumeDb] = useState(-13)
   const [musicVolumeDb, setMusicVolumeDb] = useState(-13)
+  const [blurStrength, setBlurStrength] = useState(DEFAULT_BLUR_STRENGTH)
+  const [captionHashtags, setCaptionHashtags] = useState('')
   const [subtitleFontSize, setSubtitleFontSize] = useState(6)
   const [minVideoSpeed, setMinVideoSpeed] = useState(0.85)
   const [useViesnapFallback, setUseViesnapFallback] = useState(true)
@@ -117,6 +187,23 @@ export default function AutomatedDetailPage() {
     queryKey: ['social-tiktok-status', socialId],
     queryFn: () => api.tiktokLoginStatus(socialId!),
     enabled: !!socialId,
+    // Đang kiểm tra tài khoản thì cập nhật nhanh để thấy kết quả.
+    refetchInterval: (q) => (q.state.data?.account?.busy ? 2000 : 60_000),
+  })
+
+  const accountsQuery = useQuery({ queryKey: ['accounts'], queryFn: api.listAccounts })
+
+  const assignAccountMutation = useMutation({
+    mutationFn: (accountId: string) => api.assignTiktokAccount(socialId!, accountId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['social-tiktok-status', socialId] })
+      queryClient.invalidateQueries({ queryKey: ['accounts'] })
+    },
+  })
+
+  const checkAccountMutation = useMutation({
+    mutationFn: (accountId: string) => api.checkAccount(accountId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['social-tiktok-status', socialId] }),
   })
 
   const tiktokLoginJobQuery = useQuery({
@@ -157,6 +244,23 @@ export default function AutomatedDetailPage() {
     onSuccess: () => refresh(),
   })
 
+  const skipBulkMutation = useMutation({
+    mutationFn: (awemeIds: string[]) => api.skipQueueItems(socialId!, awemeIds),
+    onSuccess: (res) => {
+      setSelectedIds(new Set())
+      setBulkMessage(
+        `Đã bỏ qua ${res.skipped} video.` + (res.kept_posted ? ` ${res.kept_posted} video đã đăng nên giữ nguyên.` : ''),
+      )
+      refresh()
+    },
+  })
+
+  // Đổi trang/bộ lọc/sắp xếp → bỏ chọn, để không bỏ qua nhầm video ở trang
+  // khác mà người dùng không còn nhìn thấy.
+  useEffect(() => {
+    setSelectedIds(new Set())
+  }, [queuePage, statusFilter, sortMode])
+
   const unskipMutation = useMutation({
     mutationFn: (awemeId: string) => api.unskipQueueItem(socialId!, awemeId),
     onSuccess: () => refresh(),
@@ -179,6 +283,8 @@ export default function AutomatedDetailPage() {
     setAudioMode((s.audio_mode as typeof audioMode) || 'original')
     setOriginalVolumeDb(s.original_audio_volume_db ?? -13)
     setMusicVolumeDb(s.music_volume_db ?? -13)
+    setBlurStrength(s.blur_strength ?? DEFAULT_BLUR_STRENGTH)
+    setCaptionHashtags(s.caption_hashtags ?? '')
     setSubtitleFontSize(s.subtitle_font_size ?? 6)
     setMinVideoSpeed(s.min_video_speed ?? 0.85)
     setUseViesnapFallback(s.use_viesnap_fallback ?? true)
@@ -196,6 +302,8 @@ export default function AutomatedDetailPage() {
         audio_mode: audioMode,
         original_audio_volume_db: originalVolumeDb,
         music_volume_db: musicVolumeDb,
+        blur_strength: blurStrength,
+        caption_hashtags: captionHashtags,
         subtitle_font_size: subtitleFontSize,
         min_video_speed: minVideoSpeed,
         use_viesnap_fallback: useViesnapFallback,
@@ -264,11 +372,13 @@ export default function AutomatedDetailPage() {
   useEffect(() => {
     if (tiktokLoginStatus && tiktokLoginStatus !== 'running') {
       queryClient.invalidateQueries({ queryKey: ['social-tiktok-status', socialId] })
+      queryClient.invalidateQueries({ queryKey: ['accounts'] })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tiktokLoginStatus])
 
   const state = detailQuery.data
+  const tiktokAccount = tiktokStatusQuery.data?.account ?? null
 
   if (detailQuery.isLoading || !state) {
     return (
@@ -380,6 +490,14 @@ export default function AutomatedDetailPage() {
         {state.last_crawl_at && (
           <p className="text-xs text-neutral-500">Crawl lần cuối: {new Date(state.last_crawl_at).toLocaleString('vi-VN')}</p>
         )}
+        {!!state.crawl_fail_count && state.last_crawl_failed_at && (
+          <p className="text-xs text-danger">
+            Crawl lỗi {state.crawl_fail_count} lần liên tiếp (lần gần nhất{' '}
+            {new Date(state.last_crawl_failed_at).toLocaleString('vi-VN')}): {state.last_crawl_error} — app tạm nghỉ{' '}
+            {[1, 3, 6, 12][Math.min(state.crawl_fail_count, 4) - 1]} giờ rồi mới tự crawl lại. Bấm "Crawl ngay" để thử
+            luôn.
+          </p>
+        )}
         <p className="text-xs text-neutral-500">
           {state.status !== 'active'
             ? 'Dự án đang tạm dừng — bộ lập lịch nền sẽ không tự crawl/kích hoạt/đăng cho tới khi bật lại.'
@@ -406,21 +524,58 @@ export default function AutomatedDetailPage() {
       />
 
       <section className="card mb-6 space-y-2 p-4">
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-neutral-300">Đăng bài TikTok (Playwright — Chrome thật)</span>
-          <span
-            className={`tag ${tiktokStatusQuery.data?.logged_in ? 'tag-accent' : 'tag-neutral'}`}
-            title="Chỉ là gợi ý — không đảm bảo đăng nhập còn hợp lệ, phép thử thật là bấm 'Đăng lên TikTok'"
+          <Link to="/accounts" className="text-xs text-neutral-400 hover:text-accent-200">
+            Quản lý tài khoản →
+          </Link>
+        </div>
+        {tiktokAccount ? (
+          <TikTokAccountIdentity account={tiktokAccount} />
+        ) : (
+          <p className="text-sm text-danger">Chưa gán tài khoản TikTok — dự án sẽ không tự đăng bài.</p>
+        )}
+        {tiktokAccount?.status_detail && tiktokAccount.status !== 'ok' && (
+          <p className="text-xs text-danger">{tiktokAccount.status_detail}</p>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            className="input max-w-xs"
+            value={state.tiktok_account_id || ''}
+            disabled={assignAccountMutation.isPending || busyTiktokLogin}
+            onChange={(e) => assignAccountMutation.mutate(e.target.value)}
           >
-            {tiktokStatusQuery.data?.logged_in ? 'Đã setup' : 'Chưa setup'}
-          </span>
+            <option value="">— Chưa gán tài khoản —</option>
+            {(accountsQuery.data ?? [])
+              .filter((a) => a.id === state.tiktok_account_id || !a.projects.length)
+              .map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.username ? `@${a.username}` : a.label || a.id}
+                  {a.status !== 'ok' ? ` (${a.status === 'unknown' ? 'chưa kiểm tra' : 'cần đăng nhập lại'})` : ''}
+                </option>
+              ))}
+          </select>
+          {tiktokAccount && (
+            <button
+              type="button"
+              className={secondaryButtonClass}
+              disabled={tiktokAccount.busy || checkAccountMutation.isPending}
+              onClick={() => checkAccountMutation.mutate(tiktokAccount.id)}
+            >
+              {tiktokAccount.busy && !busyTiktokLogin ? 'Đang kiểm tra...' : 'Kiểm tra'}
+            </button>
+          )}
           <button
             type="button"
             className={secondaryButtonClass}
             disabled={busyTiktokLogin}
             onClick={() => tiktokLoginMutation.mutate()}
           >
-            {busyTiktokLogin ? 'Đang chờ đăng nhập...' : 'Đăng nhập TikTok'}
+            {busyTiktokLogin
+              ? 'Đang chờ đăng nhập...'
+              : tiktokAccount
+                ? 'Đăng nhập lại'
+                : 'Tạo tài khoản mới và đăng nhập'}
           </button>
           {busyTiktokLogin && (
             <button
@@ -433,10 +588,17 @@ export default function AutomatedDetailPage() {
           )}
         </div>
         <p className="text-xs text-neutral-500">
-          Bấm "Đăng nhập TikTok" — 1 cửa sổ Chrome thật sẽ mở lên, tự đăng nhập tay (kể cả 2FA/captcha), xong thì đóng
-          cửa sổ đó lại. Chỉ cần làm 1 lần/tài khoản.
+          Chọn tài khoản có sẵn, hoặc bấm đăng nhập — 1 cửa sổ Chrome thật sẽ mở lên, tự đăng nhập tay (kể cả
+          2FA/captcha), xong thì đóng cửa sổ đó lại. App tự đọc tên tài khoản sau khi đóng, và kiểm tra đúng tài khoản
+          trước mỗi lần đăng.
         </p>
         {tiktokLoginMutation.error && <p className="text-sm text-danger">{(tiktokLoginMutation.error as Error).message}</p>}
+        {assignAccountMutation.error && (
+          <p className="text-sm text-danger">{(assignAccountMutation.error as Error).message}</p>
+        )}
+        {checkAccountMutation.error && (
+          <p className="text-sm text-danger">{(checkAccountMutation.error as Error).message}</p>
+        )}
         {/* Trước đây bấm "Đăng lên TikTok" mà server từ chối (vd mất file video
             đã xuất) thì không hiện gì — trông như nút không bấm được. */}
         {publishMutation.error && (
@@ -521,6 +683,18 @@ export default function AutomatedDetailPage() {
               value={musicVolumeDb}
               onChange={(e) => setMusicVolumeDb(Number(e.target.value))}
             />
+          </label>
+          <BlurStrengthControl value={blurStrength} onChange={setBlurStrength} />
+          <label className="text-sm text-neutral-300">
+            Hashtag cố định (luôn thêm vào caption)
+            <input
+              type="text"
+              className={`${inputClass} mt-1`}
+              placeholder="#Pokemon #AIContent"
+              value={captionHashtags}
+              onChange={(e) => setCaptionHashtags(e.target.value)}
+            />
+            <span className="text-xs text-neutral-500">Viết liền không dấu, cách nhau bằng dấu cách.</span>
           </label>
           <label className="text-sm text-neutral-300">
             Cỡ chữ phụ đề mới
@@ -665,7 +839,7 @@ export default function AutomatedDetailPage() {
         {saveSettingsMutation.error && <p className="text-sm text-danger">{(saveSettingsMutation.error as Error).message}</p>}
       </details>
 
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+      <div id="queue-top" className="mb-2 flex flex-wrap items-center justify-between gap-2 scroll-mt-4">
         <h2 className="text-lg">Hàng đợi video ({state.queue.length})</h2>
         <div className="flex flex-wrap items-center gap-2 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
@@ -673,19 +847,27 @@ export default function AutomatedDetailPage() {
             <select
               className={`${inputClass} mt-0`}
               value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as QueueItemStatus | 'all')}
+              onChange={(e) => {
+                setStatusFilter(e.target.value as QueueItemStatus | 'all')
+                setQueuePage(1)
+              }}
             >
-              <option value="all">Tất cả</option>
+              <option value="all">
+                Tất cả (trừ đã bỏ qua) — {state.queue.filter((i) => i.status !== 'skipped').length}
+              </option>
               {(Object.keys(STATUS_LABEL) as QueueItemStatus[]).map((s) => (
                 <option key={s} value={s}>
-                  {STATUS_LABEL[s]}
+                  {STATUS_LABEL[s]} — {state.queue.filter((i) => i.status === s).length}
                 </option>
               ))}
             </select>
           </label>
           <label className="flex items-center gap-1.5">
             Sắp xếp
-            <select className={`${inputClass} mt-0`} value={sortMode} onChange={(e) => setSortMode(e.target.value as typeof sortMode)}>
+            <select className={`${inputClass} mt-0`} value={sortMode} onChange={(e) => {
+                setSortMode(e.target.value as typeof sortMode)
+                setQueuePage(1)
+              }}>
               <option value="oldest">Cũ → mới, theo ngày đăng Douyin (mặc định)</option>
               <option value="newest">Mới → cũ</option>
               <option value="smart">Ưu tiên đang hoạt động</option>
@@ -701,7 +883,12 @@ export default function AutomatedDetailPage() {
       ) : (
         <div className="space-y-2">
           {(() => {
-            const filtered = statusFilter === 'all' ? state.queue : state.queue.filter((i) => i.status === statusFilter)
+            // "Tất cả" ẩn video đã bỏ qua (người dùng không muốn thấy nữa) — xem
+            // lại chúng qua lọc "Đã bỏ qua".
+            const filtered =
+              statusFilter === 'all'
+                ? state.queue.filter((i) => i.status !== 'skipped')
+                : state.queue.filter((i) => i.status === statusFilter)
             // Ưu tiên hiện video ĐANG CÓ HOẠT ĐỘNG (processing/failed/ready)
             // lên đầu — trước đây sort thẳng theo discovered_at giảm dần,
             // hàng đợi lớn (hàng trăm/nghìn video) khiến video đang chạy (luôn
@@ -728,13 +915,87 @@ export default function AutomatedDetailPage() {
               // tiếp theo). Nhóm khác: mới nhất trước.
               return a.status === 'pending' ? compareVideoAge(a, b) : compareVideoAge(b, a)
             })
-            const LIMIT = 60
-            const visible = sorted.slice(0, LIMIT)
-            const hiddenCount = sorted.length - visible.length
+            // Phân trang thay cho giới hạn cứng 60 video cũ (phần còn lại bị
+            // ẩn, không xem được) — vẫn nhẹ trang vì chỉ vẽ 1 trang mỗi lần.
+            const pageCount = Math.max(1, Math.ceil(sorted.length / QUEUE_PAGE_SIZE))
+            const page = Math.min(queuePage, pageCount)
+            const visible = sorted.slice((page - 1) * QUEUE_PAGE_SIZE, page * QUEUE_PAGE_SIZE)
+            const canSkip = (i: QueueItem) => i.status !== 'posted' && i.status !== 'skipped'
+            const selectable = visible.filter(canSkip)
+            const chosen = selectable.filter((i) => selectedIds.has(i.aweme_id))
+            const allChosen = selectable.length > 0 && chosen.length === selectable.length
+            const toggleOne = (id: string) =>
+              setSelectedIds((prev) => {
+                const next = new Set(prev)
+                if (next.has(id)) next.delete(id)
+                else next.add(id)
+                return next
+              })
+            const runBulkSkip = () => {
+              if (!chosen.length) return
+              const busy = chosen.filter((i) => i.status === 'processing' || i.status === 'ready').length
+              const msg =
+                `Bỏ qua ${chosen.length} video đã chọn? App sẽ không tự xử lý/đăng các video này nữa (bấm "Huỷ bỏ qua" từng video để lấy lại).` +
+                (busy ? `
+
+Trong đó có ${busy} video đang xử lý hoặc sẵn sàng đăng.` : '')
+              if (!window.confirm(msg)) return
+              setBulkMessage(null)
+              skipBulkMutation.mutate(chosen.map((i) => i.aweme_id))
+            }
             return (
               <>
+                <div className="flex flex-wrap items-center gap-3 rounded-lg border border-neutral-800 px-3 py-2 text-sm">
+                  <label className="flex items-center gap-2 text-neutral-300">
+                    <input
+                      type="checkbox"
+                      checked={allChosen}
+                      disabled={!selectable.length}
+                      ref={(el) => {
+                        if (el) el.indeterminate = chosen.length > 0 && !allChosen
+                      }}
+                      onChange={() =>
+                        setSelectedIds(allChosen ? new Set() : new Set(selectable.map((i) => i.aweme_id)))
+                      }
+                    />
+                    Chọn tất cả trong trang ({selectable.length})
+                  </label>
+                  {chosen.length > 0 && (
+                    <>
+                      <span className="text-neutral-400">Đã chọn {chosen.length}</span>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost text-danger"
+                        disabled={skipBulkMutation.isPending}
+                        onClick={runBulkSkip}
+                      >
+                        {skipBulkMutation.isPending ? 'Đang bỏ qua...' : `Bỏ qua ${chosen.length} video`}
+                      </button>
+                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => setSelectedIds(new Set())}>
+                        Bỏ chọn
+                      </button>
+                    </>
+                  )}
+                  {bulkMessage && !chosen.length && <span className="text-xs text-neutral-400">{bulkMessage}</span>}
+                  {skipBulkMutation.error && (
+                    <span className="text-xs text-danger">{(skipBulkMutation.error as Error).message}</span>
+                  )}
+                </div>
                 {visible.map((item: QueueItem) => (
-                  <div key={item.aweme_id} className="flex gap-3 rounded-lg border border-neutral-800 p-2">
+                  <div
+                    key={item.aweme_id}
+                    className={`flex gap-3 rounded-lg border p-2 ${selectedIds.has(item.aweme_id) ? 'border-accent-700 bg-accent-900/20' : 'border-neutral-800'}`}
+                  >
+                    <div className="flex w-5 shrink-0 items-center justify-center">
+                      {canSkip(item) && (
+                        <input
+                          type="checkbox"
+                          aria-label="Chọn video để bỏ qua"
+                          checked={selectedIds.has(item.aweme_id)}
+                          onChange={() => toggleOne(item.aweme_id)}
+                        />
+                      )}
+                    </div>
                     <div className="aspect-video w-32 shrink-0 overflow-hidden rounded-md bg-black">
                       {item.thumb_url && <img className="h-full w-full object-cover" src={item.thumb_url} loading="lazy" />}
                     </div>
@@ -803,7 +1064,21 @@ export default function AutomatedDetailPage() {
                             Xem lỗi
                           </button>
                         )}
+                        {item.project_id && item.status !== 'skipped' && (
+                          <button type="button" className="text-accent-300 hover:underline" onClick={() => setCaptionItem(item)}>
+                            {item.caption_vi ? 'Xem / sửa caption' : 'Caption'}
+                          </button>
+                        )}
                       </div>
+                      {/* Đăng lỗi vẫn là "Sẵn sàng đăng" — chỉ báo lỗi lần đăng gần nhất. */}
+                      {item.status === 'ready' && item.publish_error && (
+                        <p className="mt-1 text-xs text-danger" title={item.publish_error}>
+                          Đăng lỗi lần {item.publish_fail_count ?? 1}: {item.publish_error.slice(0, 160)}
+                          {(item.publish_fail_count ?? 0) >= 3
+                            ? ' — đã ngừng tự thử, bấm "Đăng lại".'
+                            : ' — app sẽ tự thử lại sau 30 phút.'}
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 flex-col gap-1 self-center">
                       {item.share_url && (
@@ -835,7 +1110,7 @@ export default function AutomatedDetailPage() {
                         >
                           {busyPublish && publishingId === item.aweme_id
                             ? 'Đang đăng...'
-                            : item.status === 'failed'
+                            : item.status === 'failed' || item.publish_error
                               ? 'Đăng lại'
                               : 'Đăng lên TikTok'}
                         </button>
@@ -864,10 +1139,16 @@ export default function AutomatedDetailPage() {
                     </div>
                   </div>
                 ))}
-                {hiddenCount > 0 && (
-                  <p className="py-2 text-center text-xs text-neutral-500">
-                    ...còn {hiddenCount} video khác (đa số đang "Chờ xử lý", không hiện hết để tránh trang bị nặng).
-                  </p>
+                {pageCount > 1 && (
+                  <QueuePager
+                    page={page}
+                    pageCount={pageCount}
+                    total={sorted.length}
+                    onChange={(n) => {
+                      setQueuePage(n)
+                      document.getElementById('queue-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                    }}
+                  />
                 )}
               </>
             )
@@ -875,6 +1156,9 @@ export default function AutomatedDetailPage() {
         </div>
       )}
 
+      {captionItem && (
+        <CaptionDialog socialId={socialId!} item={captionItem} onClose={() => setCaptionItem(null)} onSaved={refresh} />
+      )}
       {errorDialogItem && (
         <div className="dialog-backdrop" onClick={() => setErrorDialogItem(null)}>
           <div className="dialog max-w-2xl" onClick={(e) => e.stopPropagation()}>

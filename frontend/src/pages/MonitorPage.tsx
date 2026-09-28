@@ -31,9 +31,14 @@ const DAILY_STATUS: Record<MonitorDailyStatus, { label: string; tag: string }> =
 const PUBLISH_STATUS: Record<MonitorPublishEntry['status'], { label: string; tag: string }> = {
   due: { label: 'Tới lượt đăng', tag: 'tag-accent' },
   done_today: { label: 'Đã đăng đủ hôm nay', tag: 'tag-accent' },
+  retry_wait: { label: 'Đăng lỗi — chờ tự thử lại', tag: 'tag-neutral' },
+  needs_manual: { label: 'Đăng lỗi nhiều lần — cần bấm Đăng lại', tag: 'tag-danger' },
   scheduled: { label: 'Đã hẹn giờ', tag: 'tag-outline' },
   waiting_window: { label: 'Chờ khung giờ đăng', tag: 'tag-neutral' },
   no_ready: { label: 'Chưa có video sẵn sàng', tag: 'tag-neutral' },
+  no_account: { label: 'Chưa gán tài khoản TikTok', tag: 'tag-danger' },
+  account_problem: { label: 'Tài khoản TikTok cần đăng nhập lại', tag: 'tag-danger' },
+  account_busy: { label: 'Đang mở cửa sổ Chrome của tài khoản — chờ đóng', tag: 'tag-neutral' },
 }
 
 function ProjectLink({ id, title }: { id: string; title: string }) {
@@ -210,9 +215,16 @@ export default function MonitorPage() {
                 <span className="mono w-24 shrink-0 text-xs text-neutral-400">{fmtTime(e.next_post_at)}</span>
                 <ProjectLink id={e.social_id} title={e.social_title} />
                 <span className={`tag ${PUBLISH_STATUS[e.status].tag}`}>{PUBLISH_STATUS[e.status].label}</span>
+                {e.account_username && <span className="mono text-xs text-neutral-400">@{e.account_username}</span>}
                 <span className="text-xs text-neutral-500">
                   {e.ready_count} sẵn sàng · {e.posts_per_day} bài/ngày
                 </span>
+                {e.publish_error && (
+                  <span className="w-full pl-26 text-xs text-danger">
+                    Lỗi đăng lần {e.publish_fail_count}: {e.publish_error.slice(0, 140)}
+                    {e.status === 'retry_wait' && e.retry_at ? ` — tự thử lại lúc ${fmtTime(e.retry_at)}` : ''}
+                  </span>
+                )}
               </li>
             ))}
           </ul>

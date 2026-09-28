@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -9,6 +10,7 @@ from typing import Any, Callable, Optional
 from loguru import logger
 
 from .. import config
+from ..jobs import JobCancelled, current_job
 from ..utils.srt import Cue, load_srt, parse_ts, update_cue_text, write_srt
 
 # Tốc độ đọc tự nhiên mục tiêu / ngưỡng chấp nhận được (ký tự việt/giây) —
@@ -111,6 +113,10 @@ def _retry_after_s(err: BaseException, attempt: int) -> Optional[float]:
     s = _err_text(err).lower()
     if "429" in s or "resource_exhausted" in s:
         return 30.0
+    if any(tok in s for tok in ("504", "deadline_exceeded", "deadline expired", "timed out", "timeout")):
+        # Gọi bị treo rồi hết giờ (504 phía Google hoặc GEMINI_CALL_TIMEOUT_S
+        # phía mình) — thường gọi lại là qua ngay (đo thật: lần sau 1s).
+        return 3.0
     if any(tok in s for tok in ("503", "unavailable", "high demand", "try again")):
         # "503 UNAVAILABLE — model đang quá tải" — LỖI TẠM THỜI PHÍA GOOGLE,
         # không phải lỗi code/quota — với job nền tự động (không ai đứng chờ
@@ -162,11 +168,30 @@ def _quota_message(err: BaseException) -> str:
     )
 
 
+def _sleep_cancellable(seconds: float) -> None:
+    job = current_job()
+    if job is None:
+        time.sleep(seconds)
+        return
+    if job.cancel_event.wait(seconds):
+        job.raise_if_cancelled()
+
+
+# Giới hạn thời gian 1 lần gọi Gemini. Trước đây không có: đã đo thật lúc
+# Google chập chờn (gemini-flash-lite-latest) — 2/3 lần gọi treo tới khi tự
+# trả 504 DEADLINE_EXCEEDED, job dịch 12 câu kẹt hơn 10 phút. 120s dư cho 1
+# batch 200 câu bình thường (vài chục giây), quá mức là coi như treo, thử lại.
+GEMINI_CALL_TIMEOUT_S = 120
+
+
 def _generate(prompt: str, schema: dict | None = None) -> Any:
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=_api_key())
+    client = genai.Client(
+        api_key=_api_key(),
+        http_options=types.HttpOptions(timeout=GEMINI_CALL_TIMEOUT_S * 1000),
+    )
     model = config.resolve_gemini_model()
 
     def _cfg(*, with_thinking: bool) -> types.GenerateContentConfig:
@@ -182,7 +207,7 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="MINIMAL")
         return types.GenerateContentConfig(**kwargs)
 
-    def call(with_thinking: bool):
+    def call_blocking(with_thinking: bool):
         response = client.models.generate_content(
             model=model,
             contents=prompt,
@@ -201,6 +226,32 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
             raise ValueError(f"Gemini trả về rỗng (finish_reason={reason})")
         return _parse_json(text)
 
+    def call(with_thinking: bool):
+        # Chạy lời gọi trong thread phụ, còn thread job chờ có kiểm tra cờ Dừng
+        # mỗi 0.5s — trước đây bấm Dừng phải chờ Google trả lời xong (Google
+        # treo thì hàng phút) mới dừng được. Dừng giữa chừng thì bỏ mặc thread
+        # phụ tự kết thúc (tối đa GEMINI_CALL_TIMEOUT_S), kết quả bị bỏ.
+        job = current_job()
+        if job is None:
+            return call_blocking(with_thinking)
+        job.raise_if_cancelled()
+        box: dict = {}
+
+        def worker() -> None:
+            try:
+                box["result"] = call_blocking(with_thinking)
+            except BaseException as err:  # chuyển lỗi về thread job
+                box["error"] = err
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        while t.is_alive():
+            t.join(0.5)
+            job.raise_if_cancelled()
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
     last: BaseException | None = None
     thinking = True
     # 8 lần thử (trước đây 4) — job nền tự động không ai đứng chờ, đáng kiên
@@ -210,6 +261,8 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
     for attempt in range(_MAX_ATTEMPTS):
         try:
             return call(with_thinking=thinking)
+        except JobCancelled:
+            raise
         except Exception as err:
             last = err
             if _is_daily_free_tier(err):
@@ -223,7 +276,7 @@ def _generate(prompt: str, schema: dict | None = None) -> Any:
             if wait is None or attempt == _MAX_ATTEMPTS - 1:
                 raise
             logger.warning("Gemini retry sau {:.0f}s (lần {}/{}) ({})", wait, attempt + 1, _MAX_ATTEMPTS, err)
-            time.sleep(wait)
+            _sleep_cancellable(wait)
     assert last is not None
     raise last
 
@@ -253,9 +306,136 @@ def translate_title(title: str) -> str:
         result = _generate(prompt, schema=_TITLE_SCHEMA)
         vi = str(result.get("vi") or "").strip()
         return vi or title
+    except JobCancelled:
+        raise
     except Exception as err:
         logger.warning("translate_title: dịch tiêu đề thất bại, giữ nguyên bản gốc: {}", err)
         return title
+
+
+# ---- Caption đăng TikTok/Facebook cho "Dự án tự động"
+# Trước đây caption = dịch nguyên văn tiêu đề Douyin: giữ cả hashtag đặc thù
+# Douyin (#萌宠出道计划, #神奇动物在抖音, @抖音小助手...) dịch/phiên âm thành
+# hashtag vô nghĩa, có dấu, dài lê thê (#hiếuthảophảisớmkhôngnênđểlạitiếcnuối),
+# không kể nội dung video, không có câu kéo tương tác. Giờ viết caption MỚI theo
+# mẫu người dùng đưa: 1 dòng tiêu đề thu hút + emoji, 2-3 đoạn ngắn kể nội dung,
+# 1 câu hỏi cuối, rồi 5-8 hashtag ngắn viết liền không dấu (HoaChuCaiDau).
+
+_CAPTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hook": {"type": "string"},
+        "paragraphs": {"type": "array", "items": {"type": "string"}},
+        "question": {"type": "string"},
+        "hashtags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["hook", "paragraphs", "question", "hashtags"],
+}
+
+# Rác đi kèm khi copy link chia sẻ Douyin: link, lời nhắc "复制此链接...",
+# chuỗi mã/giờ đầu đoạn share ("1.56 :7pm t@E.UY Fho:/ 03/01").
+_DOUYIN_JUNK_RE = [
+    re.compile(r"https?://\S+"),
+    re.compile(r"复制此链接.*$", re.S),
+    re.compile(r"打开\s*Dou音.*$", re.S),
+    re.compile(r"@\S+"),
+    re.compile(r"^[\x00-\x7F]*?/\s*\d{1,2}/\d{1,2}\s+"),
+]
+# Hashtag chỉ có nghĩa trên Douyin (chiến dịch/tính năng của Douyin) — bỏ.
+_DOUYIN_ONLY_TAG_WORDS = ("抖音", "dou", "douyin", "上热门", "计划", "小助手", "创作者", "tiktokvn")
+MAX_CAPTION_HASHTAGS = 8
+
+
+def clean_douyin_title(title: str) -> str:
+    text = (title or "").strip()
+    for pattern in _DOUYIN_JUNK_RE:
+        text = pattern.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_hashtag(tag: str) -> str:
+    """"#mực vây lớn" / "Mực Vây Lớn" → "MucVayLon": bỏ dấu, viết liền, hoa chữ
+    cái đầu mỗi từ; giữ nguyên chữ hoa sẵn có (vd "AIContent")."""
+    import unicodedata
+
+    raw = tag.strip().lstrip("#").replace("đ", "d").replace("Đ", "D")
+    raw = unicodedata.normalize("NFD", raw)
+    raw = "".join(ch for ch in raw if unicodedata.category(ch) != "Mn")
+    words = re.findall(r"[A-Za-z0-9]+", raw)
+    return "".join(w[:1].upper() + w[1:] for w in words)
+
+
+def _clean_hashtags(tags: list[str], fixed: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in [*tags, *fixed]:
+        low = tag.lower()
+        if any(w in low for w in _DOUYIN_ONLY_TAG_WORDS):
+            continue
+        norm = _normalize_hashtag(tag)
+        if not (2 <= len(norm) <= 24) or norm.lower() in seen:
+            continue
+        seen.add(norm.lower())
+        out.append(norm)
+    # Hashtag cố định của dự án luôn được giữ, kể cả khi vượt giới hạn số lượng.
+    fixed_norm = {_normalize_hashtag(t).lower() for t in fixed}
+    head = [t for t in out if t.lower() not in fixed_norm][: max(0, MAX_CAPTION_HASHTAGS - len(fixed_norm))]
+    return head + [t for t in out if t.lower() in fixed_norm]
+
+
+def generate_caption(
+    title: str,
+    content_vi: str = "",
+    entity_dict: dict[str, str] | None = None,
+    fixed_hashtags: list[str] | None = None,
+) -> str:
+    """Viết caption đăng mạng xã hội (TikTok/Facebook) cho 1 video reup.
+    `content_vi` = lời thoại tiếng Việt của video (phụ đề đã dịch) để caption
+    kể đúng nội dung; `entity_dict` để tên riêng khớp lời thuyết minh;
+    `fixed_hashtags` = hashtag cố định của dự án (luôn có). Gemini lỗi thì trả
+    về tiêu đề đã dịch nhanh (`translate_title`) để không chặn việc đăng."""
+    fixed = [t for t in (fixed_hashtags or []) if t.strip()]
+    source = clean_douyin_title(title)
+    content = (content_vi or "").strip()[:3500]
+    names = "\n".join(f"- {k} → {v}" for k, v in list((entity_dict or {}).items())[:40])
+    prompt = f"""Bạn là người viết caption cho kênh TikTok/Facebook tiếng Việt, đăng lại video
+từ Douyin đã được lồng tiếng Việt. Viết caption MỚI (không dịch từng chữ tiêu đề gốc), bám
+đúng nội dung video, văn phong tự nhiên, cuốn hút, phù hợp người xem Việt Nam.
+
+Cấu trúc:
+- hook: 1 dòng tiêu đề thu hút (tối đa ~90 ký tự), kết thúc bằng 1-2 emoji hợp chủ đề.
+- paragraphs: 2-3 đoạn ngắn (mỗi đoạn 1-2 câu) kể điểm hấp dẫn của video; có thể thêm 1 emoji
+  cuối 1 đoạn. Không bịa chi tiết không có trong nội dung.
+- question: 1 câu hỏi mở cuối bài để người xem bình luận.
+- hashtags: 6-8 hashtag NGẮN (1-3 từ), đúng chủ đề, là từ khoá người Việt hay tìm; tiếng Việt
+  hoặc tiếng Anh tuỳ cái nào phổ biến hơn (vd Pokemon, AIContent). KHÔNG dùng hashtag đặc thù
+  Douyin (chiến dịch, tên tính năng, @tài khoản). KHÔNG phiên âm pinyin/Hán Việt tên gốc tiếng
+  Trung thành hashtag — dùng tên tiếng Việt thông dụng (vd MucVayLon) hoặc tên tiếng Anh.
+
+Tên riêng phải viết ĐÚNG như bảng sau (khớp lời thuyết minh):
+{names or "(không có)"}
+
+Tiêu đề gốc (Douyin): {source or "(trống)"}
+
+Lời thoại tiếng Việt của video:
+{content or "(không có)"}"""
+    try:
+        data = _generate(prompt, schema=_CAPTION_SCHEMA)
+        hook = str(data.get("hook") or "").strip()
+        paragraphs = [str(p).strip() for p in (data.get("paragraphs") or []) if str(p).strip()][:3]
+        question = str(data.get("question") or "").strip()
+        tags = _clean_hashtags([str(t) for t in (data.get("hashtags") or [])], fixed)
+        if not hook:
+            raise ValueError("Gemini không trả tiêu đề caption")
+        body = "\n\n".join(x for x in [hook, *paragraphs, question] if x)
+        return body + ("\n\n" + " ".join(f"#{t}" for t in tags) if tags else "")
+    except JobCancelled:
+        raise
+    except Exception as err:
+        logger.warning("generate_caption: viết caption thất bại, dùng tiêu đề dịch nhanh: {}", err)
+        fallback = translate_title(source or title)
+        tags = _clean_hashtags([], fixed)
+        return fallback + ("\n\n" + " ".join(f"#{t}" for t in tags) if tags else "")
 
 
 def _one_shot(
@@ -417,6 +597,8 @@ def process_llm(
                     except (KeyError, TypeError, ValueError):
                         continue
                 entity_dict.update(retry_ent)
+            except JobCancelled:
+                raise
             except Exception as err:
                 logger.warning("Dịch lại {} câu thiếu lỗi ({}), giữ nguyên chữ gốc", len(missing), err)
             still_missing = [c.id for c in missing if c.id not in translated_map]
@@ -446,6 +628,8 @@ def process_llm(
         for bi, batch in enumerate(violator_batches):
             try:
                 rewritten.update(_compact_rewrite_batch(batch, entity_dict))
+            except JobCancelled:
+                raise
             except Exception as err:
                 logger.warning("Nén câu đọc gấp lỗi ({}), giữ bản dịch lượt 1 cho nhóm {}/{}", err, bi + 1, len(violator_batches))
             if bi < len(violator_batches) - 1:
@@ -510,6 +694,8 @@ Trả về: {{"text_vi":"..."}}"""
             rewritten = _compact_rewrite_batch([(cue, text_vi)], entity_dict)
             if cue_id in rewritten:
                 text_vi = rewritten[cue_id]
+        except JobCancelled:
+            raise
         except Exception as err:
             logger.warning("Nén câu #{} lỗi ({}), giữ bản dịch tự nhiên", cue_id, err)
 

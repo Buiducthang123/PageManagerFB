@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
+import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,6 +48,101 @@ class SocialPublishError(RuntimeError):
     pass
 
 
+class AccountExpiredError(SocialPublishError):
+    """Profile không còn đăng nhập (hết phiên / bị đăng xuất)."""
+
+
+class AccountMismatchError(SocialPublishError):
+    """Profile đang đăng nhập 1 tài khoản khác tài khoản đã gán cho dự án."""
+
+
+class ProfileBusyError(SocialPublishError):
+    """Profile Chrome đang được 1 luồng khác mở (đăng nhập/đăng bài/kiểm tra)
+    — Chrome không cho 2 tiến trình mở chung 1 thư mục profile."""
+
+
+# Khoá theo thư mục profile — đăng nhập, đăng bài và kiểm tra tài khoản đều
+# mở persistent context trên cùng thư mục, mở chồng nhau sẽ lỗi khoá profile.
+_profile_locks: dict[str, threading.Lock] = {}
+_profile_locks_guard = threading.Lock()
+
+
+@contextmanager
+def profile_lock(profile_dir: Path, timeout_s: float = 0):
+    """`timeout_s=0` = không chờ, profile bận thì ném ProfileBusyError ngay."""
+    key = str(Path(profile_dir).resolve()).lower()
+    with _profile_locks_guard:
+        lock = _profile_locks.setdefault(key, threading.Lock())
+    acquired = lock.acquire(timeout=timeout_s) if timeout_s > 0 else lock.acquire(blocking=False)
+    if not acquired:
+        raise ProfileBusyError("Profile tài khoản đang được dùng (đang đăng bài hoặc mở cửa sổ đăng nhập) — thử lại sau")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@dataclass
+class TikTokIdentity:
+    uid: str
+    username: str
+    screen_name: str
+    avatar_url: str
+
+
+_ACCOUNT_INFO_JS = """async () => {
+  const r = await fetch('/passport/web/account/info/?aid=1459', {credentials: 'include'});
+  return await r.text();
+}"""
+
+
+def _read_identity(page: Page) -> Optional[TikTokIdentity]:
+    """Đọc tài khoản đang đăng nhập qua API `/passport/web/account/info/` mà
+    chính trang TikTok gọi (page phải đang ở 1 trang www.tiktok.com). Đã test
+    thật: đăng nhập → message "success" kèm username/uid; profile trống/hết
+    phiên → message "error", name "session_expired". Trả None = chưa đăng
+    nhập; ném SocialPublishError nếu phản hồi không đọc được."""
+    raw = page.evaluate(_ACCOUNT_INFO_JS)
+    try:
+        body = json.loads(raw)
+    except ValueError as err:
+        raise SocialPublishError(f"Không đọc được thông tin tài khoản TikTok: {raw[:200]}") from err
+    data = body.get("data") or {}
+    if body.get("message") == "success" and data.get("user_id_str"):
+        return TikTokIdentity(
+            uid=str(data["user_id_str"]),
+            username=data.get("username") or "",
+            screen_name=data.get("screen_name") or "",
+            avatar_url=data.get("avatar_url") or "",
+        )
+    if data.get("name") == "session_expired" or data.get("error_code") == 13:
+        return None
+    raise SocialPublishError(f"TikTok trả về phản hồi lạ khi kiểm tra tài khoản: {raw[:200]}")
+
+
+def check_tiktok_account(profile_dir: Path) -> Optional[TikTokIdentity]:
+    """Mở ngầm (headless) profile, đọc tài khoản đang đăng nhập. None = chưa
+    đăng nhập/hết phiên. Không đợi nếu profile đang bận (ProfileBusyError)."""
+    if not has_logged_in_session(profile_dir):
+        return None
+    with profile_lock(profile_dir), sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2000)
+            return _read_identity(page)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
 def _label_regex(labels: list[str]) -> re.Pattern:
     return re.compile("|".join(re.escape(lbl) for lbl in labels), re.IGNORECASE)
 
@@ -52,6 +151,7 @@ def login_tiktok_interactive(
     profile_dir: Path,
     timeout_s: float = 900.0,
     should_stop: Optional[Callable[[], bool]] = None,
+    url: str = TIKTOK_UPLOAD_URL,
 ) -> None:
     """Mở 1 cửa sổ Chrome THẬT (persistent context — giữ nguyên cookie/local
     storage như 1 Chrome profile bình thường, KHÔNG phải storage_state.json
@@ -59,9 +159,9 @@ def login_tiktok_interactive(
     tới trang upload TikTok, để người dùng tự đăng nhập tay (kể cả 2FA/
     captcha). Hàm CHẶN tới khi người dùng ĐÓNG cửa sổ (tín hiệu "xong rồi")
     hoặc hết `timeout_s`. Các lần đăng bài sau tái dùng đúng `profile_dir`
-    này, không cần đăng nhập lại."""
+    này, không cần đăng nhập lại. `url` khác = mở để xem (vd trang kênh)."""
     profile_dir.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
+    with profile_lock(profile_dir), sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
             headless=False,
@@ -70,12 +170,23 @@ def login_tiktok_interactive(
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(TIKTOK_UPLOAD_URL, wait_until="domcontentloaded")
+            page.goto(url, wait_until="domcontentloaded")
             closed = {"value": False}
             context.on("close", lambda: closed.__setitem__("value", True))
             start = time.time()
             while not closed["value"] and time.time() - start < timeout_s:
                 if should_stop is not None and should_stop():
+                    break
+                # Playwright sync chỉ xử lý sự kiện (page/context "close") khi
+                # có 1 lời gọi API — time.sleep suông thì không bao giờ thấy
+                # cửa sổ đã đóng. Và đóng cửa sổ cuối cùng KHÔNG làm tiến trình
+                # Chrome thoát (đã xác nhận thật: vẫn chạy ngầm, không cửa sổ),
+                # nên "hết tab" mới là tín hiệu "xong rồi", không phải context close.
+                try:
+                    context.cookies()
+                except Exception:
+                    break
+                if not context.pages:
                     break
                 time.sleep(1)
         finally:
@@ -178,10 +289,28 @@ _DROP_FILE_JS = """
     if (!file.size) return { ok: false, reason: 'empty file' };
     const dt = new DataTransfer();
     dt.items.add(file);
-    const marker = Array.from(document.querySelectorAll('div')).find(
-        (el) => (el.textContent || '').trim() === 'Or drag and drop it here'
-    );
-    const dropzone = marker ? (marker.closest('div[class*="upload"]') || marker.parentElement) : null;
+    // TikTok có nhiều phiên bản giao diện upload: "Or drag and drop it here"
+    // (1 video), "Or drag and drop them here. You can upload up to 30
+    // videos." (nhiều video — đã gặp thật ở tài khoản con-bo-biet-bay), bản
+    // tiếng Việt "Hoặc kéo và thả...". Tìm phần tử NHỎ NHẤT có chữ bắt đầu
+    // bằng cụm kéo-thả thay vì so khớp nguyên văn 1 câu.
+    const cue = /^(or\\s+)?drag\\s+and\\s+drop|^(hoặc\\s+)?kéo\\s+(và\\s+)?thả/i;
+    const candidates = Array.from(document.querySelectorAll('div, span, p')).filter((el) => {
+        const t = (el.textContent || '').trim();
+        return t.length > 0 && t.length < 160 && cue.test(t);
+    });
+    candidates.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+    const marker = candidates[0];
+    let dropzone = marker ? marker.closest('div[class*="upload" i]') : null;
+    if (!dropzone && marker) {
+        // Không có lớp "upload": leo lên tới khối đủ lớn chứa cả nút chọn video.
+        let el = marker;
+        for (let k = 0; k < 6 && el.parentElement; k++) {
+            el = el.parentElement;
+            if (el.querySelector('button, input[type="file"]')) { dropzone = el; break; }
+        }
+        dropzone = dropzone || marker.parentElement;
+    }
     if (!dropzone) return { ok: false, reason: 'dropzone not found' };
     const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
     dropzone.dispatchEvent(new DragEvent('dragenter', opts));
@@ -190,6 +319,34 @@ _DROP_FILE_JS = """
     return { ok: true };
 }
 """
+
+
+_LOGIN_PAGE_RE = re.compile(r"log in to tiktok|đăng nhập vào tiktok|use qr code|sử dụng mã qr", re.IGNORECASE)
+
+
+def _ensure_logged_in(page: Page, wait_s: float = 12.0) -> None:
+    """Tài khoản bị đăng xuất thì TikTok Studio chuyển sang trang "Log in to
+    TikTok" — trước đây luồng đăng cứ chạy tiếp, 3 lần tìm khung kéo-thả không
+    thấy rồi báo lỗi khó hiểu "Không kéo-thả được file video". Phát hiện sớm
+    để báo đúng lỗi và hướng dẫn đăng nhập lại."""
+    start = time.time()
+    while time.time() - start < wait_s:
+        if "/login" in page.url:
+            break
+        try:
+            body = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            body = ""
+        if _LOGIN_PAGE_RE.search(body):
+            break
+        if "drag and drop" in body.lower() or "select video" in body.lower() or "kéo và thả" in body.lower():
+            return
+        page.wait_for_timeout(1000)
+    else:
+        return  # không nhận ra trang nào — để các bước sau tự xử lý như cũ
+    raise SocialPublishError(
+        "Tài khoản TikTok đã bị đăng xuất — vào dự án tự động, bấm \"Đăng nhập TikTok\" để đăng nhập lại rồi bấm \"Đăng lại\""
+    )
 
 
 _UNSAVED_DRAFT_RE = re.compile(r"wasn.t saved|chưa được lưu|continue editing", re.IGNORECASE)
@@ -468,19 +625,23 @@ def publish_tiktok(
     caption: str,
     profile_dir: Path,
     screenshot_dir: Optional[Path] = None,
+    expected_uid: str = "",
 ) -> None:
     """Đăng 1 video lên TikTok qua account đã đăng nhập sẵn trong
     `profile_dir` (xem `login_tiktok_interactive`). Ném `SocialPublishError`
     nếu thất bại — chụp màn hình lại lúc lỗi (và lúc thành công) vào
     `screenshot_dir` để biết chính xác TikTok đổi UI ở bước nào nếu selector
-    có ngày nào đó không còn khớp."""
+    có ngày nào đó không còn khớp. `expected_uid` (uid tài khoản đã gán cho
+    dự án) → kiểm tra đúng tài khoản trước khi đưa file lên, lệch là dừng."""
     if not video_path.exists():
         raise SocialPublishError(f"Không thấy file video: {video_path}")
     if not has_logged_in_session(profile_dir):
         raise SocialPublishError("Account TikTok này chưa đăng nhập — bấm 'Đăng nhập TikTok' trước")
 
     console_log: list[str] = []
-    with sync_playwright() as p:
+    # Chờ tối đa 90s — đủ cho 1 lượt kiểm tra tài khoản ngầm đang chạy dở,
+    # nhưng không treo cả hàng đợi đăng khi người dùng đang mở cửa sổ đăng nhập.
+    with profile_lock(profile_dir, timeout_s=90), sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
             headless=False,
@@ -500,6 +661,23 @@ def publish_tiktok(
             )
             try:
                 page.goto(TIKTOK_UPLOAD_URL, wait_until="domcontentloaded")
+                try:
+                    identity = _read_identity(page)
+                except SocialPublishError as err:
+                    # API nhận dạng trả phản hồi lạ — không chặn đăng bài vì
+                    # nó, `_ensure_logged_in` bên dưới vẫn bắt được đăng xuất.
+                    logger.warning("social_publish: bỏ qua kiểm tra tài khoản — {}", err)
+                    identity = TikTokIdentity(uid=expected_uid, username="", screen_name="", avatar_url="")
+                if identity is None:
+                    raise AccountExpiredError(
+                        "Tài khoản TikTok đã bị đăng xuất — vào trang Tài khoản, bấm \"Đăng nhập lại\" rồi bấm \"Đăng lại\""
+                    )
+                if expected_uid and identity.uid != expected_uid:
+                    raise AccountMismatchError(
+                        f"Profile đang đăng nhập @{identity.username}, KHÔNG phải tài khoản đã gán cho dự án — "
+                        "đã dừng, không đăng. Vào trang Tài khoản kiểm tra lại"
+                    )
+                _ensure_logged_in(page)
                 _discard_unsaved_draft(page)
                 _set_video_file(page, video_path)
                 _wait_for_upload_processed(page)

@@ -46,13 +46,7 @@ _CHROME_CACHE_DIRS = (
     "ShaderCache",
     "BrowserMetrics",
 )
-# Video bản nháp TikTok Studio lưu trong IndexedDB của tiktok.com — xoá cả cặp
-# blob + leveldb cùng lúc cho nhất quán. Chỉ mất bản nháp chưa đăng.
-_TIKTOK_DRAFT_DIRS = (
-    "Default/IndexedDB/https_www.tiktok.com_0.indexeddb.blob",
-    "Default/IndexedDB/https_www.tiktok.com_0.indexeddb.leveldb",
-)
-_TIKTOK_DRAFT_MIN_BYTES = 50 * 1024 * 1024
+# KHÔNG xoá IndexedDB của tiktok.com nữa — xem `_clean_profile`.
 
 
 def free_gb() -> float:
@@ -357,10 +351,14 @@ def _save_marker(data: dict) -> None:
 
 
 def _clean_profile(profile: Path, tiktok: bool) -> int:
-    freed = sum(_remove(profile / rel) for rel in _CHROME_CACHE_DIRS)
-    if tiktok and _size(profile / _TIKTOK_DRAFT_DIRS[0]) >= _TIKTOK_DRAFT_MIN_BYTES:
-        freed += sum(_remove(profile / rel) for rel in _TIKTOK_DRAFT_DIRS)
-    return freed
+    """CHỈ xoá bộ nhớ đệm thuần (cache HTTP/mã JS/đồ hoạ) — tuyệt đối không
+    đụng dữ liệu trang (IndexedDB, Local Storage, Service Worker, cookie).
+    Đã gặp thật: bản đầu xoá thêm IndexedDB của tiktok.com (tưởng chỉ chứa
+    video bản nháp) → sau đó MỌI tài khoản TikTok bị đăng xuất dù cookie
+    phiên vẫn còn hạn (TikTok nhiều khả năng lưu dữ liệu nhận diện thiết bị ở
+    đó, mất đi thì coi là thiết bị lạ và huỷ phiên). `tiktok` giữ lại cho
+    tương thích, không còn xoá gì thêm."""
+    return sum(_remove(profile / rel) for rel in _CHROME_CACHE_DIRS)
 
 
 def _clean_browser_profiles(now: datetime) -> int:

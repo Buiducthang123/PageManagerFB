@@ -1,9 +1,12 @@
-import { useRef, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, DEFAULT_ORIGINAL_AUDIO_VOLUME_DB, DEFAULT_SUBTITLE_FONT_SIZE, type AudioMode, type ProjectState } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import JobProgressBar from './JobProgressBar'
 import OcrCropSelector, { type CropRegion } from './OcrCropSelector'
+import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from './BlurStrengthControl'
+
+const DEFAULT_MUSIC_VOLUME_DB = -13
 import { useJobStatus } from '../hooks/useJobStatus'
 
 export default function DirectExportPanel({
@@ -36,6 +39,11 @@ export default function DirectExportPanel({
     useAuto ? project.auto_subtitle_font_size ?? DEFAULT_SUBTITLE_FONT_SIZE : DEFAULT_SUBTITLE_FONT_SIZE,
   )
   const [minVideoSpeed, setMinVideoSpeed] = useState(useAuto ? project.auto_min_video_speed ?? 0.85 : 0.85)
+  // Độ mờ nền: lấy giá trị đã lưu của project (dự án tự động copy sang lúc
+  // kích hoạt, hoặc lần xuất tay trước đó), không có thì mặc định hệ thống.
+  const [blurStrength, setBlurStrength] = useState(project.auto_blur_strength ?? DEFAULT_BLUR_STRENGTH)
+  // Âm lượng nhạc nền tự thêm — mặc định -13dB, lưu lại theo project sau mỗi lần xuất.
+  const [musicVolumeDb, setMusicVolumeDb] = useState(project.auto_music_volume_db ?? DEFAULT_MUSIC_VOLUME_DB)
 
   const exportRecord = project.export
   const busyExport = exportRecord.status === 'running'
@@ -48,10 +56,28 @@ export default function DirectExportPanel({
     onSuccess: () => refresh(),
   })
 
+  // Dò vùng che chạy NỀN (vài tới hơn 10 phút) — theo dõi tiến độ qua job,
+  // làm mới project ngay khi dò xong để khung khoanh vùng cập nhật mà không
+  // cần tải lại trang.
+  const detectJobQuery = useQuery({
+    queryKey: ['blur-detect-job', projectId],
+    queryFn: () => api.detectExportBlurRegionStatus(projectId),
+    // Vẫn hỏi thưa (5s) khi chưa chạy: lượt dò có thể do nơi khác khởi động
+    // (tab khác, bộ lập lịch) — không hỏi thì trang đang mở không hề biết.
+    refetchInterval: (q) => (q.state.data?.status === 'running' ? 1500 : 5000),
+  })
   const detectBlurMutation = useMutation({
     mutationFn: () => api.detectExportBlurRegion(projectId),
-    onSuccess: () => refresh(),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['blur-detect-job', projectId] }),
   })
+  const detectStatus = detectJobQuery.data?.status
+  const detecting = detectBlurMutation.isPending || detectStatus === 'running'
+  const prevDetectStatus = useRef<string | null | undefined>(undefined)
+  useEffect(() => {
+    if (prevDetectStatus.current === 'running' && detectStatus && detectStatus !== 'running') refresh()
+    prevDetectStatus.current = detectStatus
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectStatus])
 
   // Ép <audio>/<img> tải lại sau khi upload/xoá — URL cố định (không đoán
   // đuôi file nữa, xem exportMusicUrl/exportLogoUrl) nên trình duyệt có thể
@@ -89,7 +115,7 @@ export default function DirectExportPanel({
   })
 
   const startMutation = useMutation({
-    mutationFn: () => api.startExport(projectId, audioMode, minVideoSpeed, originalAudioVolumeDb, subtitleFontSize),
+    mutationFn: () => api.startExport(projectId, audioMode, minVideoSpeed, originalAudioVolumeDb, subtitleFontSize, blurStrength, musicVolumeDb),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['job', projectId, 'export'] }),
   })
 
@@ -118,12 +144,24 @@ export default function DirectExportPanel({
             <button
               type="button"
               className="btn btn-ghost btn-sm shrink-0"
-              disabled={detectBlurMutation.isPending || busyAny}
+              disabled={detecting || busyAny}
               onClick={() => detectBlurMutation.mutate()}
             >
-              {detectBlurMutation.isPending ? 'Đang dò...' : 'Tự động phát hiện'}
+              {detecting ? 'Đang dò...' : 'Tự động phát hiện'}
             </button>
           </div>
+          {detectStatus === 'running' && (
+            <p className="mb-1.5 text-xs text-neutral-400">
+              {detectJobQuery.data?.current_label ?? 'Đang dò vùng phụ đề cũ...'} — có thể mất vài phút, cứ để trang mở
+              hoặc quay lại sau.
+            </p>
+          )}
+          {detectStatus === 'done' && detectJobQuery.data?.current_label && (
+            <p className="mb-1.5 text-xs text-accent-300">{detectJobQuery.data.current_label}</p>
+          )}
+          {detectStatus === 'failed' && detectJobQuery.data?.error && (
+            <p className="mb-1.5 text-xs text-danger">{detectJobQuery.data.error}</p>
+          )}
           {detectBlurMutation.error && (
             <p className="mb-1.5 text-xs text-danger">{(detectBlurMutation.error as Error).message}</p>
           )}
@@ -132,6 +170,11 @@ export default function DirectExportPanel({
             crop={blurRegion}
             onChange={(region) => blurMutation.mutate(region)}
           />
+          {blurRegion && (
+            <div className="mt-3">
+              <BlurStrengthControl value={blurStrength} onChange={setBlurStrength} disabled={busyAny} />
+            </div>
+          )}
         </div>
       )}
 
@@ -147,6 +190,19 @@ export default function DirectExportPanel({
             accept="audio/*"
             busy={musicMutation.isPending || deleteMusicMutation.isPending}
           />
+          <label className="mt-2 block text-xs text-neutral-400">
+            Âm lượng nhạc nền (dB) — nhạc tự lặp lại hết video, nhỏ dần ở cuối
+            <input
+              type="number"
+              step={1}
+              min={-60}
+              max={12}
+              className={`${inputClass} mt-1 max-w-[8rem]`}
+              value={musicVolumeDb}
+              disabled={busyAny}
+              onChange={(e) => setMusicVolumeDb(Number(e.target.value))}
+            />
+          </label>
         </div>
         <div className="field">
           <label>Logo (tuỳ chọn)</label>
@@ -250,9 +306,22 @@ export default function DirectExportPanel({
 
       {exportRecord.status === 'done' && (
         <div className="space-y-2">
-          <video className="max-h-96 w-full rounded-lg bg-black" src={api.exportVideoUrl(projectId)} controls preload="metadata" />
+          {/* Thêm mốc xuất xong vào URL: file luôn tên final.mp4, nếu URL không
+              đổi thì trình duyệt giữ bản cũ trong cache — xuất lại xong vẫn
+              xem video cũ tới khi tải lại trang. `key` ép thẻ video nạp lại. */}
+          <video
+            key={exportRecord.at ?? 'final'}
+            className="max-h-96 w-full rounded-lg bg-black"
+            src={`${api.exportVideoUrl(projectId)}?v=${encodeURIComponent(exportRecord.at ?? '')}`}
+            controls
+            preload="metadata"
+          />
           <div className="flex flex-wrap items-center gap-2">
-            <a className={secondaryButtonClass} href={api.exportVideoUrl(projectId)} download>
+            <a
+              className={secondaryButtonClass}
+              href={`${api.exportVideoUrl(projectId)}?v=${encodeURIComponent(exportRecord.at ?? '')}`}
+              download
+            >
               Tải video xuống
             </a>
             <button

@@ -64,6 +64,8 @@ class UpdateSocialProjectRequest(BaseModel):
     audio_mode: Optional[str] = None
     original_audio_volume_db: Optional[float] = None
     music_volume_db: Optional[float] = None
+    blur_strength: Optional[float] = Field(None, ge=0.05, le=1.0)
+    caption_hashtags: Optional[str] = None
     subtitle_font_size: Optional[int] = None
     min_video_speed: Optional[float] = None
     use_viesnap_fallback: Optional[bool] = None
@@ -127,6 +129,11 @@ class StartExportRequest(BaseModel):
     # định người dùng chốt.
     subtitle_font_size: int = Field(6, ge=1, le=100)
     min_video_speed: float = Field(0.85, ge=0.7, le=1.0)
+    # Độ mờ nền vùng che phụ đề cũ (hệ số độ mờ Gaussian theo chiều cao vùng
+    # chữ, xem export_direct.BLUR_SIGMA_RATIO). None = dùng cấu hình project.
+    blur_strength: Optional[float] = Field(None, ge=0.05, le=1.0)
+    # Âm lượng nhạc nền tự thêm (dB). None = dùng cấu hình project (mặc định -13dB).
+    music_volume_db: Optional[float] = Field(None, ge=-60, le=12)
 
 
 class UpdateExportBlurRegionRequest(BaseModel):

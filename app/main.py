@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import shutil
 import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -15,8 +17,9 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from . import accounts as acc_store
 from . import config, downloads as dl, jobs, merges as mg, projects as pj, settings as app_settings, social as sp
-from .models import Episode, QueueItem, QueueItemStatus, SocialLink, SocialProjectSummary, StageRecord, StageStatus
+from .models import Episode, QueueItem, QueueItemStatus, SocialLink, SocialProjectSummary, StageRecord, StageStatus, TikTokPostRecord
 from .schemas import (
     AppSettingsResponse,
     CreateDownloadRequest,
@@ -262,7 +265,9 @@ def _maybe_fail_social(project_id: str, stage: str, error: str) -> None:
 
 
 def _detect_blur_region_and_ranges(
-    video_path: Path, search_region: tuple[float, float, float, float] | None = None
+    video_path: Path,
+    search_region: tuple[float, float, float, float] | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[tuple[float, float, float, float] | None, list[tuple[float, float]]]:
     """Dò vùng che (`detect_subtitle_region`) rồi, nếu tìm được, dò tiếp các
     khoảng THỜI GIAN chữ thật sự hiện trong vùng đó (`detect_subtitle_visibility`)
@@ -272,15 +277,24 @@ def _detect_blur_region_and_ranges(
     — lỗi ở bước nào cũng chỉ log rồi trả về phần đã có (region rỗng → cả 2
     đều rỗng; visibility lỗi → vẫn trả region, ranges rỗng nghĩa là "che suốt
     video" ở nơi gọi)."""
+    def step(prefix: str):
+        if on_progress is None:
+            return None
+        return lambda d, t, label: on_progress(d, t, f"{prefix}: {label}")
+
     try:
-        region = ocr_stage.detect_subtitle_region(video_path, search_region=search_region)
+        region = ocr_stage.detect_subtitle_region(
+            video_path, search_region=search_region, on_progress=step("Bước 1/2 dò vị trí chữ")
+        )
     except ocr_stage.TranscribeOCRError as err:
         logger.warning("_detect_blur_region_and_ranges: dò vùng che thất bại cho '{}': {}", video_path, err)
         return None, []
     if region is None:
         return None, []
     try:
-        ranges = ocr_stage.detect_subtitle_visibility(video_path, region)
+        ranges = ocr_stage.detect_subtitle_visibility(
+            video_path, region, on_progress=step("Bước 2/2 dò lúc chữ hiện")
+        )
     except ocr_stage.TranscribeOCRError as err:
         logger.warning("_detect_blur_region_and_ranges: dò thời điểm hiện chữ thất bại cho '{}': {}", video_path, err)
         ranges = []
@@ -2182,11 +2196,25 @@ def _start_export(
     min_video_speed: float,
     original_audio_volume_db: float = -13.0,
     subtitle_font_size: int = 6,
+    blur_strength: float | None = None,
+    music_volume_db: float | None = None,
 ) -> jobs.JobState | None:
     state = pj.load_project(project_id)
     root = pj.project_dir(project_id)
     if not state.video_relpath:
         return None
+    # Xuất tay có chỉnh âm lượng nhạc nền → lưu lại cho lần xuất sau.
+    if music_volume_db is not None:
+        with pj.locked_project(project_id) as s:
+            s.auto_music_volume_db = music_volume_db
+    # Không truyền (luồng tự động) → dùng độ mờ đã lưu của project (copy từ
+    # dự án tự động lúc kích hoạt); truyền (xuất tay) → lưu lại làm mặc định
+    # cho lần xuất sau của project này.
+    if blur_strength is None:
+        blur_strength = state.auto_blur_strength
+    else:
+        with pj.locked_project(project_id) as s:
+            s.auto_blur_strength = blur_strength
 
     mute_original_audio = audio_mode == "mute"
     bg_filename = "background.wav" if audio_mode == "separated" else "background_original.wav"
@@ -2280,7 +2308,7 @@ def _start_export(
                 logo_path = _social_asset_path(state.social_link.social_id, "logo")
         output_path = _export_dir(project_id) / "final.mp4"
         background_volume_db = original_audio_volume_db if audio_mode == "original" else None
-        music_volume_db = state.auto_music_volume_db
+        render_music_db = music_volume_db if music_volume_db is not None else state.auto_music_volume_db
 
         try:
             manifest_path = root / "audio" / "manifest.json"
@@ -2299,8 +2327,9 @@ def _start_export(
                 logo_path=logo_path,
                 min_video_speed=min_video_speed,
                 background_volume_db=background_volume_db,
-                music_volume_db=music_volume_db,
+                music_volume_db=render_music_db,
                 subtitle_font_size=subtitle_font_size,
+                blur_strength=blur_strength,
                 on_progress=on_render_progress,
                 job=job,
             )
@@ -2358,6 +2387,8 @@ def start_export_route(project_id: str, body: StartExportRequest | None = None):
         min_video_speed=(body.min_video_speed if body else 0.85),
         original_audio_volume_db=(body.original_audio_volume_db if body else -13.0),
         subtitle_font_size=(body.subtitle_font_size if body else 6),
+        blur_strength=(body.blur_strength if body else None),
+        music_volume_db=(body.music_volume_db if body else None),
     )
     if job is None:
         raise HTTPException(status_code=409, detail="Xuất video đang chạy cho dự án này")
@@ -2377,15 +2408,58 @@ def detect_export_blur_region(project_id: str):
     if not state.video_relpath:
         raise HTTPException(status_code=409, detail="Chưa có file video")
     video_path = pj.project_dir(project_id) / state.video_relpath
-    try:
-        region = ocr_stage.detect_subtitle_region(video_path)
-    except ocr_stage.TranscribeOCRError as err:
-        raise HTTPException(status_code=500, detail=str(err)) from err
-    if region is None:
-        raise HTTPException(status_code=422, detail="Không phát hiện được chữ phụ đề nào trong video")
-    with pj.locked_project(project_id) as s:
-        s.export_blur_region = list(region)
-    return {"status": "ok", "region": list(region)}
+    # Dò y hệt luồng tự động lúc xuất (`_detect_blur_region_and_ranges`): tôn
+    # trọng vùng quét OCR đã khoanh của project, và dò lại luôn các khoảng
+    # thời gian chữ gốc thật sự hiện. Chạy NỀN (job) thay vì giữ request chờ:
+    # 2 lượt OCR mất vài tới hơn 10 phút với video vài phút — trước đây giao
+    # diện chỉ hiện "Đang dò..." suốt thời gian đó, không có tiến độ, người
+    # dùng tưởng không có gì xảy ra. Giao diện theo dõi qua route .../status.
+    search_region = tuple(state.auto_ocr_crop_region) if state.auto_ocr_crop_region else None
+
+    def target(job: jobs.JobState) -> None:
+        def on_progress(done: int, total: int, label: str) -> None:
+            job.done_count = done
+            job.total = max(total, 1)
+            job.current_label = label
+
+        job.current_label = "Bắt đầu dò vùng phụ đề cũ..."
+        try:
+            region, ranges = _detect_blur_region_and_ranges(video_path, search_region=search_region, on_progress=on_progress)
+        except Exception as err:
+            logger.exception("Dò vùng che lỗi {}", project_id)
+            job.status, job.error = "failed", str(err)
+            return
+        if region is None:
+            job.status, job.error = "failed", "Không phát hiện được chữ phụ đề nào trong video"
+            return
+        with pj.locked_project(project_id) as s:
+            s.export_blur_region = list(region)
+            s.export_blur_active_ranges = [list(r) for r in ranges] if ranges else None
+        job.current_label = "Đã dò xong vùng che"
+        job.status = "done"
+
+    job = jobs.start_job(f"{project_id}:blur_detect", 1, target)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang dò vùng che cho project này")
+    return {"status": "started"}
+
+
+@app.get("/api/projects/{project_id}/export/detect-blur-region/status", response_model=JobStatusResponse)
+def detect_export_blur_region_status(project_id: str):
+    job = jobs.get_job(f"{project_id}:blur_detect")
+    if job is None:
+        return JobStatusResponse(registered=False)
+    status = job.status if job.is_alive() or job.status != "running" else "failed"
+    return JobStatusResponse(
+        registered=True,
+        status=status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[],
+        error=job.error or (None if status != "failed" or job.status != "running" else "Job dò bị dừng bất thường"),
+        started_at=job.started_at,
+    )
 
 
 @app.post("/api/projects/{project_id}/export/reveal")
@@ -2559,7 +2633,13 @@ def job_status(project_id: str, stage: str):
     # là "mồ côi" như nhau — đã xác nhận thật 1 lần (job đứng yên 0/97 nhiều
     # phút, CPU gần như không dùng, `request_cancel` báo "không có job đang
     # chạy" vì `is_alive()` đã False).
-    if job is not None and not job.is_alive():
+    # CHỈ coi là mồ côi khi thread đã chết mà status VẪN "running" (chết bất
+    # thường). Job kết thúc BÌNH THƯỜNG (status done/failed/cancelled) phải
+    # trả nguyên trạng thái — trước đây mọi job hết chạy đều bị coi là "không
+    # có job" (status null), giao diện không bao giờ thấy "done" nên không làm
+    # mới project: nút "Xuất lại video" kẹt ở "Đang xuất..." tới khi tải lại
+    # trang (người dùng phản ánh thật).
+    if job is not None and not job.is_alive() and job.status == "running":
         job = None
     if job is None:
         state = pj.load_project(project_id)
@@ -3035,6 +3115,10 @@ def update_social_route(social_id: str, body: UpdateSocialProjectRequest):
                 state.original_audio_volume_db = body.original_audio_volume_db
             if body.music_volume_db is not None:
                 state.music_volume_db = body.music_volume_db
+            if body.blur_strength is not None:
+                state.blur_strength = body.blur_strength
+            if body.caption_hashtags is not None:
+                state.caption_hashtags = body.caption_hashtags.strip()
             if body.subtitle_font_size is not None:
                 state.subtitle_font_size = body.subtitle_font_size
             if body.min_video_speed is not None:
@@ -3067,6 +3151,16 @@ def delete_social_route(social_id: str):
         sp.delete_social_project(social_id)
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+
+
+def _record_crawl_failure(social_id: str, error: str) -> None:
+    try:
+        with sp.locked_state(social_id) as s:
+            s.crawl_fail_count += 1
+            s.last_crawl_failed_at = datetime.now()
+            s.last_crawl_error = error[:300]
+    except FileNotFoundError:
+        pass
 
 
 def _start_social_crawl(social_id: str, limit: int | None = None) -> jobs.JobState | None:
@@ -3108,11 +3202,13 @@ def _start_social_crawl(social_id: str, limit: int | None = None) -> jobs.JobSta
                 )
         except jobs.JobCancelled:
             job.status = "cancelled"
+            _record_crawl_failure(social_id, "Đã dừng crawl giữa chừng")
             return
         except Exception as err:
             logger.exception("Crawl dự án tự động lỗi {}", social_id)
             job.status = "failed"
             job.error = str(err)
+            _record_crawl_failure(social_id, str(err))
             return
         finally:
             shutil.rmtree(dest_dir, ignore_errors=True)
@@ -3167,6 +3263,9 @@ def _start_social_crawl(social_id: str, limit: int | None = None) -> jobs.JobSta
                 ]
                 removed = before - len(s.queue)
             s.last_crawl_at = datetime.now()
+            s.crawl_fail_count = 0
+            s.last_crawl_failed_at = None
+            s.last_crawl_error = None
             if infos:
                 # API Douyin trả dữ liệu bình thường → không còn bị khoá.
                 s.douyin_backoff_level = 0
@@ -3286,6 +3385,7 @@ def _start_social_activate(social_id: str, aweme_id: str) -> dict:
         s.auto_audio_mode = social_state.audio_mode
         s.auto_original_audio_volume_db = social_state.original_audio_volume_db
         s.auto_music_volume_db = social_state.music_volume_db
+        s.auto_blur_strength = social_state.blur_strength
         s.auto_subtitle_font_size = social_state.subtitle_font_size
         s.auto_min_video_speed = social_state.min_video_speed
 
@@ -3481,6 +3581,32 @@ def skip_queue_item_route(social_id: str, aweme_id: str):
     return {"status": "ok"}
 
 
+@app.post("/api/social/{social_id}/queue/skip-bulk")
+def skip_queue_items_bulk_route(social_id: str, body: dict):
+    """Bỏ qua nhiều video 1 lượt (chọn nhiều trên màn danh sách) — cùng luật
+    với bỏ qua từng video: video đã đăng thì giữ nguyên, không báo lỗi cả lượt."""
+    ids = {str(x) for x in (body.get("aweme_ids") or []) if str(x).strip()}
+    if not ids:
+        raise HTTPException(status_code=400, detail="Chưa chọn video nào")
+    skipped = 0
+    kept_posted = 0
+    try:
+        with sp.locked_state(social_id) as state:
+            for item in state.queue:
+                if item.aweme_id not in ids or item.status == QueueItemStatus.skipped:
+                    continue
+                if item.status == QueueItemStatus.posted:
+                    kept_posted += 1
+                    continue
+                item.status = QueueItemStatus.skipped
+                item.error = None
+                item.failed_stage = None
+                skipped += 1
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {"status": "ok", "skipped": skipped, "kept_posted": kept_posted}
+
+
 @app.post("/api/social/{social_id}/queue/{aweme_id}/unskip")
 def unskip_queue_item_route(social_id: str, aweme_id: str):
     """Huỷ đánh dấu bỏ qua — trả video về `pending`, bộ lập lịch/nút "Kích
@@ -3554,30 +3680,84 @@ def douyin_browser_login_job_route():
 
 
 def _tiktok_profile_dir(social_id: str, state: object) -> Path:
+    account_id = getattr(state, "tiktok_account_id", "") or ""
+    if account_id:
+        account = acc_store.get_account(account_id)
+        if account is not None:
+            return Path(account.profile_dir)
     path = getattr(state, "tiktok_session_path", "") or ""
     return Path(path) if path else sp.social_dir(social_id) / "tiktok_profile"
 
 
-@app.get("/api/social/{social_id}/tiktok/status")
-def tiktok_login_status_route(social_id: str):
-    try:
-        state = sp.load_state(social_id)
-    except FileNotFoundError as err:
-        raise HTTPException(status_code=404, detail=str(err)) from err
-    profile_dir = _tiktok_profile_dir(social_id, state)
-    return {"logged_in": social_publish_stage.has_logged_in_session(profile_dir)}
+# ---- Tài khoản TikTok (trang "Tài khoản")
+# Mỗi tài khoản = 1 profile Chrome đăng nhập tay; app đọc ra @username/uid
+# qua social_publish.check_tiktok_account để biết dự án nào đang đăng lên tài
+# khoản nào, phát hiện hết đăng nhập sớm, và chặn đăng nhầm tài khoản.
+
+# Tự kiểm tra lại tài khoản đang gán cho dự án đang chạy sau mỗi ngần này giờ.
+ACCOUNT_CHECK_INTERVAL_H = 6.0
 
 
-@app.post("/api/social/{social_id}/tiktok/login", status_code=202)
-def tiktok_login_route(social_id: str):
+def _apply_account_check(
+    account_id: str, identity, error: str | None = None, allow_change: bool = False
+) -> None:
+    """Ghi kết quả 1 lần kiểm tra vào tài khoản. `identity=None` và không có
+    `error` = hết đăng nhập. Profile đăng nhập 1 tài khoản khác uid đã ghi
+    nhận → "mismatch" (chặn đăng), trừ khi vừa đăng nhập lại (`allow_change`)."""
     try:
-        state = sp.load_state(social_id)
-    except FileNotFoundError as err:
-        raise HTTPException(status_code=404, detail=str(err)) from err
-    profile_dir = _tiktok_profile_dir(social_id, state)
-    if not state.tiktok_session_path:
-        with sp.locked_state(social_id) as s:
-            s.tiktok_session_path = str(profile_dir)
+        with acc_store.locked_account(account_id) as a:
+            a.checked_at = datetime.now()
+            if error:
+                a.status, a.status_detail = "error", error
+            elif identity is None:
+                a.status, a.status_detail = "expired", "Chưa đăng nhập hoặc phiên đăng nhập đã hết hạn"
+            elif a.uid and identity.uid != a.uid and not allow_change:
+                a.status = "mismatch"
+                a.status_detail = (
+                    f"Profile đang đăng nhập @{identity.username}, khác tài khoản đã ghi nhận @{a.username} — "
+                    "bấm Đăng nhập lại để xác nhận tài khoản mới"
+                )
+            else:
+                a.status, a.status_detail = "ok", None
+                a.uid = identity.uid
+                a.username = identity.username
+                a.screen_name = identity.screen_name
+                a.avatar_url = identity.avatar_url
+    except FileNotFoundError:
+        pass
+
+
+def _run_account_check(account_id: str, allow_change: bool = False) -> None:
+    account = acc_store.get_account(account_id)
+    if account is None:
+        return
+    try:
+        identity = social_publish_stage.check_tiktok_account(Path(account.profile_dir))
+    except social_publish_stage.ProfileBusyError:
+        return  # đang đăng bài/đăng nhập — để lượt sau kiểm tra, không ghi lỗi
+    except Exception as err:
+        logger.warning("Kiểm tra tài khoản {} lỗi: {}", account_id, err)
+        _apply_account_check(account_id, None, error=str(err)[:300])
+        return
+    _apply_account_check(account_id, identity, allow_change=allow_change)
+
+
+def _start_account_check(account_id: str) -> jobs.JobState | None:
+    def target(job: jobs.JobState) -> None:
+        job.current_label = "Đang kiểm tra tài khoản..."
+        _run_account_check(account_id)
+        job.status = "done"
+
+    return jobs.start_job(f"account:{account_id}:check", 1, target)
+
+
+def _start_account_login(account_id: str) -> jobs.JobState | None:
+    account = acc_store.get_account(account_id)
+    if account is None:
+        raise FileNotFoundError(f'Không tìm thấy tài khoản "{account_id}"')
+    profile_dir = Path(account.profile_dir)
+    if jobs.is_job_running(f"account:{account_id}:view"):
+        return None
 
     def target(job: jobs.JobState) -> None:
         job.current_label = "Đang chờ bạn đăng nhập TikTok trong cửa sổ Chrome..."
@@ -3586,22 +3766,55 @@ def tiktok_login_route(social_id: str):
                 profile_dir, should_stop=lambda: job.cancel_event.is_set()
             )
         except Exception as err:
-            logger.exception("Đăng nhập TikTok lỗi {}", social_id)
+            logger.exception("Đăng nhập TikTok lỗi (tài khoản {})", account_id)
             job.status = "failed"
             job.error = str(err)
             return
+        # Đóng cửa sổ xong → đọc luôn tài khoản vừa đăng nhập để hiện @username.
+        job.current_label = "Đang đọc thông tin tài khoản vừa đăng nhập..."
+        _run_account_check(account_id, allow_change=True)
         job.status = "done"
         job.current_label = "Đã đóng cửa sổ đăng nhập"
 
-    job = jobs.start_job(f"social:{social_id}:tiktok_login", 1, target)
-    if job is None:
-        raise HTTPException(status_code=409, detail="Đang mở cửa sổ đăng nhập cho dự án này")
-    return {"status": "started"}
+    return jobs.start_job(f"account:{account_id}:login", 1, target)
 
 
-@app.get("/api/social/{social_id}/jobs/tiktok_login", response_model=JobStatusResponse)
-def tiktok_login_job_status(social_id: str):
-    job = jobs.get_job(f"social:{social_id}:tiktok_login")
+def _start_account_view(account_id: str) -> jobs.JobState | None:
+    """Mở Chrome thường (có cửa sổ) bằng profile của tài khoản, vào trang kênh
+    để người dùng tự xem — đóng cửa sổ xong thì kiểm tra lại trạng thái (không
+    chấp nhận đổi tài khoản như "Đăng nhập lại": đổi là báo sai tài khoản)."""
+    account = acc_store.get_account(account_id)
+    if account is None:
+        raise FileNotFoundError(f'Không tìm thấy tài khoản "{account_id}"')
+    if jobs.is_job_running(f"account:{account_id}:login"):
+        return None
+    profile_dir = Path(account.profile_dir)
+    url = f"https://www.tiktok.com/@{account.username}" if account.username else "https://www.tiktok.com/"
+
+    def target(job: jobs.JobState) -> None:
+        job.current_label = "Đang mở Chrome — đóng cửa sổ khi xem xong"
+        try:
+            social_publish_stage.login_tiktok_interactive(
+                profile_dir, timeout_s=3600, should_stop=lambda: job.cancel_event.is_set(), url=url
+            )
+        except Exception as err:
+            logger.exception("Mở xem tài khoản {} lỗi", account_id)
+            job.status = "failed"
+            job.error = str(err)
+            return
+        job.current_label = "Đang kiểm tra lại tài khoản..."
+        _run_account_check(account_id)
+        job.status = "done"
+        job.current_label = "Đã đóng cửa sổ"
+
+    return jobs.start_job(f"account:{account_id}:view", 1, target)
+
+
+def _account_window_open(account_id: str) -> bool:
+    return jobs.is_job_running(f"account:{account_id}:login") or jobs.is_job_running(f"account:{account_id}:view")
+
+
+def _job_status_response(job: jobs.JobState | None) -> JobStatusResponse:
     if job is None:
         return JobStatusResponse(registered=False)
     return JobStatusResponse(
@@ -3616,16 +3829,344 @@ def tiktok_login_job_status(social_id: str):
     )
 
 
-@app.post("/api/social/{social_id}/jobs/tiktok_login/cancel")
-def cancel_tiktok_login_route(social_id: str):
-    ok = jobs.request_cancel(f"social:{social_id}:tiktok_login")
+def _account_views() -> list[dict]:
+    accounts = acc_store.list_accounts()
+    assigned = acc_store.projects_by_account()
+    uid_count: dict[str, int] = {}
+    for a in accounts:
+        if a.uid:
+            uid_count[a.uid] = uid_count.get(a.uid, 0) + 1
+    return [
+        {
+            **a.model_dump(mode="json"),
+            "projects": [{"social_id": sid, "title": title} for sid, title in assigned.get(a.id, [])],
+            # Cùng 1 tài khoản TikTok thật (cùng uid) đăng nhập ở 2 profile →
+            # 2 dự án đăng chung 1 kênh, gấp đôi số bài/ngày.
+            "duplicate_uid": bool(a.uid) and uid_count.get(a.uid, 0) > 1,
+            "busy": _account_window_open(a.id) or jobs.is_job_running(f"account:{a.id}:check"),
+            "window_open": _account_window_open(a.id),
+        }
+        for a in accounts
+    ]
+
+
+def _account_view(account_id: str) -> dict | None:
+    return next((v for v in _account_views() if v["id"] == account_id), None)
+
+
+@app.get("/api/accounts")
+def list_accounts_route():
+    return _account_views()
+
+
+@app.post("/api/accounts", status_code=201)
+def create_account_route(body: dict):
+    account = acc_store.create_account(label=str(body.get("label") or ""))
+    return _account_view(account.id)
+
+
+@app.patch("/api/accounts/{account_id}")
+def update_account_route(account_id: str, body: dict):
+    try:
+        with acc_store.locked_account(account_id) as a:
+            if "label" in body:
+                a.label = str(body.get("label") or "").strip()
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return _account_view(account_id)
+
+
+@app.delete("/api/accounts/{account_id}")
+def delete_account_route(account_id: str):
+    assigned = acc_store.projects_by_account().get(account_id)
+    if assigned:
+        names = ", ".join(title for _, title in assigned)
+        raise HTTPException(status_code=409, detail=f"Tài khoản đang gán cho dự án: {names} — bỏ gán trước khi xoá")
+    if _account_window_open(account_id):
+        raise HTTPException(status_code=409, detail="Đang mở cửa sổ Chrome của tài khoản này")
+    try:
+        acc_store.delete_account(account_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {"status": "ok"}
+
+
+@app.post("/api/accounts/{account_id}/check", status_code=202)
+def check_account_route(account_id: str):
+    if acc_store.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    if _account_window_open(account_id):
+        raise HTTPException(status_code=409, detail="Đang mở cửa sổ Chrome của tài khoản này — đóng cửa sổ đó trước")
+    _start_account_check(account_id)
+    return {"status": "started"}
+
+
+@app.post("/api/accounts/{account_id}/login", status_code=202)
+def login_account_route(account_id: str):
+    try:
+        job = _start_account_login(account_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang mở cửa sổ đăng nhập cho tài khoản này")
+    return {"status": "started"}
+
+
+@app.post("/api/accounts/{account_id}/view", status_code=202)
+def view_account_route(account_id: str):
+    try:
+        job = _start_account_view(account_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if job is None:
+        raise HTTPException(status_code=409, detail="Cửa sổ Chrome của tài khoản này đang mở rồi")
+    return {"status": "started"}
+
+
+@app.get("/api/accounts/{account_id}/jobs/{kind}", response_model=JobStatusResponse)
+def account_job_status_route(account_id: str, kind: str):
+    if kind not in ("login", "check", "view"):
+        raise HTTPException(status_code=404, detail="Không có job này")
+    return _job_status_response(jobs.get_job(f"account:{account_id}:{kind}"))
+
+
+@app.post("/api/accounts/{account_id}/jobs/login/cancel")
+def cancel_account_login_route(account_id: str):
+    """Đóng cửa sổ Chrome của tài khoản — cửa sổ đăng nhập hoặc cửa sổ xem."""
+    ok = jobs.request_cancel(f"account:{account_id}:login") or jobs.request_cancel(f"account:{account_id}:view")
     return {"status": "ok" if ok else "not_running"}
 
 
-def _start_social_publish(social_id: str, aweme_id: str) -> jobs.JobState | None:
+@app.get("/api/social/{social_id}/tiktok/status")
+def tiktok_login_status_route(social_id: str):
+    try:
+        state = sp.load_state(social_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    profile_dir = _tiktok_profile_dir(social_id, state)
+    return {
+        "logged_in": social_publish_stage.has_logged_in_session(profile_dir),
+        "account": _account_view(state.tiktok_account_id) if state.tiktok_account_id else None,
+    }
+
+
+@app.put("/api/social/{social_id}/tiktok-account")
+def assign_tiktok_account_route(social_id: str, body: dict):
+    """Gán (hoặc bỏ gán với account_id rỗng) tài khoản TikTok cho dự án. 1 tài
+    khoản chỉ gán cho 1 dự án — 2 dự án chung 1 kênh là đăng gấp đôi."""
+    account_id = str(body.get("account_id") or "").strip()
+    if account_id:
+        if acc_store.get_account(account_id) is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+        others = [t for sid, t in acc_store.projects_by_account().get(account_id, []) if sid != social_id]
+        if others:
+            raise HTTPException(status_code=409, detail=f'Tài khoản này đang gán cho dự án "{others[0]}"')
+    if social_id in _running_job_suffix(":publish"):
+        raise HTTPException(status_code=409, detail="Dự án đang đăng bài — đợi đăng xong rồi đổi tài khoản")
+    try:
+        with sp.locked_state(social_id) as s:
+            s.tiktok_account_id = account_id
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return tiktok_login_status_route(social_id)
+
+
+@app.post("/api/social/{social_id}/tiktok/login", status_code=202)
+def tiktok_login_route(social_id: str):
+    """Đăng nhập TikTok ngay từ trang dự án: chưa gán tài khoản thì tạo tài
+    khoản mới rồi gán, sau đó mở cửa sổ đăng nhập của tài khoản đó."""
+    try:
+        state = sp.load_state(social_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    account_id = state.tiktok_account_id
+    if not account_id or acc_store.get_account(account_id) is None:
+        account_id = acc_store.create_account(label=state.title).id
+        with sp.locked_state(social_id) as s:
+            s.tiktok_account_id = account_id
+    if _start_account_login(account_id) is None:
+        raise HTTPException(status_code=409, detail="Đang mở cửa sổ đăng nhập cho tài khoản này")
+    return {"status": "started"}
+
+
+def _social_account_id(social_id: str) -> str:
+    try:
+        return sp.load_state(social_id).tiktok_account_id
+    except FileNotFoundError:
+        return ""
+
+
+@app.get("/api/social/{social_id}/jobs/tiktok_login", response_model=JobStatusResponse)
+def tiktok_login_job_status(social_id: str):
+    account_id = _social_account_id(social_id)
+    return _job_status_response(jobs.get_job(f"account:{account_id}:login") if account_id else None)
+
+
+@app.post("/api/social/{social_id}/jobs/tiktok_login/cancel")
+def cancel_tiktok_login_route(social_id: str):
+    account_id = _social_account_id(social_id)
+    ok = bool(account_id) and jobs.request_cancel(f"account:{account_id}:login")
+    return {"status": "ok" if ok else "not_running"}
+
+
+# ---- Đăng TikTok tay từ dự án đơn — chọn tài khoản + dán caption, đăng
+# thẳng video đã xuất (export/final.mp4), không qua hàng đợi/bộ lập lịch.
+
+# TikTok cho caption tối đa 4000 ký tự.
+TIKTOK_CAPTION_MAX = 4000
+
+
+@app.post("/api/projects/{project_id}/tiktok-publish", status_code=202)
+def publish_project_tiktok_route(project_id: str, body: dict):
+    try:
+        state = pj.load_project(project_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    account_id = str(body.get("account_id") or "").strip()
+    caption = str(body.get("caption") or "").strip()
+    account = acc_store.get_account(account_id) if account_id else None
+    if account is None:
+        raise HTTPException(status_code=400, detail="Chưa chọn tài khoản TikTok")
+    if account.status in ("expired", "mismatch"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tài khoản {('@' + account.username) if account.username else account.label} cần đăng nhập lại — vào trang Tài khoản",
+        )
+    if len(caption) > TIKTOK_CAPTION_MAX:
+        raise HTTPException(status_code=400, detail=f"Caption dài {len(caption)} ký tự, TikTok cho tối đa {TIKTOK_CAPTION_MAX}")
+    video_path = pj.project_dir(project_id) / "export" / "final.mp4"
+    if state.export.status != StageStatus.done or not video_path.exists():
+        raise HTTPException(status_code=409, detail="Chưa có video đã xuất — bấm Xuất video trước")
+    if jobs.is_job_running(f"{project_id}:export"):
+        raise HTTPException(status_code=409, detail="Đang xuất lại video — đợi xuất xong rồi đăng")
+
+    with pj.locked_project(project_id) as s:
+        s.tiktok_caption = caption
+
+    def target(job: jobs.JobState) -> None:
+        job.current_label = f"Đang đăng lên @{account.username or account.label}..."
+        try:
+            social_publish_stage.publish_tiktok(
+                video_path,
+                caption,
+                Path(account.profile_dir),
+                screenshot_dir=pj.project_dir(project_id) / "logs",
+                expected_uid=account.uid,
+            )
+        except social_publish_stage.AccountExpiredError as err:
+            _apply_account_check(account.id, None)
+            job.status, job.error = "failed", str(err)
+            return
+        except Exception as err:
+            if not isinstance(err, social_publish_stage.SocialPublishError):
+                logger.exception("Đăng TikTok lỗi (project {})", project_id)
+            job.status, job.error = "failed", str(err)
+            return
+        with pj.locked_project(project_id) as s:
+            s.tiktok_posts.append(
+                TikTokPostRecord(account_id=account.id, username=account.username, caption=caption, posted_at=datetime.now())
+            )
+        job.status = "done"
+        job.current_label = f"Đã đăng lên @{account.username or account.label}"
+
+    job = jobs.start_job(f"{project_id}:tiktok_publish", 1, target)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang đăng video này")
+    return {"status": "started"}
+
+
+@app.get("/api/projects/{project_id}/tiktok-publish/job", response_model=JobStatusResponse)
+def publish_project_tiktok_job_route(project_id: str):
+    return _job_status_response(jobs.get_job(f"{project_id}:tiktok_publish"))
+
+
+def _social_caption_inputs(project_id: str | None) -> tuple[str, dict[str, str]]:
+    """Lời thoại tiếng Việt + bảng tên riêng của project pipeline — nguồn để
+    viết caption bám đúng nội dung video."""
+    if not project_id:
+        return "", {}
+    root = pj.project_dir(project_id)
+    content = ""
+    try:
+        content = " ".join((c.text or "").strip() for c in load_srt(root / "sub_vi.srt") if (c.text or "").strip())
+    except Exception:
+        pass
+    entities: dict[str, str] = {}
+    try:
+        entities = json.loads((root / "entity_dict.json").read_text(encoding="utf-8")) or {}
+    except Exception:
+        pass
+    return content, entities
+
+
+def _parse_hashtags(text: str) -> list[str]:
+    return [t for t in re.split(r"[\s,;]+", text or "") if t.strip("#").strip()]
+
+
+def _generate_social_caption(social_id: str, aweme_id: str, project_id: str | None) -> str:
+    state = sp.load_state(social_id)
+    item = next((i for i in state.queue if i.aweme_id == aweme_id), None)
+    if item is None:
+        raise ValueError("Không tìm thấy video này trong hàng đợi")
+    content, entities = _social_caption_inputs(project_id or item.project_id)
+    caption = translate_stage.generate_caption(
+        item.title, content_vi=content, entity_dict=entities, fixed_hashtags=_parse_hashtags(state.caption_hashtags)
+    )
+    with sp.locked_state(social_id) as s:
+        for i in s.queue:
+            if i.aweme_id == aweme_id:
+                i.caption_vi = caption
+                # Dòng đầu (tiêu đề thu hút) làm tên hiển thị tiếng Việt.
+                i.title_vi = caption.splitlines()[0].strip() or i.title_vi
+                break
+    return caption
+
+
+@app.post("/api/social/{social_id}/queue/{aweme_id}/caption/generate")
+def generate_social_caption_route(social_id: str, aweme_id: str):
+    """Viết (lại) caption bằng Gemini để xem trước/sửa trước khi đăng."""
+    try:
+        return {"caption": _generate_social_caption(social_id, aweme_id, None)}
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+
+
+@app.put("/api/social/{social_id}/queue/{aweme_id}/caption")
+def save_social_caption_route(social_id: str, aweme_id: str, body: dict):
+    """Lưu caption người dùng sửa tay — lần đăng tới dùng đúng nội dung này."""
+    caption = str(body.get("caption") or "").strip()
+    if len(caption) > 2200:
+        raise HTTPException(status_code=400, detail="Caption TikTok tối đa 2200 ký tự")
+    try:
+        with sp.locked_state(social_id) as s:
+            item = next((i for i in s.queue if i.aweme_id == aweme_id), None)
+            if item is None:
+                raise HTTPException(status_code=404, detail="Không tìm thấy video này trong hàng đợi")
+            item.caption_vi = caption or None
+            if caption:
+                item.title_vi = caption.splitlines()[0].strip() or item.title_vi
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {"status": "ok", "caption": caption}
+
+
+def _ensure_social_caption(social_id: str, aweme_id: str, project_id: str | None) -> str:
+    """Caption đã có (viết từ trước / người dùng sửa) thì dùng lại, chưa có
+    thì viết mới — lần đăng lại không gọi Gemini nữa."""
+    state = sp.load_state(social_id)
+    item = next((i for i in state.queue if i.aweme_id == aweme_id), None)
+    if item is not None and item.caption_vi:
+        return item.caption_vi
+    return _generate_social_caption(social_id, aweme_id, project_id)
+
+
+def _start_social_publish(social_id: str, aweme_id: str, manual: bool = False) -> jobs.JobState | None:
     """Tách khỏi route để bộ lập lịch nền gọi lại y hệt logic bấm tay "Đăng
     lên TikTok" — raise ValueError (thông điệp tiếng Việt) cho lỗi tiền kiểm
-    tra, route dùng lại làm HTTPException detail."""
+    tra, route dùng lại làm HTTPException detail. `manual=True` (người dùng
+    bấm) đặt lại bộ đếm lỗi đăng liên tiếp, để bộ lập lịch lại được tự thử."""
     try:
         state = sp.load_state(social_id)
     except FileNotFoundError as err:
@@ -3641,20 +4182,10 @@ def _start_social_publish(social_id: str, aweme_id: str) -> jobs.JobState | None
     if not video_path.exists():
         raise ValueError("Không tìm thấy video đã xuất — kiểm tra lại project pipeline")
     profile_dir = _tiktok_profile_dir(social_id, state)
+    account = acc_store.get_account(state.tiktok_account_id) if state.tiktok_account_id else None
+    expected_uid = account.uid if account else ""
 
-    # Dịch tiêu đề (thường tiếng Trung) sang tiếng Việt NGAY TRƯỚC LÚC đăng —
-    # người dùng chốt: chỉ dịch khi thật sự chuẩn bị đăng bài, không phải lúc
-    # kích hoạt (xem comment ở `_start_social_activate`). Dịch lười theo
-    # nghĩa hẹp hơn nữa — nếu đã dịch từ lần đăng thử trước (item.title_vi có
-    # sẵn), dùng lại luôn, không gọi lại Gemini.
-    title_vi = item.title_vi or translate_stage.translate_title(item.title)
-    if title_vi != item.title_vi:
-        with sp.locked_state(social_id) as s_title:
-            for i in s_title.queue:
-                if i.aweme_id == aweme_id:
-                    i.title_vi = title_vi
-                    break
-    caption = title_vi or item.title or ""
+    project_id_for_caption = item.project_id
 
     # Xoá lỗi cũ (nếu có, vd từ lần đăng thất bại trước) ngay khi bắt đầu thử
     # lại — nếu không, lỗi cũ tồn tại vĩnh viễn trên UI kể cả sau khi đăng
@@ -3665,36 +4196,69 @@ def _start_social_publish(social_id: str, aweme_id: str) -> jobs.JobState | None
             if i.aweme_id == aweme_id:
                 i.error = None
                 i.failed_stage = None
+                # Đăng lỗi vẫn là "sẵn sàng đăng" — video cũ từng bị chuyển
+                # sang "lỗi" ở bước đăng thì đưa về lại.
+                if i.status == QueueItemStatus.failed:
+                    i.status = QueueItemStatus.ready
+                if manual:
+                    i.publish_fail_count = 0
                 break
 
+    def mark_publish_failed(job: jobs.JobState, err: BaseException) -> None:
+        job.status = "failed"
+        job.error = str(err)
+        with sp.locked_state(social_id) as s:
+            for i in s.queue:
+                if i.aweme_id == aweme_id:
+                    i.status = QueueItemStatus.ready
+                    i.publish_error = str(err)
+                    i.publish_failed_at = datetime.now()
+                    i.publish_fail_count += 1
+                    break
+
     def target(job: jobs.JobState) -> None:
+        job.current_label = "Đang viết caption..."
+        try:
+            caption = _ensure_social_caption(social_id, aweme_id, project_id_for_caption)
+        except Exception as err:
+            logger.exception("Viết caption lỗi {}", social_id)
+            mark_publish_failed(job, err)
+            return
         job.current_label = "Đang đăng video lên TikTok..."
         try:
             social_publish_stage.publish_tiktok(
-                video_path, caption, profile_dir, screenshot_dir=sp.social_dir(social_id) / "logs"
+                video_path,
+                caption,
+                profile_dir,
+                screenshot_dir=sp.social_dir(social_id) / "logs",
+                expected_uid=expected_uid,
             )
-        except social_publish_stage.SocialPublishError as err:
+        except social_publish_stage.AccountExpiredError as err:
+            if account:
+                _apply_account_check(account.id, None)
+            mark_publish_failed(job, err)
+            return
+        except social_publish_stage.AccountMismatchError as err:
+            if account:
+                try:
+                    with acc_store.locked_account(account.id) as a:
+                        a.status, a.status_detail, a.checked_at = "mismatch", str(err), datetime.now()
+                except FileNotFoundError:
+                    pass
+            mark_publish_failed(job, err)
+            return
+        except social_publish_stage.ProfileBusyError as err:
+            # Profile đang bị cửa sổ khác giữ — không phải lỗi đăng, không tính
+            # vào số lần lỗi; tick sau tự thử lại.
             job.status = "failed"
             job.error = str(err)
-            with sp.locked_state(social_id) as s:
-                for i in s.queue:
-                    if i.aweme_id == aweme_id:
-                        i.status = QueueItemStatus.failed
-                        i.error = str(err)
-                        i.failed_stage = "publish"
-                        break
+            return
+        except social_publish_stage.SocialPublishError as err:
+            mark_publish_failed(job, err)
             return
         except Exception as err:
             logger.exception("Đăng TikTok lỗi {}", social_id)
-            job.status = "failed"
-            job.error = str(err)
-            with sp.locked_state(social_id) as s:
-                for i in s.queue:
-                    if i.aweme_id == aweme_id:
-                        i.status = QueueItemStatus.failed
-                        i.error = str(err)
-                        i.failed_stage = "publish"
-                        break
+            mark_publish_failed(job, err)
             return
 
         job.status = "done"
@@ -3705,6 +4269,9 @@ def _start_social_publish(social_id: str, aweme_id: str) -> jobs.JobState | None
                 if i.aweme_id == aweme_id:
                     i.status = QueueItemStatus.posted
                     i.posted_at = datetime.now()
+                    i.publish_error = None
+                    i.publish_failed_at = None
+                    i.publish_fail_count = 0
                     break
 
     return jobs.start_job(f"social:{social_id}:{aweme_id}:publish", 1, target)
@@ -3713,7 +4280,7 @@ def _start_social_publish(social_id: str, aweme_id: str) -> jobs.JobState | None
 @app.post("/api/social/{social_id}/queue/{aweme_id}/publish", status_code=202)
 def publish_queue_item_route(social_id: str, aweme_id: str):
     try:
-        job = _start_social_publish(social_id, aweme_id)
+        job = _start_social_publish(social_id, aweme_id, manual=True)
     except ValueError as err:
         raise HTTPException(status_code=409, detail=str(err)) from err
     if job is None:
@@ -3806,6 +4373,19 @@ def _wait_for_douyin_api_slot() -> None:
 SOCIAL_CRAWL_JITTER_H = 2.0
 
 
+# Crawl lỗi/bị huỷ liên tiếp → nghỉ lần lượt ngần này giờ rồi mới tự thử lại
+# (bấm "Crawl ngay" vẫn chạy ngay). Trước đây không nghỉ: crawl lỗi (vd đóng
+# cửa sổ Chrome đang cuộn) thì vài phút sau lại tự mở Chrome, lặp mãi.
+SOCIAL_CRAWL_RETRY_HOURS = (1.0, 3.0, 6.0, 12.0)
+
+
+def _crawl_retry_at(state) -> datetime | None:
+    if not state.crawl_fail_count or state.last_crawl_failed_at is None:
+        return None
+    hours = SOCIAL_CRAWL_RETRY_HOURS[min(state.crawl_fail_count, len(SOCIAL_CRAWL_RETRY_HOURS)) - 1]
+    return state.last_crawl_failed_at + timedelta(hours=hours)
+
+
 def _crawl_due(last_crawl_at: datetime | None, now: datetime) -> bool:
     if last_crawl_at is None:
         return True
@@ -3864,6 +4444,11 @@ def _compute_next_post_at(after: datetime, posts_per_day: int) -> datetime:
 # giây → coi là bị gián đoạn (vd server khởi động lại giữa chừng) và đánh
 # dấu lỗi, nếu không nó sẽ chặn cả hàng đợi chung mãi mãi.
 SOCIAL_STUCK_GRACE_S = 180.0
+
+# Video sẵn sàng đăng mà đăng TikTok lỗi: tự thử lại sau ngần này phút, tối đa
+# ngần này lần liên tiếp rồi chờ người dùng bấm "Đăng lại".
+SOCIAL_PUBLISH_RETRY_MIN = 30
+SOCIAL_PUBLISH_MAX_AUTO_RETRY = 3
 _stuck_since: dict[str, float] = {}
 
 _STAGE_LABELS = {
@@ -3937,6 +4522,41 @@ def _recover_stuck_items(states: list) -> bool:
     for key in list(_stuck_since):
         if key not in alive:
             _stuck_since.pop(key, None)
+
+    # Video từng bị chuyển sang "lỗi" ở bước ĐĂNG (cách cũ) mà vẫn còn video
+    # thành phẩm → đưa về "sẵn sàng đăng", giữ lỗi đăng để hiển thị. Đăng lỗi
+    # không phải video lỗi (người dùng chốt) — nó không được làm dừng dự án.
+    for st in states:
+        for it in st.queue:
+            if not (it.status == QueueItemStatus.failed and it.failed_stage == "publish"):
+                continue
+            if not (it.project_id and (pj.project_dir(it.project_id) / "export" / "final.mp4").exists()):
+                # Không còn video thành phẩm (vd đã bị tự dọn khi còn bị coi là
+                # video lỗi) → không đăng lại được, phải xử lý lại từ đầu: đổi
+                # sang lỗi ở bước kích hoạt để giao diện hiện nút "Thử lại".
+                try:
+                    with sp.locked_state(st.id) as s:
+                        for i in s.queue:
+                            if i.aweme_id == it.aweme_id and i.status == QueueItemStatus.failed:
+                                i.failed_stage = "activate"
+                                i.error = f"Không còn video thành phẩm để đăng lại (lỗi đăng trước đó: {i.error}) — bấm Thử lại để xử lý lại"
+                    changed = True
+                except FileNotFoundError:
+                    pass
+                continue
+            try:
+                with sp.locked_state(st.id) as s:
+                    for i in s.queue:
+                        if i.aweme_id == it.aweme_id and i.status == QueueItemStatus.failed:
+                            i.status = QueueItemStatus.ready
+                            i.publish_error = i.error
+                            i.publish_failed_at = datetime.now()
+                            i.publish_fail_count = max(i.publish_fail_count, 1)
+                            i.error = None
+                            i.failed_stage = None
+                changed = True
+            except FileNotFoundError:
+                pass
 
     # Video `ready` mà file thành phẩm không còn (project pipeline bị xoá tay)
     # → không bao giờ đăng được: đăng tay bị từ chối, bộ lập lịch thử lại mãi
@@ -4070,18 +4690,55 @@ def _publish_plan(states: list, now: datetime) -> list[dict]:
     plan: list[dict] = []
     in_window = _in_posting_window(now)
     today = now.date()
+    accounts = {a.id: a for a in acc_store.list_accounts()}
     for st in states:
         if st.status != "active":
             continue
-        ready = sorted((i for i in st.queue if i.status == QueueItemStatus.ready), key=_video_age_key)
+        account = accounts.get(st.tiktok_account_id) if st.tiktok_account_id else None
+        # Bỏ qua video mà project của nó đang chạy 1 bước (vd người dùng bấm
+        # "Xuất lại video"): file final.mp4 đang ghi dở, đăng lúc này sẽ lỗi
+        # hoặc đăng bản hỏng. Xuất xong nó tự quay lại lượt đăng.
+        running = jobs.running_keys()
+        ready = sorted(
+            (
+                i for i in st.queue
+                if i.status == QueueItemStatus.ready
+                and not (i.project_id and any(k.startswith(f"{i.project_id}:") for k in running))
+            ),
+            key=_video_age_key,
+        )
         posted_today = _posted_today(st, today)
         due_time = st.next_post_at is None or now >= st.next_post_at
+        head = ready[0] if ready else None
+        publish_error = head.publish_error if head else None
+        retry_at = (
+            head.publish_failed_at + timedelta(minutes=SOCIAL_PUBLISH_RETRY_MIN)
+            if head and head.publish_error and head.publish_failed_at
+            else None
+        )
         if posted_today >= max(st.posts_per_day, 1):
             status = "done_today"
         elif not ready:
             status = "no_ready"
+        elif account is None:
+            status = "no_account"
+        elif account.status in ("expired", "mismatch"):
+            # Biết trước là sẽ lỗi — không mở Chrome thử đăng cho tốn lượt
+            # thử lại, chờ người dùng đăng nhập lại/kiểm tra ở trang Tài khoản.
+            status = "account_problem"
+        elif _account_window_open(account.id):
+            # Người dùng đang mở cửa sổ Chrome của tài khoản (Xem/Đăng nhập) —
+            # Chrome không cho 2 nơi mở chung 1 profile, chờ đóng rồi mới đăng.
+            status = "account_busy"
+        elif head.publish_error and head.publish_fail_count >= SOCIAL_PUBLISH_MAX_AUTO_RETRY:
+            # Đăng lỗi nhiều lần liên tiếp — ngừng tự thử (tránh mở Chrome
+            # liên tục khi vd tài khoản TikTok bị đăng xuất), chờ người dùng
+            # bấm "Đăng lại". Giữ đúng thứ tự: không nhảy sang video sau.
+            status = "needs_manual"
         elif not due_time:
             status = "scheduled"
+        elif retry_at and now < retry_at:
+            status = "retry_wait"
         elif not in_window:
             status = "waiting_window"
         else:
@@ -4097,9 +4754,28 @@ def _publish_plan(states: list, now: datetime) -> list[dict]:
             "aweme_id": ready[0].aweme_id if ready else None,
             "video_title": (ready[0].title if ready else "") or "",
             "status": status,
+            "publish_error": publish_error,
+            "publish_fail_count": head.publish_fail_count if head else 0,
+            "retry_at": retry_at,
+            "account_username": account.username if account else "",
+            "account_status": account.status if account else None,
         })
     plan.sort(key=lambda e: e["next_post_at"] or datetime.min)
     return plan
+
+
+def _maybe_check_accounts(active: list, now: datetime) -> None:
+    if any(k.startswith("account:") for k in jobs.running_keys()):
+        return
+    wanted = {st.tiktok_account_id for st in active if st.tiktok_account_id}
+    stale = [
+        a for a in acc_store.list_accounts()
+        if a.id in wanted
+        and (a.checked_at is None or now - a.checked_at >= timedelta(hours=ACCOUNT_CHECK_INTERVAL_H))
+    ]
+    stale.sort(key=lambda a: a.checked_at or datetime.min)
+    if stale:
+        _start_account_check(stale[0].id)
 
 
 def _social_scheduler_tick() -> None:
@@ -4133,7 +4809,12 @@ def _social_scheduler_tick() -> None:
     # 1) Crawl — 1 lượt tại 1 thời điểm cho cả hệ thống, dự án lâu chưa
     # crawl nhất được ưu tiên.
     if not _running_job_suffix(":crawl"):
-        due = [st for st in active if not _douyin_resting(st, now) and _crawl_due(st.last_crawl_at, now)]
+        due = [
+            st for st in active
+            if not _douyin_resting(st, now)
+            and _crawl_due(st.last_crawl_at, now)
+            and not ((retry := _crawl_retry_at(st)) and now < retry)
+        ]
         due.sort(key=lambda st: st.last_crawl_at or datetime.min)
         for st in due[:1]:
             try:
@@ -4178,7 +4859,11 @@ def _social_scheduler_tick() -> None:
                 logger.exception("social scheduler: kích hoạt lỗi cho '{}'", entry["social_id"])
                 break
 
-    # 3) Đăng bài — 1 bài tại 1 thời điểm, chỉ trong khung giờ đăng, dự án
+    # 3) Kiểm tra tài khoản TikTok của dự án đang chạy (mỗi tick tối đa 1, cũ
+    # nhất trước) — phát hiện hết đăng nhập TRƯỚC giờ đăng thay vì lúc đăng lỗi.
+    _maybe_check_accounts(active, now)
+
+    # 4) Đăng bài — 1 bài tại 1 thời điểm, chỉ trong khung giờ đăng, dự án
     # trễ giờ hẹn lâu nhất được đăng trước.
     if not _running_job_suffix(":publish"):
         for entry in (e for e in _publish_plan(active, now) if e["status"] == "due"):
@@ -4331,7 +5016,10 @@ def social_monitor_route():
                     "social_id": st.id,
                     "social_title": st.title,
                     "last_crawl_at": st.last_crawl_at,
-                    "next_crawl_at": _next_crawl_at(st.last_crawl_at),
+                    "next_crawl_at": max(
+                        (t for t in (_next_crawl_at(st.last_crawl_at), _crawl_retry_at(st)) if t), default=None
+                    ),
+                    "last_crawl_error": st.last_crawl_error,
                     "active": st.status == "active",
                 }
                 for st in states
@@ -4363,6 +5051,10 @@ def _social_scheduler_loop() -> None:
 
 @app.on_event("startup")
 def _start_social_scheduler() -> None:
+    try:
+        acc_store.migrate_legacy_profiles()
+    except Exception:
+        logger.exception("accounts: chuyển profile TikTok cũ sang trang Tài khoản lỗi")
     threading.Thread(target=_social_scheduler_loop, daemon=True).start()
 
 

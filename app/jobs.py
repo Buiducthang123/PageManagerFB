@@ -45,6 +45,14 @@ class JobState:
 
 _jobs: dict[str, JobState] = {}
 _jobs_guard = threading.Lock()
+# Job của thread hiện tại — để code ở tầng sâu (vd lời gọi Gemini trong
+# translate.py) tự biết người dùng đã bấm Dừng mà không phải truyền job xuống
+# qua mọi hàm.
+_current = threading.local()
+
+
+def current_job() -> Optional[JobState]:
+    return getattr(_current, "job", None)
 
 
 def start_job(key: str, total: int, target: Callable[[JobState], None]) -> Optional[JobState]:
@@ -55,7 +63,11 @@ def start_job(key: str, total: int, target: Callable[[JobState], None]) -> Optio
         job = JobState(total=total)
         _jobs[key] = job
 
-    thread = threading.Thread(target=target, args=(job,), daemon=True)
+    def run() -> None:
+        _current.job = job
+        target(job)
+
+    thread = threading.Thread(target=run, daemon=True)
     job.thread = thread
     thread.start()
     return job

@@ -70,12 +70,16 @@ export interface ProjectState {
   auto_audio_mode: AudioMode
   auto_original_audio_volume_db: number
   auto_subtitle_font_size: number
+  auto_blur_strength?: number | null
+  auto_music_volume_db?: number | null
   auto_min_video_speed: number
   split_mode: boolean
   // "Xuất video trực tiếp" (ffmpeg, không qua CapCut) — hành động PHỤ, tách
   // riêng khỏi `stages`/STAGE_ORDER (xem app/models.py::ProjectState.export).
   export: StageRecord
   export_blur_region: number[] | null
+  tiktok_caption?: string
+  tiktok_posts?: { account_id: string; username: string; caption: string; posted_at: string }[]
 }
 
 export interface ProjectSummary {
@@ -207,6 +211,10 @@ export interface QueueItem {
   error: string | null
   failed_stage: 'activate' | 'publish' | null
   files_cleaned_at?: string | null
+  publish_error?: string | null
+  publish_failed_at?: string | null
+  publish_fail_count?: number
+  caption_vi?: string | null
 }
 
 export interface SocialProjectSummary {
@@ -226,17 +234,23 @@ export interface SocialProjectState extends SocialProjectSummary {
   audio_mode: string
   original_audio_volume_db: number
   music_volume_db: number
+  blur_strength: number
+  caption_hashtags: string
   subtitle_font_size: number
   min_video_speed: number
   use_viesnap_fallback: boolean
   crawl_via_browser: boolean
   queue: QueueItem[]
   last_crawl_at: string | null
+  crawl_fail_count?: number
+  last_crawl_failed_at?: string | null
+  last_crawl_error?: string | null
   last_post_at: string | null
   next_post_at: string | null
   douyin_backoff_until: string | null
   douyin_backoff_level: number
   tiktok_session_path: string
+  tiktok_account_id: string
   facebook_page_id: string
   facebook_page_token: string
 }
@@ -280,7 +294,42 @@ export interface MonitorPublishEntry {
   ready_count: number
   aweme_id: string | null
   video_title: string
-  status: 'no_ready' | 'scheduled' | 'waiting_window' | 'due' | 'done_today'
+  status:
+    | 'no_ready'
+    | 'scheduled'
+    | 'waiting_window'
+    | 'due'
+    | 'done_today'
+    | 'retry_wait'
+    | 'needs_manual'
+    | 'no_account'
+    | 'account_problem'
+    | 'account_busy'
+  publish_error?: string | null
+  publish_fail_count?: number
+  retry_at?: string | null
+  account_username?: string
+  account_status?: AccountStatus | null
+}
+
+export type AccountStatus = 'unknown' | 'ok' | 'expired' | 'mismatch' | 'error'
+
+export interface TikTokAccount {
+  id: string
+  label: string
+  profile_dir: string
+  username: string
+  screen_name: string
+  uid: string
+  avatar_url: string
+  status: AccountStatus
+  status_detail: string | null
+  checked_at: string | null
+  created_at: string
+  projects: { social_id: string; title: string }[]
+  duplicate_uid: boolean
+  busy: boolean
+  window_open: boolean
 }
 
 export interface MonitorJobRow {
@@ -503,18 +552,27 @@ export const api = {
     minVideoSpeed: number,
     originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
     subtitleFontSize: number = DEFAULT_SUBTITLE_FONT_SIZE,
+    blurStrength?: number,
+    musicVolumeDb?: number,
   ) =>
     postJson<{ status: string }>(`/api/projects/${id}/export`, {
       audio_mode: audioMode,
       min_video_speed: minVideoSpeed,
       original_audio_volume_db: originalAudioVolumeDb,
       subtitle_font_size: subtitleFontSize,
+      blur_strength: blurStrength,
+      music_volume_db: musicVolumeDb,
     }),
   updateExportBlurRegion: (id: string, region: number[] | null) =>
     postJson<{ status: string }>(`/api/projects/${id}/export/blur-region`, { region }),
   detectExportBlurRegion: (id: string) =>
-    postJson<{ status: string; region: number[] }>(`/api/projects/${id}/export/detect-blur-region`, {}),
+    postJson<{ status: string }>(`/api/projects/${id}/export/detect-blur-region`, {}),
+  detectExportBlurRegionStatus: (id: string) =>
+    request<JobStatus>(`/api/projects/${id}/export/detect-blur-region/status`),
   revealExportVideo: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/export/reveal`),
+  publishProjectTiktok: (id: string, accountId: string, caption: string) =>
+    postJson<{ status: string }>(`/api/projects/${id}/tiktok-publish`, { account_id: accountId, caption }),
+  projectTiktokPublishJob: (id: string) => request<JobStatus>(`/api/projects/${id}/tiktok-publish/job`),
   uploadExportMusic: (id: string, file: File) => {
     const form = new FormData()
     form.append('file', file)
@@ -657,6 +715,8 @@ export const api = {
       audio_mode: string
       original_audio_volume_db: number
       music_volume_db: number
+      blur_strength: number
+      caption_hashtags: string
       subtitle_font_size: number
       min_video_speed: number
       use_viesnap_fallback: boolean
@@ -687,9 +747,20 @@ export const api = {
   activateQueueItem: (id: string, awemeId: string) =>
     postJson<{ status: string; project_id: string }>(`/api/social/${id}/queue/${awemeId}/activate`),
   skipQueueItem: (id: string, awemeId: string) => postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/skip`),
+  skipQueueItems: (id: string, awemeIds: string[]) =>
+    postJson<{ status: string; skipped: number; kept_posted: number }>(`/api/social/${id}/queue/skip-bulk`, {
+      aweme_ids: awemeIds,
+    }),
   unskipQueueItem: (id: string, awemeId: string) =>
     postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/unskip`),
   socialMonitor: () => request<SocialMonitor>('/api/social-monitor'),
+  generateSocialCaption: (id: string, awemeId: string) =>
+    postJson<{ caption: string }>(`/api/social/${id}/queue/${awemeId}/caption/generate`),
+  saveSocialCaption: (id: string, awemeId: string, caption: string) =>
+    request<{ status: string }>(`/api/social/${id}/queue/${awemeId}/caption`, {
+      method: 'PUT',
+      body: JSON.stringify({ caption }),
+    }),
   socialCleanupPlan: (id: string) => request<SocialCleanupPlan>(`/api/social/${id}/cleanup-plan`),
   cleanupOverview: () => request<CleanupOverview>('/api/cleanup'),
   cleanupDelete: (projectIds: string[], mode: 'files' | 'project') =>
@@ -703,7 +774,22 @@ export const api = {
   douyinBrowserStatus: () => request<DouyinBrowserStatus>('/api/douyin-browser/status'),
   douyinBrowserLogin: () => postJson<{ status: string }>('/api/douyin-browser/login'),
   douyinBrowserLoginJob: () => request<JobStatus>('/api/douyin-browser/login-job'),
-  tiktokLoginStatus: (id: string) => request<{ logged_in: boolean }>(`/api/social/${id}/tiktok/status`),
+  tiktokLoginStatus: (id: string) =>
+    request<{ logged_in: boolean; account: TikTokAccount | null }>(`/api/social/${id}/tiktok/status`),
+  assignTiktokAccount: (id: string, accountId: string) =>
+    request<{ logged_in: boolean; account: TikTokAccount | null }>(`/api/social/${id}/tiktok-account`, {
+      method: 'PUT',
+      body: JSON.stringify({ account_id: accountId }),
+    }),
+  listAccounts: () => request<TikTokAccount[]>('/api/accounts'),
+  createAccount: (label: string) => postJson<TikTokAccount>('/api/accounts', { label }),
+  updateAccount: (id: string, label: string) =>
+    request<TikTokAccount>(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify({ label }) }),
+  deleteAccount: (id: string) => request<{ status: string }>(`/api/accounts/${id}`, { method: 'DELETE' }),
+  checkAccount: (id: string) => postJson<{ status: string }>(`/api/accounts/${id}/check`),
+  loginAccount: (id: string) => postJson<{ status: string }>(`/api/accounts/${id}/login`),
+  viewAccount: (id: string) => postJson<{ status: string }>(`/api/accounts/${id}/view`),
+  cancelAccountLogin: (id: string) => postJson<{ status: string }>(`/api/accounts/${id}/jobs/login/cancel`),
   tiktokLogin: (id: string) => postJson<{ status: string }>(`/api/social/${id}/tiktok/login`),
   tiktokLoginJobStatus: (id: string) => request<JobStatus>(`/api/social/${id}/jobs/tiktok_login`),
   cancelTiktokLogin: (id: string) => postJson<{ status: string }>(`/api/social/${id}/jobs/tiktok_login/cancel`),
