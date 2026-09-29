@@ -454,13 +454,19 @@ trong danh sách này:
     prompt = f"""Bạn là dịch giả chuyên nghiệp zh→vi cho video reup. Bản dịch sẽ được đọc thành
 giọng nói (TTS) — văn phong phải TỰ NHIÊN khi đọc to, không dịch máy móc từng chữ.
 
-Làm CẢ 3 việc trong 1 JSON:
+Làm CẢ 4 việc trong 1 JSON:
 1. entity_dict: tên riêng (người/địa danh/công ty/nickname) → phiên âm tiếng Việt nhất quán.
    Không có thì {{}}. Nếu câu nguồn có cụm rõ ràng bị nghe nhầm (lỗi ASR) và nghi là tên riêng —
    giữ dạng phiên âm hợp lý, TUYỆT ĐỐI KHÔNG dịch nghĩa đen thành từ thật không liên quan ngữ cảnh.
-2. Clean từng câu: bỏ filler, sửa lỗi nghe nhầm rõ ràng (đặc biệt lỗi đồng âm tiếng Trung).
-3. Dịch đủ MỌI câu, giữ đúng id, áp dụng entity_dict nhất quán cho MỌI lần tên đó xuất hiện —
-   KHÔNG được bỏ tên riêng thay bằng đại từ/mô tả mơ hồ. Giữ giọng điệu gốc (cảm thán, tiếng lóng
+2. Clean từng câu: bỏ filler, sửa lỗi nghe nhầm rõ ràng (đặc biệt lỗi đồng âm tiếng Trung). Câu
+   nguồn có thể tới từ OCR phụ đề cứng trên khung hình — sửa luôn lỗi đọc nhầm ký tự rõ ràng của
+   OCR (vd nét chữ giống nhau bị lẫn, phồn thể/giản thể lẫn lộn) dựa vào ngữ cảnh câu.
+3. Loại rác OCR: nếu câu nguồn là rác thật sự — không phải câu thoại/phụ đề có nghĩa (vd chỉ vài
+   ký tự vô nghĩa do đọc lệch khung hình, watermark/tên kênh/đường link lẫn vào vùng phụ đề, ký tự
+   lặp/nhiễu không tạo thành câu nào) — trả "text_vi" RỖNG ("") cho đúng id đó thay vì cố dịch. CHỈ
+   bỏ khi chắc chắn là rác, KHÔNG bỏ câu thoại ngắn nhưng có nghĩa (vd cảm thán "啊", "什么").
+4. Dịch đủ MỌI câu còn lại, giữ đúng id, áp dụng entity_dict nhất quán cho MỌI lần tên đó xuất hiện
+   — KHÔNG được bỏ tên riêng thay bằng đại từ/mô tả mơ hồ. Giữ giọng điệu gốc (cảm thán, tiếng lóng
    bình luận game) nhưng làm mềm ngôn từ tục tĩu quá mức để phù hợp kiểm duyệt Facebook.{known_block}
 
 Câu nguồn:

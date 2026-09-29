@@ -165,3 +165,28 @@ def apply_whisper_cache_env() -> Path:
 
 
 apply_whisper_cache_env()
+
+# Facebook Page (Reels) — Graph API. App ID/Secret CHỈ cần khi dán user token
+# ngắn hạn (~1-2h) và muốn tool tự đổi sang token dài hạn — không bắt buộc
+# (dán token đã "Extend" sẵn ở Access Token Debugger thì không cần), và không
+# được đóng gói vào bản build gửi khách.
+FB_GRAPH_VERSION = os.environ.get("FB_GRAPH_VERSION", "v21.0").strip() or "v21.0"
+FB_APP_ID = os.environ.get("FB_APP_ID", "").strip()
+FB_APP_SECRET = os.environ.get("FB_APP_SECRET", "").strip()
+# Đăng nhập Facebook (OAuth) ngay trong tool: ngrok trỏ vào cổng frontend
+# (5175, Vite chuyển /api sang backend). FB_REDIRECT_URI="auto" (mặc định) =
+# tự hỏi ngrok đang chạy tên miền hiện tại (xem facebook_publish.resolve_redirect_uri);
+# URI https://<tên-miền>/api/facebook/callback phải khai báo y hệt trong
+# Meta App > Facebook Login > Valid OAuth Redirect URIs.
+FB_REDIRECT_URI = os.environ.get("FB_REDIRECT_URI", "auto").strip()
+FB_LOGIN_SCOPES = os.environ.get(
+    "FB_LOGIN_SCOPES",
+    "pages_show_list,pages_read_engagement,pages_manage_posts,pages_manage_engagement,pages_manage_metadata",
+).strip()
+# Đăng nhập xong quay về đây (không ở lại tên miền ngrok).
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5175").strip().rstrip("/")
+# File pages.json của PagesManagerSupperTool (đã đăng nhập Facebook qua OAuth
+# + ngrok) — nút "Nhập từ PagesManager" đọc token Page từ đây.
+PAGES_MANAGER_PAGES_JSON = os.environ.get(
+    "PAGES_MANAGER_PAGES_JSON", r"D:\PagesManagerSupperTool\backend\data\pages.json"
+).strip()

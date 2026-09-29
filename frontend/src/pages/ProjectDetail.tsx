@@ -31,6 +31,7 @@ import HorizontalStepper from '../components/HorizontalStepper'
 import CollapsibleStageSection from '../components/CollapsibleStageSection'
 import DirectExportPanel from '../components/DirectExportPanel'
 import TikTokPublishPanel from '../components/TikTokPublishPanel'
+import FacebookPublishPanel from '../components/FacebookPublishPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
 
 // Trạng thái tổng hợp của 1 tập/đoạn — dùng cho chấm màu ở sidebar: có bước
@@ -1200,6 +1201,22 @@ export default function ProjectDetail() {
           defaultExpanded={false}
         >
           <TikTokPublishPanel projectId={projectId} project={project} />
+        </CollapsibleStageSection>
+      )}
+
+      {!isMulti && !isSplit && project.export.status === 'done' && (
+        <CollapsibleStageSection
+          id="stage-facebook"
+          label="Đăng Facebook Reels"
+          status={project.facebook_posts?.length ? 'done' : 'pending'}
+          meta={
+            project.facebook_posts?.length
+              ? `Đã đăng ${project.facebook_posts.length} lần`
+              : 'Chọn Page, viết mô tả rồi đăng'
+          }
+          defaultExpanded={false}
+        >
+          <FacebookPublishPanel projectId={projectId} project={project} />
         </CollapsibleStageSection>
       )}
 

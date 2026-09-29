@@ -16,6 +16,7 @@ import DouyinBrowserPanel from '../components/DouyinBrowserPanel'
 import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from '../components/BlurStrengthControl'
 import CaptionDialog from '../components/CaptionDialog'
 import TikTokAccountIdentity from '../components/TikTokAccountIdentity'
+import PostScheduleEditor from '../components/PostScheduleEditor'
 
 const STATUS_LABEL: Record<QueueItemStatus, string> = {
   pending: 'Chờ xử lý',
@@ -110,6 +111,7 @@ export default function AutomatedDetailPage() {
   const { socialId } = useParams<{ socialId: string }>()
   const queryClient = useQueryClient()
   const [publishingId, setPublishingId] = useState<string | null>(null)
+  const [fbPublishingId, setFbPublishingId] = useState<string | null>(null)
   const logoRef = useRef<HTMLInputElement>(null)
   const musicRef = useRef<HTMLInputElement>(null)
   const [errorDialogItem, setErrorDialogItem] = useState<QueueItem | null>(null)
@@ -194,10 +196,11 @@ export default function AutomatedDetailPage() {
   const accountsQuery = useQuery({ queryKey: ['accounts'], queryFn: api.listAccounts })
 
   const assignAccountMutation = useMutation({
-    mutationFn: (accountId: string) => api.assignTiktokAccount(socialId!, accountId),
+    mutationFn: ({ id, move }: { id: string; move: boolean }) => api.assignTiktokAccount(socialId!, id, move),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['social-tiktok-status', socialId] })
       queryClient.invalidateQueries({ queryKey: ['accounts'] })
+      queryClient.invalidateQueries({ queryKey: ['social'] })
     },
   })
 
@@ -220,7 +223,37 @@ export default function AutomatedDetailPage() {
     refetchInterval: (q) => (q.state.data?.status === 'running' ? 1500 : false),
   })
 
+  const fbPublishJobQuery = useQuery({
+    queryKey: ['social-fb-publish-job', socialId, fbPublishingId],
+    queryFn: () => api.fbPublishQueueItemJobStatus(socialId!, fbPublishingId!),
+    enabled: !!socialId && !!fbPublishingId,
+    refetchInterval: (q) => (q.state.data?.status === 'running' ? 2000 : false),
+  })
+
+  const fbPagesQuery = useQuery({ queryKey: ['facebook-pages'], queryFn: api.listFacebookPages })
+
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['social', socialId] })
+
+  const assignFbPageMutation = useMutation({
+    mutationFn: ({ id, move }: { id: string; move: boolean }) => api.assignFacebookPage(socialId!, id, move),
+    onSuccess: () => {
+      refresh()
+      queryClient.invalidateQueries({ queryKey: ['facebook-pages'] })
+    },
+  })
+
+  const checkFbPageMutation = useMutation({
+    mutationFn: (pageId: string) => api.checkFacebookPage(pageId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['facebook-pages'] }),
+  })
+
+  const fbPublishMutation = useMutation({
+    mutationFn: (awemeId: string) => {
+      setFbPublishingId(awemeId)
+      return api.fbPublishQueueItem(socialId!, awemeId)
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['social-fb-publish-job', socialId, fbPublishingId] }),
+  })
 
   const crawlMutation = useMutation({
     mutationFn: (limit: number | null) => api.crawlSocial(socialId!, limit),
@@ -354,6 +387,13 @@ export default function AutomatedDetailPage() {
   const busyCrawl = jobQuery.data?.status === 'running'
   const busyTiktokLogin = tiktokLoginJobQuery.data?.status === 'running'
   const busyPublish = publishJobQuery.data?.status === 'running'
+  const busyFbPublish = fbPublishJobQuery.data?.status === 'running'
+
+  const fbPublishStatus = fbPublishJobQuery.data?.status
+  useEffect(() => {
+    if (fbPublishingId && fbPublishStatus && fbPublishStatus !== 'running') refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fbPublishStatus, fbPublishingId])
 
   const publishStatus = publishJobQuery.data?.status
   useEffect(() => {
@@ -379,6 +419,8 @@ export default function AutomatedDetailPage() {
 
   const state = detailQuery.data
   const tiktokAccount = tiktokStatusQuery.data?.account ?? null
+  const fbPages = fbPagesQuery.data?.pages ?? []
+  const fbPage = state ? fbPages.find((p) => p.page_id === state.facebook_page_id) ?? null : null
 
   if (detailQuery.isLoading || !state) {
     return (
@@ -391,14 +433,6 @@ export default function AutomatedDetailPage() {
   const oldestPending = [...state.queue].filter((i) => i.status === 'pending').sort(compareVideoAge)[0]
   const oldestReady = [...state.queue].filter((i) => i.status === 'ready').sort(compareVideoAge)[0]
 
-  // Giờ hẹn do backend tính sẵn (`next_post_at`: giãn cách ngẫu nhiên, chỉ
-  // trong khung giờ cao điểm 7-9h, 12-13h, 19-22h). Chưa đăng bài nào thì
-  // bộ lập lịch đăng ngay khi đang trong khung giờ — tự tính lại ở FE để
-  // hiển thị đúng. Còn lệch vài phút theo tick ~60s của bộ lập lịch.
-  const POSTING_WINDOWS: [number, number][] = [[7, 9], [12, 13], [19, 22]]
-  const inPostingWindow = (d: Date) => POSTING_WINDOWS.some(([s, e]) => d.getHours() >= s && d.getHours() < e)
-  const nextPostAt = state.next_post_at ? new Date(state.next_post_at) : null
-  const nextPostDue = nextPostAt ? nextPostAt.getTime() <= Date.now() : inPostingWindow(new Date())
   const douyinBackoffUntil = state.douyin_backoff_until ? new Date(state.douyin_backoff_until) : null
   const douyinResting = douyinBackoffUntil !== null && douyinBackoffUntil.getTime() > Date.now()
 
@@ -468,20 +502,25 @@ export default function AutomatedDetailPage() {
               Kích hoạt video cũ nhất ({oldestPending.title.slice(0, 30) || oldestPending.aweme_id})
             </button>
           )}
-          <label className="ml-auto flex items-center gap-2 text-sm text-neutral-300">
-            Số video/ngày (tối đa 3)
+          <label
+            className="ml-auto flex items-center gap-2 text-sm text-neutral-300"
+            title="Áp dụng cho giờ đăng cố định của cả TikTok và Facebook — đăng đúng từng phút mỗi ngày dễ bị coi là bot"
+          >
+            Giờ cố định lệch ngẫu nhiên ±
             <input
               type="number"
-              min={1}
-              max={3}
-              className={`${inputClass} mt-0 w-20`}
-              defaultValue={state.posts_per_day}
+              min={0}
+              max={60}
+              className={`${inputClass} mt-0 w-16`}
+              defaultValue={state.post_time_jitter_min}
+              key={state.post_time_jitter_min}
               onBlur={(e) => {
-                const n = Math.min(3, Math.max(1, Number(e.target.value) || 1))
+                const n = Math.min(60, Math.max(0, Number(e.target.value) || 0))
                 e.target.value = String(n)
-                if (n !== state.posts_per_day) updateMutation.mutate({ posts_per_day: n })
+                if (n !== state.post_time_jitter_min) updateMutation.mutate({ post_time_jitter_min: n })
               }}
             />
+            phút
           </label>
         </div>
         <JobProgressBar job={jobQuery.data} />
@@ -501,13 +540,11 @@ export default function AutomatedDetailPage() {
         <p className="text-xs text-neutral-500">
           {state.status !== 'active'
             ? 'Dự án đang tạm dừng — bộ lập lịch nền sẽ không tự crawl/kích hoạt/đăng cho tới khi bật lại.'
-            : !oldestReady
-              ? 'Chưa có video "Sẵn sàng đăng" nào trong hàng đợi — bộ lập lịch nền tự kích hoạt video cũ nhất rồi đăng khi có.'
-              : nextPostDue
-                ? 'Đã tới lượt đăng — bộ lập lịch nền (tick mỗi ~60s) sẽ tự đăng video cũ nhất sẵn sàng trong ít phút tới.'
-                : nextPostAt
-                  ? `Video tiếp theo dự kiến tự đăng lúc: ${nextPostAt.toLocaleString('vi-VN')} (${state.posts_per_day} video/ngày, giờ ngẫu nhiên trong khung 7-9h, 12-13h, 19-22h).`
-                  : 'Chưa tới khung giờ đăng — bộ lập lịch chỉ đăng trong khung 7-9h, 12-13h, 19-22h.'}
+            : !state.tiktok_enabled && !state.facebook_enabled
+              ? 'Chưa bật nền tảng đăng nào — bật TikTok và/hoặc Facebook ở bên dưới để dự án chạy.'
+              : !oldestReady
+                ? 'Chưa có video "Sẵn sàng đăng" nào trong hàng đợi — bộ lập lịch nền tự kích hoạt video cũ nhất rồi đăng khi có.'
+                : 'Lịch đăng riêng của từng nền tảng xem ở mục TikTok / Facebook bên dưới.'}
         </p>
         {douyinResting && (
           <p className="text-xs text-danger">
@@ -543,17 +580,35 @@ export default function AutomatedDetailPage() {
             className="input max-w-xs"
             value={state.tiktok_account_id || ''}
             disabled={assignAccountMutation.isPending || busyTiktokLogin}
-            onChange={(e) => assignAccountMutation.mutate(e.target.value)}
+            onChange={(e) => {
+              const id = e.target.value
+              const acc = (accountsQuery.data ?? []).find((a) => a.id === id)
+              const others = (acc?.projects ?? []).filter((p) => p.social_id !== socialId)
+              if (others.length) {
+                const name = acc!.username ? `@${acc!.username}` : acc!.label || acc!.id
+                const ok = window.confirm(
+                  `Tài khoản ${name} đang dùng cho dự án "${others.map((p) => p.title).join(', ')}".\n\n` +
+                    'Chuyển sang dự án này? Dự án kia sẽ không còn tài khoản TikTok và ngừng đăng TikTok.',
+                )
+                if (!ok) {
+                  e.target.value = state.tiktok_account_id || ''
+                  return
+                }
+              }
+              assignAccountMutation.mutate({ id, move: others.length > 0 })
+            }}
           >
             <option value="">— Chưa gán tài khoản —</option>
-            {(accountsQuery.data ?? [])
-              .filter((a) => a.id === state.tiktok_account_id || !a.projects.length)
-              .map((a) => (
+            {(accountsQuery.data ?? []).map((a) => {
+              const others = a.projects.filter((p) => p.social_id !== socialId)
+              return (
                 <option key={a.id} value={a.id}>
                   {a.username ? `@${a.username}` : a.label || a.id}
                   {a.status !== 'ok' ? ` (${a.status === 'unknown' ? 'chưa kiểm tra' : 'cần đăng nhập lại'})` : ''}
+                  {others.length ? ` · đang dùng: ${others.map((p) => p.title).join(', ')}` : ''}
                 </option>
-              ))}
+              )
+            })}
           </select>
           {tiktokAccount && (
             <button
@@ -610,6 +665,136 @@ export default function AutomatedDetailPage() {
         {busyPublish && publishJobQuery.data?.current_label && (
           <p className="text-xs text-neutral-400">{publishJobQuery.data.current_label}</p>
         )}
+        <PostScheduleEditor
+          platformLabel="TikTok"
+          enabled={state.tiktok_enabled}
+          canEnable
+          postsPerDay={state.posts_per_day}
+          maxPostsPerDay={3}
+          postTimes={state.tiktok_post_times ?? []}
+          jitterMin={state.post_time_jitter_min}
+          nextPostAt={state.next_post_at}
+          saving={updateMutation.isPending}
+          onToggle={(v) => updateMutation.mutate({ tiktok_enabled: v })}
+          onSavePostsPerDay={(n) => updateMutation.mutate({ posts_per_day: n })}
+          onSaveTimes={(times) => updateMutation.mutate({ tiktok_post_times: times })}
+        />
+      </section>
+
+      <section className="card mb-6 space-y-2 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm text-neutral-300">Đăng Reels lên Facebook Page (Graph API)</span>
+          <Link to="/accounts?tab=facebook" className="text-xs text-neutral-400 hover:text-accent-200">
+            Quản lý Facebook Page →
+          </Link>
+        </div>
+        {fbPage ? (
+          <div className="flex items-center gap-3">
+            {fbPage.picture_url && <img src={fbPage.picture_url} alt="" className="h-8 w-8 rounded-full object-cover" />}
+            <div className="text-sm">
+              <a
+                href={`https://www.facebook.com/${fbPage.page_id}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-text hover:text-accent-200"
+              >
+                {fbPage.name}
+              </a>
+              <div className={`text-xs ${fbPage.status === 'expired' ? 'text-danger' : 'text-neutral-500'}`}>
+                {fbPage.status === 'ok'
+                  ? 'Token còn dùng được'
+                  : fbPage.status === 'expired'
+                    ? 'Token hết hạn — vào trang Tài khoản nhập lại token'
+                    : fbPage.status === 'error'
+                      ? 'Không kiểm tra được token'
+                      : 'Chưa kiểm tra token'}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-neutral-500">Chưa chọn Facebook Page.</p>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            className="input max-w-xs"
+            value={state.facebook_page_id || ''}
+            disabled={assignFbPageMutation.isPending || busyFbPublish}
+            onChange={(e) => {
+              const id = e.target.value
+              const page = fbPages.find((p) => p.page_id === id)
+              const others = (page?.projects ?? []).filter((p) => p.social_id !== socialId)
+              if (others.length) {
+                const ok = window.confirm(
+                  `Page "${page!.name}" đang dùng cho dự án "${others.map((p) => p.title).join(', ')}".\n\n` +
+                    'Chuyển sang dự án này? Dự án kia sẽ không còn Page và tắt đăng Facebook.',
+                )
+                if (!ok) {
+                  e.target.value = state.facebook_page_id || ''
+                  return
+                }
+              }
+              assignFbPageMutation.mutate({ id, move: others.length > 0 })
+            }}
+          >
+            <option value="">— Chưa chọn Page —</option>
+            {fbPages.map((p) => {
+              const others = p.projects.filter((x) => x.social_id !== socialId)
+              return (
+                <option key={p.page_id} value={p.page_id}>
+                  {p.name}
+                  {p.status === 'expired' ? ' (token hết hạn)' : ''}
+                  {others.length ? ` · đang dùng: ${others.map((x) => x.title).join(', ')}` : ''}
+                </option>
+              )
+            })}
+          </select>
+          {fbPage && (
+            <button
+              type="button"
+              className={secondaryButtonClass}
+              disabled={checkFbPageMutation.isPending}
+              onClick={() => checkFbPageMutation.mutate(fbPage.page_id)}
+            >
+              {checkFbPageMutation.isPending ? 'Đang kiểm tra...' : 'Kiểm tra'}
+            </button>
+          )}
+        </div>
+        {!fbPages.length && (
+          <p className="text-xs text-neutral-500">
+            Chưa có Facebook Page nào — vào trang Tài khoản để nhập từ PagesManager hoặc dán token.
+          </p>
+        )}
+        {assignFbPageMutation.error && (
+          <p className="text-sm text-danger">{(assignFbPageMutation.error as Error).message}</p>
+        )}
+        {checkFbPageMutation.error && (
+          <p className="text-sm text-danger">{(checkFbPageMutation.error as Error).message}</p>
+        )}
+        {fbPublishMutation.error && (
+          <p className="text-sm text-danger">Không đăng được: {(fbPublishMutation.error as Error).message}</p>
+        )}
+        {fbPublishJobQuery.data?.status === 'failed' && fbPublishJobQuery.data.error && (
+          <p className="text-sm text-danger">Đăng Facebook lỗi: {fbPublishJobQuery.data.error}</p>
+        )}
+        {busyFbPublish && fbPublishJobQuery.data?.current_label && (
+          <p className="text-xs text-neutral-400">{fbPublishJobQuery.data.current_label}</p>
+        )}
+        <PostScheduleEditor
+          platformLabel="Facebook"
+          enabled={state.facebook_enabled}
+          canEnable={!!state.facebook_page_id}
+          disabledReason="Chọn Page trước"
+          postsPerDay={state.facebook_posts_per_day}
+          maxPostsPerDay={3}
+          postTimes={state.facebook_post_times ?? []}
+          jitterMin={state.post_time_jitter_min}
+          nextPostAt={state.facebook_next_post_at}
+          saving={updateMutation.isPending}
+          onToggle={(v) => updateMutation.mutate({ facebook_enabled: v })}
+          onSavePostsPerDay={(n) => updateMutation.mutate({ facebook_posts_per_day: n })}
+          onSaveTimes={(times) => updateMutation.mutate({ facebook_post_times: times })}
+        />
+        {updateMutation.error && <p className="text-sm text-danger">{(updateMutation.error as Error).message}</p>}
       </section>
 
       <details className="card mb-6 space-y-3 p-4">
@@ -1070,12 +1255,50 @@ Trong đó có ${busy} video đang xử lý hoặc sẵn sàng đăng.` : '')
                           </button>
                         )}
                       </div>
+                      {(item.tiktok_posted_at || item.fb_posted_at || (item.status === 'ready' && state.facebook_enabled)) && (
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          {(state.tiktok_enabled || item.tiktok_posted_at) && (
+                            <span className={item.tiktok_posted_at ? 'text-accent-300' : 'text-neutral-500'}>
+                              TikTok:{' '}
+                              {item.tiktok_posted_at
+                                ? `đã đăng ${new Date(item.tiktok_posted_at).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}`
+                                : 'chờ đăng'}
+                            </span>
+                          )}
+                          {(state.facebook_enabled || item.fb_posted_at) && (
+                            <span className={item.fb_posted_at ? 'text-accent-300' : 'text-neutral-500'}>
+                              Facebook:{' '}
+                              {item.fb_posted_at ? (
+                                item.fb_permalink ? (
+                                  <a href={item.fb_permalink} target="_blank" rel="noreferrer" className="hover:underline">
+                                    đã đăng{' '}
+                                    {new Date(item.fb_posted_at).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}{' '}
+                                    ↗
+                                  </a>
+                                ) : (
+                                  `đã đăng ${new Date(item.fb_posted_at).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}`
+                                )
+                              ) : (
+                                'chờ đăng'
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      )}
                       {/* Đăng lỗi vẫn là "Sẵn sàng đăng" — chỉ báo lỗi lần đăng gần nhất. */}
-                      {item.status === 'ready' && item.publish_error && (
+                      {item.status === 'ready' && item.publish_error && !item.tiktok_posted_at && (
                         <p className="mt-1 text-xs text-danger" title={item.publish_error}>
-                          Đăng lỗi lần {item.publish_fail_count ?? 1}: {item.publish_error.slice(0, 160)}
+                          Đăng TikTok lỗi lần {item.publish_fail_count ?? 1}: {item.publish_error.slice(0, 160)}
                           {(item.publish_fail_count ?? 0) >= 3
                             ? ' — đã ngừng tự thử, bấm "Đăng lại".'
+                            : ' — app sẽ tự thử lại sau 30 phút.'}
+                        </p>
+                      )}
+                      {item.status === 'ready' && item.fb_publish_error && !item.fb_posted_at && (
+                        <p className="mt-1 text-xs text-danger" title={item.fb_publish_error}>
+                          Đăng Facebook lỗi lần {item.fb_publish_fail_count ?? 1}: {item.fb_publish_error.slice(0, 200)}
+                          {(item.fb_publish_fail_count ?? 0) >= 3
+                            ? ' — đã ngừng tự thử, bấm "Đăng lại Facebook".'
                             : ' — app sẽ tự thử lại sau 30 phút.'}
                         </p>
                       )}
@@ -1101,20 +1324,40 @@ Trong đó có ${busy} video đang xử lý hoặc sẵn sàng đăng.` : '')
                           {item.status === 'failed' ? 'Thử lại (đưa về hàng chờ)' : 'Kích hoạt'}
                         </button>
                       )}
-                      {(item.status === 'ready' || (item.status === 'failed' && item.failed_stage === 'publish')) && (
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm"
-                          disabled={busyPublish && publishingId === item.aweme_id}
-                          onClick={() => publishMutation.mutate(item.aweme_id)}
-                        >
-                          {busyPublish && publishingId === item.aweme_id
-                            ? 'Đang đăng...'
-                            : item.status === 'failed' || item.publish_error
-                              ? 'Đăng lại'
-                              : 'Đăng lên TikTok'}
-                        </button>
-                      )}
+                      {(item.status === 'ready' || (item.status === 'failed' && item.failed_stage === 'publish')) &&
+                        !item.tiktok_posted_at && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            disabled={busyPublish && publishingId === item.aweme_id}
+                            onClick={() => publishMutation.mutate(item.aweme_id)}
+                          >
+                            {busyPublish && publishingId === item.aweme_id
+                              ? 'Đang đăng...'
+                              : item.status === 'failed' || item.publish_error
+                                ? 'Đăng lại'
+                                : 'Đăng lên TikTok'}
+                          </button>
+                        )}
+                      {/* Video đã "posted" (vd đăng TikTok trước khi bật Facebook) vẫn đăng tay
+                          lên Facebook được, miễn còn file đã xuất. */}
+                      {(item.status === 'ready' || (item.status === 'posted' && !item.files_cleaned_at)) &&
+                        !!state.facebook_page_id &&
+                        !item.fb_posted_at &&
+                        !!item.project_id && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            disabled={busyFbPublish}
+                            onClick={() => fbPublishMutation.mutate(item.aweme_id)}
+                          >
+                            {busyFbPublish && fbPublishingId === item.aweme_id
+                              ? 'Đang đăng FB...'
+                              : item.fb_publish_error
+                                ? 'Đăng lại Facebook'
+                                : 'Đăng lên Facebook'}
+                          </button>
+                        )}
                       {item.status === 'skipped' ? (
                         <button
                           type="button"

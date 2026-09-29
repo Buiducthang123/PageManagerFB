@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -483,7 +484,41 @@ def _wait_for_content_check(page: Page, timeout_s: float = 90.0) -> None:
     )
 
 
+# Dán caption như Ctrl+V: bắn 1 sự kiện `paste` chứa toàn bộ caption vào ô
+# đang focus — trình soạn thảo (Draft.js) của TikTok tự xử lý paste, giữ
+# nguyên xuống dòng/dấu tiếng Việt. Không dùng clipboard thật của máy (cần
+# quyền trình duyệt, và đè mất thứ người dùng đang copy).
+_PASTE_JS = """
+(text) => {
+  const el = document.activeElement;
+  if (!el) return false;
+  const dt = new DataTransfer();
+  dt.setData('text/plain', text);
+  const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+  el.dispatchEvent(ev);
+  return true;
+}
+"""
+
+
+def _norm_caption(text: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFC", text or ""))
+
+
+def _read_caption(target) -> str:
+    try:
+        return target.inner_text(timeout=3000) if target.evaluate("e => e.tagName") != "TEXTAREA" else target.input_value()
+    except Exception:
+        return ""
+
+
 def _set_caption(page: Page, caption: str) -> None:
+    """Điền caption rồi ĐỌC LẠI để chắc đúng từng chữ. Trước đây gõ từng ký tự
+    (`type`, delay 10ms) — đã xác nhận thật: ô caption TikTok (Draft.js, có
+    gợi ý #hashtag/@mention) làm tiếng Việt có dấu bị đảo thứ tự/dính chữ
+    ("đào tạoA tay đua", "khôn-đức-bu"). Giờ dán 1 lần; không khớp thì thử
+    `insert_text` (1 sự kiện nhập, không gõ phím); vẫn sai thì DỪNG — không
+    đăng bài với caption hỏng."""
     if not caption:
         return
     for selector in _CAPTION_SELECTORS:
@@ -492,12 +527,30 @@ def _set_caption(page: Page, caption: str) -> None:
             continue
         try:
             target.click(timeout=8000)
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Delete")
-            target.type(caption, delay=10)
-            return
         except Exception:
             continue
+        actual = ""
+        for method in ("paste", "insert_text"):
+            try:
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+                page.wait_for_timeout(300)
+                if method == "paste":
+                    page.evaluate(_PASTE_JS, caption)
+                else:
+                    page.keyboard.insert_text(caption)
+                page.wait_for_timeout(800)
+            except Exception as err:
+                logger.warning("social_publish: điền caption bằng {} lỗi: {}", method, err)
+                continue
+            actual = _read_caption(target)
+            if _norm_caption(actual) == _norm_caption(caption):
+                logger.info("social_publish: đã điền caption ({}), đọc lại khớp", method)
+                return
+            logger.warning("social_publish: caption sau khi {} không khớp — đọc lại: {!r}", method, actual[:200])
+        raise SocialPublishError(
+            "Caption điền vào TikTok bị sai chữ, đã dừng không đăng. Đọc lại được: " + (actual[:120] or "(trống)")
+        )
     raise SocialPublishError("Không tìm thấy ô nhập caption")
 
 

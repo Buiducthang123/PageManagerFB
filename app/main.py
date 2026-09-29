@@ -3,23 +3,36 @@ from __future__ import annotations
 import json
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from . import accounts as acc_store
+from . import fb_pages as fb_store
 from . import config, downloads as dl, jobs, merges as mg, projects as pj, settings as app_settings, social as sp
-from .models import Episode, QueueItem, QueueItemStatus, SocialLink, SocialProjectSummary, StageRecord, StageStatus, TikTokPostRecord
+from .models import (
+    Episode,
+    FacebookPostRecord,
+    QueueItem,
+    QueueItemStatus,
+    SocialLink,
+    SocialProjectSummary,
+    StageRecord,
+    StageStatus,
+    TikTokPostRecord,
+)
 from .schemas import (
     AppSettingsResponse,
     CreateDownloadRequest,
@@ -57,6 +70,7 @@ from .stages import douyin_browser as douyin_browser_stage
 from .stages import douyin_dl as douyin_dl_stage
 from .stages import dub_audio as dub_audio_stage
 from .stages import export_direct as export_direct_stage
+from .stages import facebook_publish as fb_publish_stage
 from .stages import fetch_url as fetch_url_stage
 from .stages import ingest as ingest_stage
 from .stages import social_publish as social_publish_stage
@@ -2287,7 +2301,20 @@ def _start_export(
             # (pipeline chạy nhanh hơn OCR) hoặc chưa từng chạy (project cũ).
             job.current_label = "Tự dò vùng phụ đề cũ (OCR)"
             search_region = tuple(state.auto_ocr_crop_region) if state.auto_ocr_crop_region else None
-            blur_region, ranges = _detect_blur_region_and_ranges(video_path, search_region=search_region)
+
+            def on_ocr_progress(done: int, tot: int, label: str) -> None:
+                job.raise_if_cancelled()
+                job.done_count = done
+                job.total = max(tot, 1)
+                job.current_label = label
+
+            try:
+                blur_region, ranges = _detect_blur_region_and_ranges(
+                    video_path, search_region=search_region, on_progress=on_ocr_progress
+                )
+            except jobs.JobCancelled:
+                _mark_export_cancelled(project_id, job)
+                return
             if blur_region is not None:
                 with pj.locked_project(project_id) as s:
                     s.export_blur_region = list(blur_region)
@@ -3097,12 +3124,44 @@ def update_social_route(social_id: str, body: UpdateSocialProjectRequest):
                 state.title = body.title.strip() or state.title
             if body.status is not None:
                 state.status = body.status
+            # Đổi lịch đăng của 1 nền tảng → tính lại giờ hẹn theo lịch mới
+            # ngay, không bắt chờ hết giờ hẹn cũ (có thể tính theo nhịp khác).
+            reschedule: set[str] = set()
             if body.posts_per_day is not None and body.posts_per_day != state.posts_per_day:
                 state.posts_per_day = body.posts_per_day
-                # Đổi số bài/ngày → tính lại giờ hẹn theo nhịp mới ngay, không
-                # bắt chờ hết giờ hẹn cũ (có thể đã tính theo nhịp thưa hơn).
-                if state.last_post_at is not None:
-                    state.next_post_at = _compute_next_post_at(state.last_post_at, state.posts_per_day)
+                reschedule.add("tiktok")
+            if body.facebook_posts_per_day is not None and body.facebook_posts_per_day != state.facebook_posts_per_day:
+                state.facebook_posts_per_day = body.facebook_posts_per_day
+                reschedule.add("facebook")
+            for platform, times in (("tiktok", body.tiktok_post_times), ("facebook", body.facebook_post_times)):
+                if times is None:
+                    continue
+                bad = [t for t in times if str(t).strip() and not _parse_post_times([t])]
+                if bad:
+                    raise HTTPException(status_code=400, detail=f"Giờ đăng không hợp lệ: {', '.join(bad)} (dạng HH:MM)")
+                cleaned = [f"{h:02d}:{m:02d}" for h, m in _parse_post_times(times)]
+                if platform == "tiktok":
+                    state.tiktok_post_times = cleaned
+                else:
+                    state.facebook_post_times = cleaned
+                reschedule.add(platform)
+            if body.post_time_jitter_min is not None and body.post_time_jitter_min != state.post_time_jitter_min:
+                state.post_time_jitter_min = body.post_time_jitter_min
+                reschedule.update(PLATFORMS)
+            if body.tiktok_enabled is not None:
+                state.tiktok_enabled = body.tiktok_enabled
+            if body.facebook_enabled is not None:
+                if body.facebook_enabled and not state.facebook_page_id:
+                    raise HTTPException(status_code=400, detail="Chọn Facebook Page cho dự án trước khi bật đăng Facebook")
+                state.facebook_enabled = body.facebook_enabled
+            for platform in reschedule:
+                _, times, last, _ = _schedule(state, platform)
+                if _parse_post_times(times):
+                    _set_next_post(state, platform, _next_post_for(state, platform, datetime.now()))
+                elif last is not None:
+                    _set_next_post(state, platform, _next_post_for(state, platform, last))
+                else:
+                    _set_next_post(state, platform, None)
             if body.engine is not None:
                 state.engine = body.engine
             if body.tts_engine is not None:
@@ -3937,6 +3996,235 @@ def cancel_account_login_route(account_id: str):
     return {"status": "ok" if ok else "not_running"}
 
 
+# ------------------------------------------------------------------ Facebook Page (Reels)
+
+
+def _fb_page_views() -> list[dict]:
+    assigned = fb_store.projects_by_page()
+    return [
+        {
+            **p.model_dump(mode="json", exclude={"access_token"}),
+            "token_masked": fb_store.mask_token(p.access_token),
+            "projects": [{"social_id": sid, "title": title} for sid, title in assigned.get(p.page_id, [])],
+        }
+        for p in fb_store.list_pages()
+    ]
+
+
+@app.get("/api/facebook-pages")
+def list_fb_pages_route():
+    return {
+        "pages": _fb_page_views(),
+        "pages_manager_path": config.PAGES_MANAGER_PAGES_JSON,
+        "oauth_configured": fb_publish_stage.oauth_configured(),
+        # Dò trực tiếp mỗi lần (ngrok miễn phí đổi tên miền mỗi lần bật) —
+        # None = ngrok chưa chạy.
+        "redirect_uri": fb_publish_stage.resolve_redirect_uri(),
+    }
+
+
+# Chống CSRF cho OAuth: `state` chỉ dùng 1 lần, hết hạn sau 10 phút.
+_FB_OAUTH_STATE_TTL_S = 600
+_fb_oauth_states: dict[str, tuple[float, str]] = {}  # state -> (hết hạn, redirect_uri)
+_fb_oauth_lock = threading.Lock()
+
+
+def _fb_accounts_redirect(**params: str) -> RedirectResponse:
+    query = urllib.parse.urlencode({"tab": "facebook", **params})
+    return RedirectResponse(f"{config.FRONTEND_URL}/accounts?{query}")
+
+
+@app.get("/api/facebook/login")
+def fb_login_route():
+    """Mở từ trình duyệt (không gọi bằng fetch): chuyển sang hộp thoại đăng
+    nhập Facebook. Facebook gọi lại /api/facebook/callback qua tên miền ngrok."""
+    if not fb_publish_stage.oauth_configured():
+        return _fb_accounts_redirect(fb_error="Chưa cấu hình FB_APP_ID / FB_APP_SECRET trong file .env")
+    redirect_uri = fb_publish_stage.resolve_redirect_uri()
+    if not redirect_uri:
+        return _fb_accounts_redirect(
+            fb_error="Chưa bật ngrok — chạy \"ngrok http 5175\" rồi bấm Kết nối Facebook lại"
+        )
+    state = secrets.token_hex(16)
+    now = time.time()
+    with _fb_oauth_lock:
+        for k in [k for k, (exp, _) in _fb_oauth_states.items() if exp < now]:
+            _fb_oauth_states.pop(k, None)
+        _fb_oauth_states[state] = (now + _FB_OAUTH_STATE_TTL_S, redirect_uri)
+    return RedirectResponse(fb_publish_stage.login_dialog_url(state, redirect_uri))
+
+
+@app.get("/api/facebook/callback")
+def fb_callback_route(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    """Luôn kết thúc bằng chuyển về trang Tài khoản (localhost) kèm kết quả."""
+    if error:
+        return _fb_accounts_redirect(fb_error=f"Facebook từ chối: {error_description or error}")
+    with _fb_oauth_lock:
+        expires, redirect_uri = _fb_oauth_states.pop(state or "", (0.0, ""))
+    if expires < time.time():
+        return _fb_accounts_redirect(fb_error="Phiên đăng nhập hết hạn hoặc không hợp lệ — bấm Kết nối Facebook lại")
+    if not code:
+        return _fb_accounts_redirect(fb_error="Facebook không trả mã đăng nhập")
+    try:
+        user_token = fb_publish_stage.exchange_code(code, redirect_uri)
+        saved = fb_store.import_from_token(user_token, source="oauth")
+    except (ValueError, fb_publish_stage.FacebookPublishError) as err:
+        return _fb_accounts_redirect(fb_error=str(err))
+    except Exception as err:
+        logger.exception("Đăng nhập Facebook lỗi")
+        return _fb_accounts_redirect(fb_error=f"Lỗi không xác định: {err}")
+    return _fb_accounts_redirect(fb_connected=str(len(saved)))
+
+
+@app.post("/api/facebook-pages/import-pagesmanager")
+def import_fb_pages_route(body: dict):
+    path = Path(str(body.get("path") or config.PAGES_MANAGER_PAGES_JSON).strip().strip('"'))
+    try:
+        imported = fb_store.import_from_pages_manager(path)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    except (ValueError, json.JSONDecodeError) as err:
+        raise HTTPException(status_code=400, detail=f"File pages.json không đúng định dạng: {err}") from err
+    return {"imported": len(imported), "pages": _fb_page_views()}
+
+
+@app.post("/api/facebook-pages/token")
+def add_fb_token_route(body: dict):
+    try:
+        saved = fb_store.import_from_token(str(body.get("token") or ""))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except fb_publish_stage.FacebookPublishError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return {"imported": len(saved), "pages": _fb_page_views()}
+
+
+@app.post("/api/facebook-pages/{page_id}/check")
+def check_fb_page_route(page_id: str):
+    try:
+        fb_store.check_page(page_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return next((v for v in _fb_page_views() if v["page_id"] == page_id), None)
+
+
+@app.delete("/api/facebook-pages/{page_id}")
+def delete_fb_page_route(page_id: str):
+    assigned = fb_store.projects_by_page().get(page_id)
+    if assigned:
+        names = ", ".join(title for _, title in assigned)
+        raise HTTPException(status_code=409, detail=f"Page đang gán cho dự án: {names} — bỏ gán trước khi xoá")
+    try:
+        fb_store.delete_page(page_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {"status": "ok"}
+
+
+@app.put("/api/social/{social_id}/facebook-page")
+def assign_fb_page_route(social_id: str, body: dict):
+    """Gán (hoặc bỏ gán với page_id rỗng) Facebook Page cho dự án. 1 Page chỉ
+    gán cho 1 dự án — cùng luật với tài khoản TikTok (`move=true` = chuyển Page
+    từ dự án khác sang). Bỏ gán thì tắt luôn đăng Facebook của dự án."""
+    page_id = str(body.get("page_id") or "").strip()
+    move = bool(body.get("move"))
+    others: list[tuple[str, str]] = []
+    if page_id:
+        if fb_store.get_page(page_id) is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy Facebook Page")
+        others = [(sid, t) for sid, t in fb_store.projects_by_page().get(page_id, []) if sid != social_id]
+        if others and not move:
+            raise HTTPException(status_code=409, detail=f'Page này đang gán cho dự án "{others[0][1]}"')
+    busy = set(_running_job_suffix(":fbpublish"))
+    if social_id in busy or any(sid in busy for sid, _ in others):
+        raise HTTPException(status_code=409, detail="Dự án đang đăng Facebook — đợi đăng xong rồi đổi Page")
+    try:
+        with sp.locked_state(social_id) as s:
+            s.facebook_page_id = page_id
+            if not page_id:
+                s.facebook_enabled = False
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    # Dự án cũ mất Page → tắt luôn đăng Facebook của nó.
+    for sid, _ in others:
+        try:
+            with sp.locked_state(sid) as s_old:
+                if s_old.facebook_page_id == page_id:
+                    s_old.facebook_page_id = ""
+                    s_old.facebook_enabled = False
+        except FileNotFoundError:
+            pass
+    return sp.load_state(social_id)
+
+
+@app.post("/api/projects/{project_id}/facebook-publish", status_code=202)
+def publish_project_facebook_route(project_id: str, body: dict):
+    """Đăng tay video đã xuất của 1 project lên Facebook Page (Reels)."""
+    try:
+        state = pj.load_project(project_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    page_id = str(body.get("page_id") or "").strip()
+    caption = str(body.get("caption") or "").strip()
+    page = fb_store.get_page(page_id) if page_id else None
+    if page is None:
+        raise HTTPException(status_code=400, detail="Chưa chọn Facebook Page")
+    if page.status == "expired":
+        raise HTTPException(status_code=409, detail=f"Token của Page {page.name} đã hết hạn — vào trang Tài khoản nhập lại")
+    video_path = pj.project_dir(project_id) / "export" / "final.mp4"
+    if state.export.status != StageStatus.done or not video_path.exists():
+        raise HTTPException(status_code=409, detail="Chưa có video đã xuất — bấm Xuất video trước")
+    if jobs.is_job_running(f"{project_id}:export"):
+        raise HTTPException(status_code=409, detail="Đang xuất lại video — đợi xuất xong rồi đăng")
+
+    with pj.locked_project(project_id) as s:
+        s.facebook_caption = caption
+
+    def target(job: jobs.JobState) -> None:
+        def progress(msg: str) -> None:
+            job.current_label = f"[{page.name}] {msg}"
+
+        try:
+            result = fb_publish_stage.publish_reel(page.page_id, page.access_token, video_path, caption, on_progress=progress)
+        except fb_publish_stage.FacebookTokenError as err:
+            fb_store.mark_expired(page.page_id, str(err))
+            job.status, job.error = "failed", str(err)
+            return
+        except Exception as err:
+            if not isinstance(err, fb_publish_stage.FacebookPublishError):
+                logger.exception("Đăng Facebook lỗi (project {})", project_id)
+            job.status, job.error = "failed", str(err)
+            return
+        with pj.locked_project(project_id) as s:
+            s.facebook_posts.append(
+                FacebookPostRecord(
+                    page_id=page.page_id,
+                    page_name=page.name,
+                    video_id=result["video_id"],
+                    permalink_url=result.get("permalink_url"),
+                    caption=caption,
+                    posted_at=datetime.now(),
+                )
+            )
+        job.status = "done"
+        job.current_label = f"Đã đăng lên {page.name}"
+
+    job = jobs.start_job(f"{project_id}:facebook_publish", 1, target)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang đăng video này lên Facebook")
+    return {"status": "started"}
+
+
+@app.get("/api/projects/{project_id}/facebook-publish/job", response_model=JobStatusResponse)
+def publish_project_facebook_job_route(project_id: str):
+    return _job_status_response(jobs.get_job(f"{project_id}:facebook_publish"))
+
+
 @app.get("/api/social/{social_id}/tiktok/status")
 def tiktok_login_status_route(social_id: str):
     try:
@@ -3953,21 +4241,33 @@ def tiktok_login_status_route(social_id: str):
 @app.put("/api/social/{social_id}/tiktok-account")
 def assign_tiktok_account_route(social_id: str, body: dict):
     """Gán (hoặc bỏ gán với account_id rỗng) tài khoản TikTok cho dự án. 1 tài
-    khoản chỉ gán cho 1 dự án — 2 dự án chung 1 kênh là đăng gấp đôi."""
+    khoản chỉ gán cho 1 dự án — 2 dự án chung 1 kênh là đăng gấp đôi. Tài
+    khoản đang thuộc dự án khác: `move=true` thì CHUYỂN sang dự án này (gỡ khỏi
+    dự án cũ), không thì từ chối."""
     account_id = str(body.get("account_id") or "").strip()
+    move = bool(body.get("move"))
+    others: list[tuple[str, str]] = []
     if account_id:
         if acc_store.get_account(account_id) is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
-        others = [t for sid, t in acc_store.projects_by_account().get(account_id, []) if sid != social_id]
-        if others:
-            raise HTTPException(status_code=409, detail=f'Tài khoản này đang gán cho dự án "{others[0]}"')
-    if social_id in _running_job_suffix(":publish"):
+        others = [(sid, t) for sid, t in acc_store.projects_by_account().get(account_id, []) if sid != social_id]
+        if others and not move:
+            raise HTTPException(status_code=409, detail=f'Tài khoản này đang gán cho dự án "{others[0][1]}"')
+    busy = set(_running_job_suffix(":publish"))
+    if social_id in busy or any(sid in busy for sid, _ in others):
         raise HTTPException(status_code=409, detail="Dự án đang đăng bài — đợi đăng xong rồi đổi tài khoản")
     try:
         with sp.locked_state(social_id) as s:
             s.tiktok_account_id = account_id
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+    for sid, _ in others:
+        try:
+            with sp.locked_state(sid) as s_old:
+                if s_old.tiktok_account_id == account_id:
+                    s_old.tiktok_account_id = ""
+        except FileNotFoundError:
+            pass
     return tiktok_login_status_route(social_id)
 
 
@@ -4176,6 +4476,8 @@ def _start_social_publish(social_id: str, aweme_id: str, manual: bool = False) -
         raise ValueError("Không tìm thấy video này trong hàng đợi")
     if item.status not in (QueueItemStatus.ready, QueueItemStatus.failed):
         raise ValueError(f"Video đang ở trạng thái '{item.status.value}', chưa sẵn sàng đăng")
+    if item.tiktok_posted_at:
+        raise ValueError("Video này đã đăng TikTok rồi")
     if not item.project_id:
         raise ValueError("Video này chưa gắn với project pipeline nào")
     video_path = pj.project_dir(item.project_id) / "export" / "final.mp4"
@@ -4264,14 +4566,14 @@ def _start_social_publish(social_id: str, aweme_id: str, manual: bool = False) -
         job.status = "done"
         with sp.locked_state(social_id) as s:
             s.last_post_at = datetime.now()
-            s.next_post_at = _compute_next_post_at(s.last_post_at, s.posts_per_day)
+            s.next_post_at = _next_post_for(s, "tiktok", s.last_post_at)
             for i in s.queue:
                 if i.aweme_id == aweme_id:
-                    i.status = QueueItemStatus.posted
-                    i.posted_at = datetime.now()
+                    i.tiktok_posted_at = datetime.now()
                     i.publish_error = None
                     i.publish_failed_at = None
                     i.publish_fail_count = 0
+                    _finalize_if_published(s, i)
                     break
 
     return jobs.start_job(f"social:{social_id}:{aweme_id}:publish", 1, target)
@@ -4286,6 +4588,115 @@ def publish_queue_item_route(social_id: str, aweme_id: str):
     if job is None:
         raise HTTPException(status_code=409, detail="Đang đăng video này")
     return {"status": "started"}
+
+
+def _start_social_fb_publish(social_id: str, aweme_id: str, manual: bool = False) -> jobs.JobState | None:
+    """Đăng 1 video trong hàng đợi lên Facebook Page (Reels) — cùng vai trò
+    `_start_social_publish` (TikTok), dùng chung cho bấm tay và bộ lập lịch."""
+    try:
+        state = sp.load_state(social_id)
+    except FileNotFoundError as err:
+        raise ValueError(str(err)) from err
+    item = next((i for i in state.queue if i.aweme_id == aweme_id), None)
+    if item is None:
+        raise ValueError("Không tìm thấy video này trong hàng đợi")
+    if item.status not in (QueueItemStatus.ready, QueueItemStatus.failed, QueueItemStatus.posted):
+        raise ValueError(f"Video đang ở trạng thái '{item.status.value}', chưa sẵn sàng đăng")
+    if item.fb_posted_at:
+        raise ValueError("Video này đã đăng Facebook rồi")
+    if not item.project_id:
+        raise ValueError("Video này chưa gắn với project pipeline nào")
+    video_path = pj.project_dir(item.project_id) / "export" / "final.mp4"
+    if not video_path.exists():
+        raise ValueError("Không tìm thấy video đã xuất — kiểm tra lại project pipeline")
+    page = fb_store.get_page(state.facebook_page_id) if state.facebook_page_id else None
+    if page is None:
+        raise ValueError("Dự án chưa chọn Facebook Page")
+    project_id_for_caption = item.project_id
+
+    if manual:
+        with sp.locked_state(social_id) as s0:
+            for i in s0.queue:
+                if i.aweme_id == aweme_id:
+                    i.fb_publish_fail_count = 0
+                    break
+
+    def mark_failed(job: jobs.JobState, err: BaseException, permanent: bool) -> None:
+        job.status = "failed"
+        job.error = str(err)
+        with sp.locked_state(social_id) as s:
+            for i in s.queue:
+                if i.aweme_id == aweme_id:
+                    i.fb_publish_error = str(err)
+                    i.fb_publish_failed_at = datetime.now()
+                    # Lỗi không thể tự khỏi (video bị từ chối, thiếu quyền,
+                    # token hỏng) → dừng tự thử luôn, chờ người dùng xử lý.
+                    i.fb_publish_fail_count = (
+                        max(i.fb_publish_fail_count + 1, SOCIAL_PUBLISH_MAX_AUTO_RETRY)
+                        if permanent
+                        else i.fb_publish_fail_count + 1
+                    )
+                    break
+
+    def target(job: jobs.JobState) -> None:
+        job.current_label = "Đang viết caption..."
+        try:
+            caption = _ensure_social_caption(social_id, aweme_id, project_id_for_caption)
+        except Exception as err:
+            logger.exception("Viết caption lỗi {}", social_id)
+            mark_failed(job, err, permanent=False)
+            return
+
+        def progress(msg: str) -> None:
+            job.current_label = f"[{page.name}] {msg}"
+
+        try:
+            result = fb_publish_stage.publish_reel(page.page_id, page.access_token, video_path, caption, on_progress=progress)
+        except fb_publish_stage.FacebookTokenError as err:
+            fb_store.mark_expired(page.page_id, str(err))
+            mark_failed(job, err, permanent=True)
+            return
+        except fb_publish_stage.FacebookPublishError as err:
+            mark_failed(job, err, permanent=err.permanent)
+            return
+        except Exception as err:
+            logger.exception("Đăng Facebook lỗi {}", social_id)
+            mark_failed(job, err, permanent=False)
+            return
+
+        job.status = "done"
+        job.current_label = f"Đã đăng lên {page.name}"
+        with sp.locked_state(social_id) as s:
+            s.facebook_last_post_at = datetime.now()
+            s.facebook_next_post_at = _next_post_for(s, "facebook", s.facebook_last_post_at)
+            for i in s.queue:
+                if i.aweme_id == aweme_id:
+                    i.fb_posted_at = datetime.now()
+                    i.fb_video_id = result["video_id"]
+                    i.fb_permalink = result.get("permalink_url")
+                    i.fb_publish_error = None
+                    i.fb_publish_failed_at = None
+                    i.fb_publish_fail_count = 0
+                    _finalize_if_published(s, i)
+                    break
+
+    return jobs.start_job(f"social:{social_id}:{aweme_id}:fbpublish", 1, target)
+
+
+@app.post("/api/social/{social_id}/queue/{aweme_id}/facebook-publish", status_code=202)
+def fb_publish_queue_item_route(social_id: str, aweme_id: str):
+    try:
+        job = _start_social_fb_publish(social_id, aweme_id, manual=True)
+    except ValueError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    if job is None:
+        raise HTTPException(status_code=409, detail="Đang đăng video này lên Facebook")
+    return {"status": "started"}
+
+
+@app.get("/api/social/{social_id}/queue/{aweme_id}/jobs/fbpublish", response_model=JobStatusResponse)
+def fb_publish_queue_item_job_status(social_id: str, aweme_id: str):
+    return _job_status_response(jobs.get_job(f"social:{social_id}:{aweme_id}:fbpublish"))
 
 
 @app.get("/api/social/{social_id}/queue/{aweme_id}/jobs/publish", response_model=JobStatusResponse)
@@ -4405,14 +4816,47 @@ def _in_posting_window(dt: datetime) -> bool:
     return any(start <= dt.hour < end for start, end in SOCIAL_POSTING_WINDOWS)
 
 
-def _compute_next_post_at(after: datetime, posts_per_day: int) -> datetime:
+def _parse_post_times(times: list[str] | None) -> list[tuple[int, int]]:
+    """["19:30", "10:00"] → [(10, 0), (19, 30)] — bỏ mốc sai định dạng."""
+    out: set[tuple[int, int]] = set()
+    for raw in times or []:
+        m = re.fullmatch(r"\s*(\d{1,2})[:hH.](\d{2})\s*", str(raw))
+        if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+            out.add((int(m.group(1)), int(m.group(2))))
+    return sorted(out)
+
+
+def _next_fixed_slot(after: datetime, times: list[str], jitter_min: int) -> datetime | None:
+    """Mốc giờ cố định kế tiếp SAU `after`, ± `jitter_min` phút ngẫu nhiên."""
+    slots = _parse_post_times(times)
+    if not slots:
+        return None
+    for day in range(8):
+        d = after.date() + timedelta(days=day)
+        for h, m in slots:
+            slot = datetime(d.year, d.month, d.day, h, m)
+            if slot > after:
+                jitter = random.uniform(-jitter_min, jitter_min) if jitter_min > 0 else 0.0
+                return max(slot + timedelta(minutes=jitter), after + timedelta(minutes=1))
+    return None
+
+
+def _compute_next_post_at(
+    after: datetime, posts_per_day: int, post_times: list[str] | None = None, jitter_min: int = 0
+) -> datetime:
     """Giờ đăng kế tiếp tính từ mốc `after` (lần đăng gần nhất).
+
+    Có `post_times` (người dùng đặt giờ cố định) → mốc kế tiếp trong danh sách
+    đó ± `jitter_min` phút. Không có → tự chọn trong khung giờ cao điểm:
 
     Giãn cách đo bằng "phút nằm trong khung giờ đăng", không phải phút đồng
     hồ: tổng các khung là 6h/ngày, nên với N bài/ngày thì mỗi bài cách nhau
     trung bình 6h/N phút-trong-khung (±20% ngẫu nhiên). Cách này tự trải đều
     đúng N bài/ngày vào các khung cao điểm, và phần thời gian ngoài khung (đêm,
     chiều) tự bị bỏ qua mà không cần xử lý riêng."""
+    fixed = _next_fixed_slot(after, post_times or [], jitter_min)
+    if fixed is not None:
+        return fixed
     ppd = min(max(posts_per_day, 1), 3)
     window_min_per_day = sum((end - start) * 60 for start, end in SOCIAL_POSTING_WINDOWS)
     target = window_min_per_day / ppd * random.uniform(1 - SOCIAL_POST_GAP_JITTER, 1 + SOCIAL_POST_GAP_JITTER)
@@ -4426,6 +4870,116 @@ def _compute_next_post_at(after: datetime, posts_per_day: int) -> datetime:
             if counted >= target:
                 break
     return t + timedelta(seconds=random.randint(0, 59))
+
+
+# ---- Nhiều nền tảng đăng (TikTok / Facebook Reels)
+# Mỗi nền tảng có lịch riêng và ghi nhận "đã đăng" riêng trên từng video —
+# xem SocialProjectState/QueueItem trong models.py.
+PLATFORMS = ("tiktok", "facebook")
+PLATFORM_LABELS = {"tiktok": "TikTok", "facebook": "Facebook"}
+# Giờ cố định bị lỡ quá ngần này phút (máy tắt, chưa có video sẵn sàng...) →
+# bỏ mốc đó, chờ mốc kế tiếp thay vì đăng lệch giờ người dùng đặt.
+FIXED_SLOT_GRACE_MIN = 90
+
+
+def _enabled_platforms(st) -> list[str]:
+    return [p for p, on in (("tiktok", st.tiktok_enabled), ("facebook", st.facebook_enabled)) if on]
+
+
+def _posted_on(item, platform: str) -> datetime | None:
+    return item.tiktok_posted_at if platform == "tiktok" else item.fb_posted_at
+
+
+def _item_publish_error(item, platform: str) -> tuple[str | None, datetime | None, int]:
+    if platform == "tiktok":
+        return item.publish_error, item.publish_failed_at, item.publish_fail_count
+    return item.fb_publish_error, item.fb_publish_failed_at, item.fb_publish_fail_count
+
+
+def _schedule(st, platform: str) -> tuple[int, list[str], datetime | None, datetime | None]:
+    """(số bài/ngày, giờ cố định, lần đăng gần nhất, giờ hẹn kế tiếp)."""
+    if platform == "tiktok":
+        return st.posts_per_day, st.tiktok_post_times, st.last_post_at, st.next_post_at
+    return st.facebook_posts_per_day, st.facebook_post_times, st.facebook_last_post_at, st.facebook_next_post_at
+
+
+def _daily_target(st, platform: str) -> int:
+    ppd, times, _, _ = _schedule(st, platform)
+    slots = _parse_post_times(times)
+    return len(slots) if slots else max(ppd, 1)
+
+
+def _next_post_for(st, platform: str, after: datetime) -> datetime:
+    ppd, times, _, _ = _schedule(st, platform)
+    return _compute_next_post_at(after, ppd, times, st.post_time_jitter_min)
+
+
+def _set_next_post(s, platform: str, value: datetime | None) -> None:
+    if platform == "tiktok":
+        s.next_post_at = value
+    else:
+        s.facebook_next_post_at = value
+
+
+def _posted_today_on(st, platform: str, today) -> int:
+    return sum(1 for i in st.queue if (t := _posted_on(i, platform)) and t.date() == today)
+
+
+def _unposted_ready(st, platform: str) -> list:
+    return [i for i in st.queue if i.status == QueueItemStatus.ready and not _posted_on(i, platform)]
+
+
+def _finalize_if_published(st, item) -> bool:
+    """Video sẵn sàng mà MỌI nền tảng đang bật đã đăng xong → `posted`. Gọi
+    trong `sp.locked_state`. Không nền tảng nào bật thì không đánh dấu (nếu
+    không video sẽ bị coi là đã đăng rồi bị tự dọn file)."""
+    platforms = _enabled_platforms(st)
+    if item.status != QueueItemStatus.ready or not platforms:
+        return False
+    times = [_posted_on(item, p) for p in platforms]
+    if not all(times):
+        return False
+    item.status = QueueItemStatus.posted
+    item.posted_at = max(times)
+    return True
+
+
+def _reconcile_schedules(states: list, now: datetime) -> bool:
+    """Việc định kỳ mỗi tick cho phần đăng bài, trả True nếu có sửa gì:
+    - video đã đăng đủ các nền tảng đang bật (vd vừa tắt 1 nền tảng) → posted;
+    - giờ hẹn chưa có / giờ cố định đã lỡ quá lâu → tính lại."""
+    changed = False
+    for st in states:
+        fix = any(
+            i.status == QueueItemStatus.ready and _enabled_platforms(st) and all(_posted_on(i, p) for p in _enabled_platforms(st))
+            for i in st.queue
+        )
+        for p in _enabled_platforms(st):
+            _, times, last, nxt = _schedule(st, p)
+            fixed = bool(_parse_post_times(times))
+            if nxt is None and (last is not None or fixed):
+                fix = True
+            elif fixed and nxt is not None and now > nxt + timedelta(minutes=FIXED_SLOT_GRACE_MIN):
+                fix = True
+        if not fix:
+            continue
+        try:
+            with sp.locked_state(st.id) as s:
+                for i in s.queue:
+                    _finalize_if_published(s, i)
+                for p in _enabled_platforms(s):
+                    _, times, last, nxt = _schedule(s, p)
+                    fixed = bool(_parse_post_times(times))
+                    if nxt is None and fixed:
+                        _set_next_post(s, p, _next_post_for(s, p, now))
+                    elif nxt is None and last is not None:
+                        _set_next_post(s, p, _next_post_for(s, p, last))
+                    elif fixed and nxt is not None and now > nxt + timedelta(minutes=FIXED_SLOT_GRACE_MIN):
+                        _set_next_post(s, p, _next_post_for(s, p, now))
+            changed = True
+        except FileNotFoundError:
+            pass
+    return changed
 
 
 # ---- Hàng đợi CHUNG cho mọi dự án tự động
@@ -4632,9 +5186,20 @@ def _pipeline_plan(states: list, now: datetime) -> tuple[list[dict], list[dict]]
         ready = sum(1 for i in st.queue if i.status == QueueItemStatus.ready)
         processing = any(i.status == QueueItemStatus.processing for i in st.queue)
         failed = [i for i in st.queue if i.status == QueueItemStatus.failed]
-        ppd = max(st.posts_per_day, 1)
-        posted_today = _posted_today(st, today)
-        need_today = max(0, ppd - posted_today)
+        # Tính riêng từng nền tảng đang bật: nền tảng nào còn thiếu video sẵn
+        # sàng cho số bài của nó thì dự án cần xử lý thêm (video đã đăng
+        # TikTok nhưng còn chờ Facebook không tính là "sẵn sàng" cho TikTok).
+        platforms = _enabled_platforms(st)
+        per = {
+            p: (_daily_target(st, p), _posted_today_on(st, p, today), len(_unposted_ready(st, p)))
+            for p in platforms
+        }
+        ppd = max((t for t, _, _ in per.values()), default=max(st.posts_per_day, 1))
+        posted_today = max((d for _, d, _ in per.values()), default=0)
+        need_today = max((max(0, t - d) for t, d, _ in per.values()), default=0)
+        short_today = any(r < max(0, t - d) for t, d, r in per.values())
+        short_ahead = any(r < max(0, t - d) + t for t, d, r in per.values())
+        all_done_today = bool(per) and all(d >= t for t, d, _ in per.values())
         entry = {
             "order": order,
             "social_id": st.id,
@@ -4654,14 +5219,16 @@ def _pipeline_plan(states: list, now: datetime) -> tuple[list[dict], list[dict]]
         }
         if st.status != "active":
             entry["status"], entry["reason"] = "paused", "Dự án đang tạm dừng"
+        elif not platforms:
+            entry["status"], entry["reason"] = "paused", "Chưa bật nền tảng đăng nào (TikTok/Facebook)"
         elif processing:
             entry["status"] = "processing"
         elif failed:
             entry["status"] = "stopped_failed"
             entry["reason"] = f"Có {len(failed)} video lỗi — thử lại hoặc bỏ qua để dự án chạy tiếp"
-        elif posted_today >= ppd:
+        elif all_done_today:
             entry["status"] = "done_today"
-        elif ready >= need_today:
+        elif not short_today:
             entry["status"] = "prepared"
         elif _douyin_resting(st, now):
             entry["status"] = "resting"
@@ -4673,67 +5240,86 @@ def _pipeline_plan(states: list, now: datetime) -> tuple[list[dict], list[dict]]
         daily.append(entry)
 
         can_process = (
-            st.status == "active" and not processing and not failed and pending and not _douyin_resting(st, now)
+            st.status == "active"
+            and platforms
+            and not processing
+            and not failed
+            and pending
+            and not _douyin_resting(st, now)
         )
         if not can_process:
             continue
-        if ready < need_today:
+        if short_today:
             pass1.append(entry)
-        elif ready < need_today + ppd:
+        elif short_ahead:
             pass2.append({**entry, "ahead": True})
     return pass1 + pass2, daily
 
 
-def _publish_plan(states: list, now: datetime) -> list[dict]:
-    """Lịch đăng của mọi dự án đang chạy, sắp theo giờ hẹn (sớm nhất trước).
-    Đăng đủ posts_per_day bài trong ngày thì dừng tới hôm sau."""
+def _publish_plan(states: list, now: datetime, platform: str = "tiktok") -> list[dict]:
+    """Lịch đăng lên 1 nền tảng của mọi dự án đang chạy (bật nền tảng đó), sắp
+    theo giờ hẹn (sớm nhất trước). Đăng đủ số bài/ngày thì dừng tới hôm sau."""
     plan: list[dict] = []
-    in_window = _in_posting_window(now)
     today = now.date()
-    accounts = {a.id: a for a in acc_store.list_accounts()}
+    accounts = {a.id: a for a in acc_store.list_accounts()} if platform == "tiktok" else {}
+    fb_pages = {p.page_id: p for p in fb_store.list_pages()} if platform == "facebook" else {}
+    running = jobs.running_keys()
     for st in states:
-        if st.status != "active":
+        if st.status != "active" or platform not in _enabled_platforms(st):
             continue
-        account = accounts.get(st.tiktok_account_id) if st.tiktok_account_id else None
+        ppd, times, last_post_at, next_post_at = _schedule(st, platform)
+        fixed = bool(_parse_post_times(times))
+        # Giờ cố định do người dùng đặt thì không bó theo khung giờ cao điểm.
+        in_window = fixed or _in_posting_window(now)
+        target = _daily_target(st, platform)
+        if platform == "tiktok":
+            account = accounts.get(st.tiktok_account_id) if st.tiktok_account_id else None
+            account_name = account.username if account else ""
+            account_status = account.status if account else None
+            account_bad = account is not None and account.status in ("expired", "mismatch")
+            account_busy = account is not None and _account_window_open(account.id)
+        else:
+            page = fb_pages.get(st.facebook_page_id) if st.facebook_page_id else None
+            account = page
+            account_name = page.name if page else ""
+            account_status = page.status if page else None
+            account_bad = page is not None and page.status == "expired"
+            account_busy = False
         # Bỏ qua video mà project của nó đang chạy 1 bước (vd người dùng bấm
         # "Xuất lại video"): file final.mp4 đang ghi dở, đăng lúc này sẽ lỗi
         # hoặc đăng bản hỏng. Xuất xong nó tự quay lại lượt đăng.
-        running = jobs.running_keys()
         ready = sorted(
             (
-                i for i in st.queue
-                if i.status == QueueItemStatus.ready
-                and not (i.project_id and any(k.startswith(f"{i.project_id}:") for k in running))
+                i for i in _unposted_ready(st, platform)
+                if not (i.project_id and any(k.startswith(f"{i.project_id}:") for k in running))
             ),
             key=_video_age_key,
         )
-        posted_today = _posted_today(st, today)
-        due_time = st.next_post_at is None or now >= st.next_post_at
+        posted_today = _posted_today_on(st, platform, today)
+        due_time = (next_post_at is None and not fixed) or (next_post_at is not None and now >= next_post_at)
         head = ready[0] if ready else None
-        publish_error = head.publish_error if head else None
+        publish_error, failed_at, fail_count = _item_publish_error(head, platform) if head else (None, None, 0)
         retry_at = (
-            head.publish_failed_at + timedelta(minutes=SOCIAL_PUBLISH_RETRY_MIN)
-            if head and head.publish_error and head.publish_failed_at
-            else None
+            failed_at + timedelta(minutes=SOCIAL_PUBLISH_RETRY_MIN) if publish_error and failed_at else None
         )
-        if posted_today >= max(st.posts_per_day, 1):
+        if posted_today >= target:
             status = "done_today"
         elif not ready:
             status = "no_ready"
         elif account is None:
             status = "no_account"
-        elif account.status in ("expired", "mismatch"):
-            # Biết trước là sẽ lỗi — không mở Chrome thử đăng cho tốn lượt
-            # thử lại, chờ người dùng đăng nhập lại/kiểm tra ở trang Tài khoản.
+        elif account_bad:
+            # Biết trước là sẽ lỗi — không thử đăng cho tốn lượt thử lại, chờ
+            # người dùng đăng nhập lại / nhập lại token ở trang Tài khoản.
             status = "account_problem"
-        elif _account_window_open(account.id):
+        elif account_busy:
             # Người dùng đang mở cửa sổ Chrome của tài khoản (Xem/Đăng nhập) —
             # Chrome không cho 2 nơi mở chung 1 profile, chờ đóng rồi mới đăng.
             status = "account_busy"
-        elif head.publish_error and head.publish_fail_count >= SOCIAL_PUBLISH_MAX_AUTO_RETRY:
-            # Đăng lỗi nhiều lần liên tiếp — ngừng tự thử (tránh mở Chrome
-            # liên tục khi vd tài khoản TikTok bị đăng xuất), chờ người dùng
-            # bấm "Đăng lại". Giữ đúng thứ tự: không nhảy sang video sau.
+        elif publish_error and fail_count >= SOCIAL_PUBLISH_MAX_AUTO_RETRY:
+            # Đăng lỗi nhiều lần liên tiếp (hoặc lỗi không thể tự khỏi) — ngừng
+            # tự thử, chờ người dùng bấm "Đăng lại". Giữ đúng thứ tự: không
+            # nhảy sang video sau.
             status = "needs_manual"
         elif not due_time:
             status = "scheduled"
@@ -4744,21 +5330,23 @@ def _publish_plan(states: list, now: datetime) -> list[dict]:
         else:
             status = "due"
         plan.append({
+            "platform": platform,
             "social_id": st.id,
             "social_title": st.title,
-            "next_post_at": st.next_post_at,
-            "last_post_at": st.last_post_at,
-            "posts_per_day": st.posts_per_day,
+            "next_post_at": next_post_at,
+            "last_post_at": last_post_at,
+            "posts_per_day": target,
+            "post_times": [f"{h:02d}:{m:02d}" for h, m in _parse_post_times(times)],
             "posted_today": posted_today,
             "ready_count": len(ready),
-            "aweme_id": ready[0].aweme_id if ready else None,
-            "video_title": (ready[0].title if ready else "") or "",
+            "aweme_id": head.aweme_id if head else None,
+            "video_title": (head.title if head else "") or "",
             "status": status,
             "publish_error": publish_error,
-            "publish_fail_count": head.publish_fail_count if head else 0,
+            "publish_fail_count": fail_count,
             "retry_at": retry_at,
-            "account_username": account.username if account else "",
-            "account_status": account.status if account else None,
+            "account_username": account_name,
+            "account_status": account_status,
         })
     plan.sort(key=lambda e: e["next_post_at"] or datetime.min)
     return plan
@@ -4778,6 +5366,23 @@ def _maybe_check_accounts(active: list, now: datetime) -> None:
         _start_account_check(stale[0].id)
 
 
+def _maybe_check_fb_pages(active: list, now: datetime) -> None:
+    """Kiểm tra token Facebook Page của dự án đang chạy (mỗi tick tối đa 1, cũ
+    nhất trước) — phát hiện token hỏng trước giờ đăng."""
+    wanted = {st.facebook_page_id for st in active if st.facebook_enabled and st.facebook_page_id}
+    stale = [
+        p for p in fb_store.list_pages()
+        if p.page_id in wanted
+        and (p.checked_at is None or now - p.checked_at >= timedelta(hours=ACCOUNT_CHECK_INTERVAL_H))
+    ]
+    stale.sort(key=lambda p: p.checked_at or datetime.min)
+    if stale:
+        try:
+            fb_store.check_page(stale[0].page_id)
+        except Exception:
+            logger.exception("social scheduler: kiểm tra Facebook Page {} lỗi", stale[0].page_id)
+
+
 def _social_scheduler_tick() -> None:
     try:
         states = _load_all_social_states()
@@ -4793,16 +5398,10 @@ def _social_scheduler_tick() -> None:
     if social_cleanup.maybe_run():
         states = _load_all_social_states()
 
-    # Dự án cũ chưa có giờ hẹn đăng → tính bù 1 lần từ `last_post_at`.
-    for st in states:
-        if st.next_post_at is None and st.last_post_at is not None:
-            try:
-                with sp.locked_state(st.id) as s_next:
-                    if s_next.next_post_at is None:
-                        s_next.next_post_at = _compute_next_post_at(s_next.last_post_at, s_next.posts_per_day)
-                    st.next_post_at = s_next.next_post_at
-            except FileNotFoundError:
-                pass
+    # Giờ hẹn đăng chưa có / giờ cố định đã lỡ → tính lại; video đã đăng đủ các
+    # nền tảng đang bật → posted.
+    if _reconcile_schedules(states, now):
+        states = _load_all_social_states()
 
     active = [st for st in states if st.status == "active"]
 
@@ -4862,18 +5461,25 @@ def _social_scheduler_tick() -> None:
     # 3) Kiểm tra tài khoản TikTok của dự án đang chạy (mỗi tick tối đa 1, cũ
     # nhất trước) — phát hiện hết đăng nhập TRƯỚC giờ đăng thay vì lúc đăng lỗi.
     _maybe_check_accounts(active, now)
+    _maybe_check_fb_pages(active, now)
 
-    # 4) Đăng bài — 1 bài tại 1 thời điểm, chỉ trong khung giờ đăng, dự án
-    # trễ giờ hẹn lâu nhất được đăng trước.
-    if not _running_job_suffix(":publish"):
-        for entry in (e for e in _publish_plan(active, now) if e["status"] == "due"):
+    # 4) Đăng bài — mỗi nền tảng 1 bài tại 1 thời điểm (TikTok mở Chrome,
+    # Facebook gọi API — 2 nền tảng chạy song song được), dự án trễ giờ hẹn
+    # lâu nhất được đăng trước.
+    for platform, suffix, start in (
+        ("tiktok", ":publish", _start_social_publish),
+        ("facebook", ":fbpublish", _start_social_fb_publish),
+    ):
+        if _running_job_suffix(suffix):
+            continue
+        for entry in (e for e in _publish_plan(active, now, platform) if e["status"] == "due"):
             try:
-                if _start_social_publish(entry["social_id"], entry["aweme_id"]) is not None:
+                if start(entry["social_id"], entry["aweme_id"]) is not None:
                     break
             except ValueError as err:
-                logger.warning("social scheduler: đăng bài lỗi cho '{}': {}", entry["social_id"], err)
+                logger.warning("social scheduler: đăng {} lỗi cho '{}': {}", platform, entry["social_id"], err)
             except Exception:
-                logger.exception("social scheduler: đăng bài lỗi cho '{}'", entry["social_id"])
+                logger.exception("social scheduler: đăng {} lỗi cho '{}'", platform, entry["social_id"])
 
 
 @app.get("/api/cleanup")
@@ -4984,7 +5590,10 @@ def social_monitor_route():
         return rows
 
     process_queue, daily_plan = _pipeline_plan(states, now)
-    publish_plan = _publish_plan(states, now)
+    publish_plan = sorted(
+        _publish_plan(states, now, "tiktok") + _publish_plan(states, now, "facebook"),
+        key=lambda e: e["next_post_at"] or datetime.min,
+    )
     all_items = [it for st in states for it in st.queue]
     today = now.date()
     return {
@@ -4992,7 +5601,9 @@ def social_monitor_route():
         "in_posting_window": _in_posting_window(now),
         "posting_windows": [f"{a}h-{b}h" for a, b in SOCIAL_POSTING_WINDOWS],
         "processing": processing,
-        "publishing": _job_rows(":publish"),
+        "publishing": [
+            {**r, "platform": "tiktok"} for r in _job_rows(":publish")
+        ] + [{**r, "platform": "facebook"} for r in _job_rows(":fbpublish")],
         "crawling": _job_rows(":crawl"),
         "pipeline_queue": process_queue,
         "daily_plan": daily_plan,

@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 STAGE_ORDER = ("ingest", "transcribe", "translate", "tts", "assemble")
 # "assemble" ở cuối chỉ thật sự dùng cho dự án "split" (mỗi đoạn tự ráp draft
@@ -106,11 +106,23 @@ class ProjectState(BaseModel):
     # caption người dùng dán lần gần nhất + lịch sử các lần đăng thành công.
     tiktok_caption: str = ""
     tiktok_posts: list["TikTokPostRecord"] = Field(default_factory=list)
+    # Đăng tay lên Facebook Page (Reels) — cùng ý nghĩa 2 field TikTok ở trên.
+    facebook_caption: str = ""
+    facebook_posts: list["FacebookPostRecord"] = Field(default_factory=list)
 
 
 class TikTokPostRecord(BaseModel):
     account_id: str
     username: str = ""
+    caption: str = ""
+    posted_at: datetime
+
+
+class FacebookPostRecord(BaseModel):
+    page_id: str
+    page_name: str = ""
+    video_id: str = ""
+    permalink_url: Optional[str] = None
     caption: str = ""
     posted_at: datetime
 
@@ -175,6 +187,30 @@ class QueueItem(BaseModel):
     # bằng `translate.generate_caption` lần đầu đăng rồi lưu lại dùng cho các
     # lần đăng lại; người dùng sửa được trước khi đăng.
     caption_vi: Optional[str] = None
+    # Mỗi nền tảng ghi nhận riêng — `status=posted`/`posted_at` chỉ khi MỌI nền
+    # tảng đang bật của dự án đã đăng xong (xem `_finalize_if_published` trong
+    # main.py), nên TikTok xong mà Facebook lỗi thì chỉ thử lại Facebook, không
+    # đăng trùng TikTok. `publish_error/_failed_at/_fail_count` ở trên là của
+    # TikTok (giữ tên cũ), `fb_*` là của Facebook.
+    tiktok_posted_at: Optional[datetime] = None
+    fb_posted_at: Optional[datetime] = None
+    fb_video_id: Optional[str] = None
+    fb_permalink: Optional[str] = None
+    fb_publish_error: Optional[str] = None
+    fb_publish_failed_at: Optional[datetime] = None
+    fb_publish_fail_count: int = 0
+
+    @model_validator(mode="after")
+    def _legacy_tiktok_posted(self) -> "QueueItem":
+        # Video đã `posted` từ trước khi có nhiều nền tảng — chỉ có thể là TikTok.
+        if (
+            self.status == QueueItemStatus.posted
+            and self.tiktok_posted_at is None
+            and self.fb_posted_at is None
+            and self.posted_at is not None
+        ):
+            self.tiktok_posted_at = self.posted_at
+        return self
 
 
 class SocialProjectSummary(BaseModel):
@@ -269,11 +305,47 @@ class SocialProjectState(BaseModel):
     # profile Chrome lấy theo tài khoản, `tiktok_session_path` chỉ còn là
     # đường dẫn cũ trước khi có trang Tài khoản.
     tiktok_account_id: str = ""
+    # Nền tảng đăng — bật/tắt riêng, mỗi nền tảng có lịch riêng:
+    # - TikTok: `posts_per_day` / `last_post_at` / `next_post_at` ở trên (tên cũ).
+    # - Facebook: các field `facebook_*` bên dưới.
+    # `*_post_times` rỗng = tự chọn giờ ngẫu nhiên trong khung giờ cao điểm;
+    # có giá trị (vd ["10:00", "19:30"]) = đăng đúng các giờ đó ±
+    # `post_time_jitter_min` phút, số bài/ngày = số mốc giờ.
+    tiktok_enabled: bool = True
+    tiktok_post_times: list[str] = Field(default_factory=list)
+    facebook_enabled: bool = False
+    # id Page trong app/fb_pages.py (token lưu ở đó, không lưu trong dự án).
     facebook_page_id: str = ""
-    facebook_page_token: str = ""
+    facebook_posts_per_day: int = 1
+    facebook_post_times: list[str] = Field(default_factory=list)
+    facebook_last_post_at: Optional[datetime] = None
+    facebook_next_post_at: Optional[datetime] = None
+    post_time_jitter_min: int = 10
 
 
 AccountStatus = Literal["unknown", "ok", "expired", "mismatch", "error"]
+
+
+class FacebookPage(BaseModel):
+    """1 Facebook Page đăng Reels qua Graph API bằng Page access token. Token
+    CHỈ nằm trong file này ở máy người dùng — API trả về frontend luôn che đi."""
+
+    page_id: str
+    name: str = ""
+    category: Optional[str] = None
+    picture_url: Optional[str] = None
+    access_token: str
+    # Unix time token hết hạn — 0 = không hết hạn, None = không rõ.
+    token_expires_at: Optional[int] = None
+    # "oauth" (đăng nhập Facebook trong tool) | "pagesmanager" (nhập từ
+    # PagesManagerSupperTool) | "token" (dán tay)
+    source: str = "token"
+    # ok = token còn dùng được; expired = hết hạn/bị thu hồi; error = không
+    # kiểm tra được (mạng...); unknown = chưa kiểm tra.
+    status: Literal["unknown", "ok", "expired", "error"] = "unknown"
+    status_detail: Optional[str] = None
+    checked_at: Optional[datetime] = None
+    added_at: datetime
 
 
 class TikTokAccount(BaseModel):

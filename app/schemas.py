@@ -70,6 +70,14 @@ class UpdateSocialProjectRequest(BaseModel):
     min_video_speed: Optional[float] = None
     use_viesnap_fallback: Optional[bool] = None
     crawl_via_browser: Optional[bool] = None
+    # Nền tảng đăng + lịch riêng từng nền tảng — `*_post_times` là danh sách
+    # "HH:MM", rỗng = tự chọn giờ trong khung cao điểm.
+    tiktok_enabled: Optional[bool] = None
+    tiktok_post_times: Optional[list[str]] = None
+    facebook_enabled: Optional[bool] = None
+    facebook_posts_per_day: Optional[int] = Field(None, ge=1, le=3)
+    facebook_post_times: Optional[list[str]] = None
+    post_time_jitter_min: Optional[int] = Field(None, ge=0, le=60)
 
 
 class UpdateAutoPipelineRequest(BaseModel):

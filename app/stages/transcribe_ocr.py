@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -63,6 +64,10 @@ def _load_engine():
 
 
 _region_engine = None
+# RapidOCR không đảm bảo an toàn khi 2 thread gọi CHUNG 1 engine cùng lúc — lượt
+# dò sớm sau ingest (main._start_early_blur_detect) và transcribe từng chạy
+# song song trên cùng engine này. Khoá quanh mỗi lần gọi engine.
+_region_engine_lock = threading.Lock()
 
 
 def _load_region_engine():
@@ -153,10 +158,20 @@ _SIG_EMPTY_CELLS = 12  # ít hơn ngần này ô có chữ ở cả 2 khung = c�
 _SIG_DIFF_RATIO = 0.3
 
 
+#
+# Sửa lần 3: đo độ sáng theo kênh màu SÁNG NHẤT (max R/G/B) thay vì grayscale
+# — phụ đề màu (vàng/cam/đỏ tươi...) có độ sáng grayscale chỉ ~150-190, dưới
+# ngưỡng 200, mặt nạ chữ luôn RỖNG → mọi khung "giống nhau" → câu đầu tiên bị
+# dùng lại suốt 85s (đã xác nhận thật: kênh câu cá phụ đề vàng cam, chỉ 7/100
+# khung được OCR thật). Viền đen vẫn là max(R,G,B) thấp nên không đổi.
+_MAX_REUSE_FRAMES = 5  # dù khung "giống", tối đa ngần này khung liên tiếp là OCR thật lại 1 lần
+
+
 def _frame_signature(frame_path: Path) -> np.ndarray:
-    img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    color = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+    if color is None:
         return np.zeros((_SIG_SIZE[1], _SIG_SIZE[0]), dtype=bool)
+    img = color.max(axis=2)
     bright = (img >= 200).astype(np.uint8)
     dark = (img <= 70).astype(np.uint8)
     k = max(3, round(img.shape[0] / 60)) | 1  # độ dày viền tỉ lệ theo độ phân giải
@@ -200,7 +215,43 @@ def _ocr_text(engine, frame_path: Path) -> str:
     return "".join(t for _, t in boxes)
 
 
+_RegionKey = tuple[str, int, int, Optional[tuple[float, float, float, float]]]
+_region_cache: dict[_RegionKey, Optional[tuple[float, float, float, float]]] = {}
+_region_key_locks: dict[_RegionKey, threading.Lock] = {}
+_region_cache_guard = threading.Lock()
+
+
 def detect_subtitle_region(
+    video_path: Path,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    search_region: Optional[tuple[float, float, float, float]] = None,
+) -> Optional[tuple[float, float, float, float]]:
+    """Như `_detect_subtitle_region_uncached`, nhưng mỗi video (theo đường dẫn +
+    kích thước + mtime + vùng quét) chỉ dò 1 lần mỗi phiên chạy: lượt dò sớm
+    sau ingest và transcribe/export cùng cần vùng này, trước đây chạy SONG
+    SONG 2 lượt (~3 phút mỗi lượt trên video 7 phút) — giờ lượt sau chờ và
+    dùng lại kết quả lượt trước."""
+    try:
+        st = video_path.stat()
+    except OSError:
+        return _detect_subtitle_region_uncached(video_path, on_progress, search_region)
+    key: _RegionKey = (str(video_path.resolve()), st.st_size, int(st.st_mtime), search_region)
+    with _region_cache_guard:
+        if key in _region_cache:
+            return _region_cache[key]
+        key_lock = _region_key_locks.setdefault(key, threading.Lock())
+    with key_lock:
+        with _region_cache_guard:
+            if key in _region_cache:
+                return _region_cache[key]
+        result = _detect_subtitle_region_uncached(video_path, on_progress, search_region)
+        with _region_cache_guard:
+            _region_cache[key] = result
+            _region_key_locks.pop(key, None)
+        return result
+
+
+def _detect_subtitle_region_uncached(
     video_path: Path,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     search_region: Optional[tuple[float, float, float, float]] = None,
@@ -266,7 +317,8 @@ def detect_subtitle_region(
             if img is None:
                 continue
             h, w = img.shape[:2]
-            result = engine(str(frame))
+            with _region_engine_lock:
+                result = engine(str(frame))
             if not result.txts:
                 continue
             scores = result.scores or [1.0] * len(result.txts)
@@ -327,41 +379,46 @@ def detect_subtitle_region(
     # xuất hiện ở MỌI khung nên đếm còn đông hơn cả phụ đề, nếu chỉ đếm số
     # lượng thô sẽ chọn nhầm logo làm "dải chữ chính").
     _MAX_REPEAT_FRAC = 0.6  # > 60% box cùng 1 nội dung y hệt → coi là logo tĩnh
+    # Phụ đề DI ĐỘNG (chữ hiệu ứng bay/nhảy khắp khung hình, karaoke động...)
+    # và CHỮ TRONG CẢNH (biển hiệu cửa hàng, bảng giá...) khác phụ đề hội
+    # thoại thường: dù đổi độ dài câu, TÂM ngang (center-x) của phụ đề hội
+    # thoại vẫn dao động RẤT ít quanh 1 vị trí quen thuộc (thường giữa khung
+    # hoặc lề trái cố định) — còn 2 loại kia thì tâm-x trải rộng/rải rác.
+    _MAX_CENTER_X_STD = 0.12  # phân số chiều rộng khung hình
+    # Dải được chọn phải có ít nhất ngần này box — 1-2 box lẻ ở 1 dải hiếm
+    # hoi (nhiễu) không đủ tin để lấy làm vùng phụ đề cho cả video.
+    _MIN_GROUP_BOXES = 3
     candidate_bins = sorted(range(_NUM_BINS), key=lambda b: bin_counts[b], reverse=True)
     matched: list[tuple[float, float, float, float, str]] = []
     for bin_idx in candidate_bins:
         if bin_counts[bin_idx] == 0:
             break
         group = _boxes_in_bin(bin_idx)
-        if not group:
+        if len(group) < _MIN_GROUP_BOXES:
             continue
         texts = [b[4] for b in group]
         most_common_count = max(texts.count(t) for t in set(texts))
-        if most_common_count / len(texts) > _MAX_REPEAT_FRAC and len(group) >= 3:
+        if most_common_count / len(texts) > _MAX_REPEAT_FRAC:
             continue  # nghi logo tĩnh — thử bin đông kế tiếp
+        # Tâm-x rải rác → chữ trong cảnh/di động, thử dải đông KẾ TIẾP thay
+        # vì bỏ cuộc cả video. Đã xác nhận thật (kênh câu cá quay ngoài phố):
+        # biển hiệu cửa hàng ở y≈0.33 cho NHIỀU box hơn cả dải phụ đề thật ở
+        # y≈0.74 — bản cũ chọn dải biển hiệu, thấy tâm-x rải rác rồi trả None
+        # luôn, transcribe lùi về crop 25% đáy cắt đôi dòng phụ đề → OCR ra
+        # chữ rác, 1 câu kéo dài 85s.
+        std_x = float(np.std([(b[0] + b[1]) / 2 for b in group]))
+        if std_x > _MAX_CENTER_X_STD:
+            logger.info(
+                "detect_subtitle_region: bỏ dải y≈{:.2f} (tâm-X rải rác, std={:.3f}) — thử dải kế tiếp",
+                (bin_idx + 0.5) / _NUM_BINS, std_x,
+            )
+            continue
         matched = group
         break
 
     if not matched:
+        logger.warning("detect_subtitle_region: không có dải chữ nào giống phụ đề hội thoại — bỏ qua auto-dò")
         return None
-
-    # Phụ đề DI ĐỘNG (chữ hiệu ứng bay/nhảy khắp khung hình, karaoke động...)
-    # khác phụ đề hội thoại thường: dù đổi độ dài câu, TÂM ngang (center-x)
-    # của phụ đề hội thoại vẫn dao động RẤT ít quanh 1 vị trí quen thuộc
-    # (thường giữa khung hoặc lề trái cố định) — còn chữ di động thì tâm-x
-    # trải rộng/rải rác. 1 box che TĨNH DUY NHẤT không hợp cho trường hợp
-    # này (che sai vị trí phần lớn thời gian) — bỏ qua auto-che, để người
-    # dùng tự khoanh tay nếu cần (không cố ép che sai).
-    _MAX_CENTER_X_STD = 0.12  # phân số chiều rộng khung hình
-    if len(matched) >= 4:
-        center_xs = [(b[0] + b[1]) / 2 for b in matched]
-        std_x = float(np.std(center_xs))
-        if std_x > _MAX_CENTER_X_STD:
-            logger.warning(
-                "detect_subtitle_region: phụ đề nghi DI ĐỘNG (std tâm-X={:.3f} > {}) — bỏ qua auto-che",
-                std_x, _MAX_CENTER_X_STD,
-            )
-            return None
 
     def _percentile(values: list[float], p: float) -> float:
         s = sorted(values)
@@ -380,7 +437,12 @@ def detect_subtitle_region(
     # chiều cao so với text cũ". Đo thật trên video xam-xi-du: dải che 155px =
     # 2.1x dòng chữ; đệm 15% chiều cao chữ → 118px (1.6x), vẫn che trọn 94%
     # box chữ gốc (các phương án chặt hơn lọt chữ nhiều hơn: 86-88%).
-    _PAD_Y_TEXT_FRAC = 0.15
+    # Sửa lần 2 → 0: box OCR vốn đã rộng hơn nét chữ thật ~1% khung hình mỗi
+    # cạnh (đo thật trên kênh câu cá: box 0.709-0.782, chữ kể cả viền chỉ
+    # 0.718-0.774), cộng thêm đệm làm lõi dày gần gấp đôi dòng chữ; mép mềm
+    # (export_direct.BLUR_FEATHER_RATIO) đã phủ phần lệch nhỏ còn lại. Người
+    # dùng phản ánh vùng mờ "chiều cao lớn quá, muốn sát text".
+    _PAD_Y_TEXT_FRAC = 0.0
     median_h = float(np.median([b[3] - b[2] for b in matched]))
     pad_y = _PAD_Y_TEXT_FRAC * median_h
     x0 = max(0.0, _percentile([b[0] for b in matched], 0.10) - _PAD_FRAC)
@@ -430,7 +492,8 @@ def detect_subtitle_visibility(
             if img is None:
                 presence.append(False)
                 continue
-            result = engine(str(frame))
+            with _region_engine_lock:
+                result = engine(str(frame))
             has_text = False
             if result.txts:
                 scores = result.scores or [1.0] * len(result.txts)
@@ -493,15 +556,32 @@ def transcribe_video(
         prev_sig: Optional[np.ndarray] = None
         prev_text = ""
         ocr_calls = 0
+        reused = 0
+        # Mặt nạ chữ chỉ "thấy" phụ đề chữ sáng có viền tối. Kiểu phụ đề khác
+        # (vd chữ vàng nhạt viền cam + viền ngoài trắng, KHÔNG có viền tối —
+        # đã gặp thật) cho mặt nạ RỖNG dù đang có chữ → mọi khung bị coi là
+        # giống nhau. OCR thật đọc ra chữ mà mặt nạ trống = mặt nạ mù với kiểu
+        # phụ đề của video này → tắt hẳn bỏ-qua-khung, OCR mọi khung còn lại.
+        sig_blind = False
         for i, frame in enumerate(frames):
             if on_progress:
                 on_progress(i, total, f"OCR khung {i + 1}/{total}")
             sig = _frame_signature(frame)
-            if prev_sig is not None and _frames_similar(sig, prev_sig):
+            if (
+                not sig_blind
+                and prev_sig is not None
+                and _frames_similar(sig, prev_sig)
+                and reused < _MAX_REUSE_FRAMES
+            ):
                 text = prev_text  # khung gần như giống hệt khung trước — khỏi OCR lại
+                reused += 1
             else:
                 text = _ocr_text(engine, frame)
                 ocr_calls += 1
+                reused = 0
+                if text and not sig_blind and int(np.count_nonzero(sig)) < _SIG_EMPTY_CELLS:
+                    sig_blind = True
+                    logger.info("OCR: mặt nạ chữ không nhận ra kiểu phụ đề của video này — OCR mọi khung từ khung {}", i + 1)
             raw.append((i * frame_dur, text))
             prev_sig = sig
             prev_text = text

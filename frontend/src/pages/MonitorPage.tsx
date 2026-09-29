@@ -36,8 +36,8 @@ const PUBLISH_STATUS: Record<MonitorPublishEntry['status'], { label: string; tag
   scheduled: { label: 'Đã hẹn giờ', tag: 'tag-outline' },
   waiting_window: { label: 'Chờ khung giờ đăng', tag: 'tag-neutral' },
   no_ready: { label: 'Chưa có video sẵn sàng', tag: 'tag-neutral' },
-  no_account: { label: 'Chưa gán tài khoản TikTok', tag: 'tag-danger' },
-  account_problem: { label: 'Tài khoản TikTok cần đăng nhập lại', tag: 'tag-danger' },
+  no_account: { label: 'Chưa gán tài khoản / Page', tag: 'tag-danger' },
+  account_problem: { label: 'Tài khoản cần đăng nhập lại / token hết hạn', tag: 'tag-danger' },
   account_busy: { label: 'Đang mở cửa sổ Chrome của tài khoản — chờ đóng', tag: 'tag-neutral' },
 }
 
@@ -77,7 +77,7 @@ export default function MonitorPage() {
       <div>
         <h1 className="text-2xl">Giám sát tiến trình</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          Toàn hệ thống xử lý lần lượt 1 video, đăng 1 bài và crawl 1 kênh tại 1 thời điểm. Khung giờ đăng:{' '}
+          Toàn hệ thống xử lý lần lượt 1 video, đăng 1 bài mỗi nền tảng và crawl 1 kênh tại 1 thời điểm. Khung giờ đăng:{' '}
           {d.posting_windows.join(', ')} — {d.in_posting_window ? 'đang trong khung giờ đăng' : 'hiện ngoài khung giờ đăng'}.
           Tự làm mới mỗi 5 giây.
         </p>
@@ -147,8 +147,8 @@ export default function MonitorPage() {
           )
         })}
         {d.publishing.map((p) => (
-          <div key={`pub:${p.social_id}`} className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="tag tag-accent">Đăng TikTok</span>
+          <div key={`pub:${p.platform}:${p.social_id}`} className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="tag tag-accent">{p.platform === 'facebook' ? 'Đăng Facebook' : 'Đăng TikTok'}</span>
             <ProjectLink id={p.social_id} title={p.social_title} />
             <span className="text-xs text-neutral-400">{p.label}</span>
           </div>
@@ -211,13 +211,19 @@ export default function MonitorPage() {
           {!d.publish_plan.length && <p className="text-sm text-neutral-500">Chưa có dự án nào đang chạy.</p>}
           <ul className="space-y-2">
             {d.publish_plan.map((e) => (
-              <li key={e.social_id} className="flex flex-wrap items-center gap-2 text-sm">
+              <li key={`${e.platform}:${e.social_id}`} className="flex flex-wrap items-center gap-2 text-sm">
                 <span className="mono w-24 shrink-0 text-xs text-neutral-400">{fmtTime(e.next_post_at)}</span>
+                <span className="tag tag-outline">{e.platform === 'facebook' ? 'Facebook' : 'TikTok'}</span>
                 <ProjectLink id={e.social_id} title={e.social_title} />
                 <span className={`tag ${PUBLISH_STATUS[e.status].tag}`}>{PUBLISH_STATUS[e.status].label}</span>
-                {e.account_username && <span className="mono text-xs text-neutral-400">@{e.account_username}</span>}
+                {e.account_username && (
+                  <span className="mono text-xs text-neutral-400">
+                    {e.platform === 'facebook' ? e.account_username : `@${e.account_username}`}
+                  </span>
+                )}
                 <span className="text-xs text-neutral-500">
-                  {e.ready_count} sẵn sàng · {e.posts_per_day} bài/ngày
+                  {e.ready_count} sẵn sàng · {e.posted_today}/{e.posts_per_day} bài hôm nay
+                  {e.post_times?.length ? ` · giờ cố định ${e.post_times.join(', ')}` : ''}
                 </span>
                 {e.publish_error && (
                   <span className="w-full pl-26 text-xs text-danger">

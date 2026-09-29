@@ -35,7 +35,13 @@ LOGO_WIDTH_PX = 110
 # 0.3 — so thật trên video xam-xi-du (chữ trắng trên áo đen): 0.18 còn thấy
 # rõ vệt chữ gốc, 0.3 xoá mịn hơn mà vẫn giữ nền.
 BLUR_SIGMA_RATIO = 0.3
-BLUR_FEATHER_RATIO = 0.45
+# 0.45 → 0.2 → 0.08: mép mềm mỗi bên tính theo chiều cao LÕI, lõi dày thì mép
+# cũng dày — đo thật trên video dọc 1920px: dải nhìn thấy mờ 390px cho dòng
+# chữ ~105px ở 0.45. 0.2 (cùng lõi khít hơn, xem transcribe_ocr._PAD_Y_TEXT_FRAC)
+# còn 228px. Người dùng phản ánh vùng mờ vẫn rộng hơn hẳn viền chữ thật (xem
+# ảnh mẫu) — hạ tiếp xuống 0.08 để mép mờ khít sát chữ hơn, chấp nhận viền
+# chuyển tiếp mỏng hơn (đổi lấy khít, không còn dư nhiều khoảng nền quanh chữ).
+BLUR_FEATHER_RATIO = 0.08
 
 
 def _write_feather_mask(

@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type TikTokAccount } from '../lib/api'
 import { secondaryButtonClass } from '../lib/ui'
 import TikTokAccountIdentity from '../components/TikTokAccountIdentity'
+import FacebookPagesSection from '../components/FacebookPagesSection'
 
 // Trang "Tài khoản": mọi tài khoản TikTok dùng để đăng bài — đang đăng nhập
 // @ai, gán cho dự án tự động nào, còn phiên đăng nhập hay không. App tự kiểm
@@ -142,6 +143,12 @@ export default function AccountsPage() {
     refetchInterval: (q) => (q.state.data?.some((a) => a.busy) ? 2000 : 30_000),
   })
   const [newLabel, setNewLabel] = useState('')
+  // Tab đang mở nằm trên URL (?tab=facebook) — F5 hay mở link vẫn đúng tab.
+  const [params, setParams] = useSearchParams()
+  const tab: 'tiktok' | 'facebook' = params.get('tab') === 'facebook' ? 'facebook' : 'tiktok'
+  const fbQuery = useQuery({ queryKey: ['facebook-pages'], queryFn: api.listFacebookPages, refetchInterval: 60_000 })
+  const fbPages = fbQuery.data?.pages ?? []
+  const fbProblem = fbPages.filter((p) => p.status === 'expired').length
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['accounts'] })
 
@@ -165,64 +172,101 @@ export default function AccountsPage() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
-      <div>
-        <h1 className="text-2xl">Tài khoản TikTok</h1>
-        <p className="mt-1 text-sm text-neutral-500">
-          Mỗi tài khoản là một cửa sổ Chrome riêng đã đăng nhập tay. App đọc tên tài khoản thật để biết mỗi dự án đang
-          đăng lên kênh nào, tự kiểm tra lại mỗi 6 giờ, và không đăng khi tài khoản hết đăng nhập hoặc không khớp tài
-          khoản đã gán.
-        </p>
-      </div>
+      <h1 className="text-2xl">Tài khoản đăng bài</h1>
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <div className="card px-4 py-3">
-          <div className="text-xs text-neutral-500">Tổng tài khoản</div>
-          <div className="mono mt-1 text-2xl">{accounts.length}</div>
-        </div>
-        <div className="card px-4 py-3">
-          <div className="text-xs text-neutral-500">Đang đăng nhập</div>
-          <div className="mono mt-1 text-2xl">{counts.ok}</div>
-        </div>
-        <div className={`card px-4 py-3 ${counts.problem ? 'border-danger-300' : ''}`}>
-          <div className="text-xs text-neutral-500">Cần xử lý</div>
-          <div className="mono mt-1 text-2xl">{counts.problem}</div>
-        </div>
-        <div className="card px-4 py-3">
-          <div className="text-xs text-neutral-500">Chưa gán dự án</div>
-          <div className="mono mt-1 text-2xl">{counts.unassigned}</div>
-        </div>
-      </div>
-
-      <section className="card space-y-2 p-4">
-        <label htmlFor="new-account-label" className="block text-sm text-neutral-300">
-          Thêm tài khoản
-        </label>
-        <div className="flex flex-wrap gap-2">
-          <input
-            id="new-account-label"
-            className="input min-w-0 flex-1"
-            value={newLabel}
-            placeholder="Ghi chú (không bắt buộc), vd: Kênh Pokemon phụ"
-            onChange={(e) => setNewLabel(e.target.value)}
-          />
-          <button type="button" className="btn btn-primary" disabled={create.isPending} onClick={() => create.mutate()}>
-            Thêm và đăng nhập
+      <div role="tablist" className="flex gap-1 border-b border-neutral-800">
+        {(
+          [
+            ['tiktok', 'TikTok', accounts.length, counts.problem],
+            ['facebook', 'Facebook Page', fbPages.length, fbProblem],
+          ] as const
+        ).map(([key, label, total, problem]) => (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={tab === key}
+            onClick={() => setParams(key === 'tiktok' ? {} : { tab: key }, { replace: true })}
+            className={`-mb-px flex items-center gap-2 border-b-2 px-4 py-2 text-sm transition-colors ${
+              tab === key
+                ? 'border-accent text-text'
+                : 'border-transparent text-neutral-500 hover:text-neutral-300'
+            }`}
+          >
+            {label}
+            <span className="mono text-xs text-neutral-500">{total}</span>
+            {problem > 0 && (
+              <span className="tag tag-danger" title="Cần xử lý">
+                {problem}
+              </span>
+            )}
           </button>
-        </div>
-        <p className="text-xs text-neutral-500">
-          Một cửa sổ Chrome sẽ mở ra — đăng nhập tay (kể cả 2FA/captcha) rồi đóng cửa sổ. App tự đọc tên tài khoản sau
-          khi bạn đóng.
-        </p>
-        {create.error && <p className="text-sm text-danger">{(create.error as Error).message}</p>}
-      </section>
-
-      {query.isLoading && <div className="skeleton h-24" />}
-      {!query.isLoading && !accounts.length && <p className="text-sm text-neutral-500">Chưa có tài khoản nào.</p>}
-      <ul className="space-y-3">
-        {accounts.map((a) => (
-          <AccountRow key={a.id} account={a} onChanged={refresh} />
         ))}
-      </ul>
+      </div>
+
+      {tab === 'facebook' ? (
+        <FacebookPagesSection />
+      ) : (
+        <>
+          <div>
+            <p className="text-sm text-neutral-500">
+              Mỗi tài khoản là một cửa sổ Chrome riêng đã đăng nhập tay. App đọc tên tài khoản thật để biết mỗi dự án đang
+              đăng lên kênh nào, tự kiểm tra lại mỗi 6 giờ, và không đăng khi tài khoản hết đăng nhập hoặc không khớp tài
+              khoản đã gán.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="card px-4 py-3">
+              <div className="text-xs text-neutral-500">Tổng tài khoản</div>
+              <div className="mono mt-1 text-2xl">{accounts.length}</div>
+            </div>
+            <div className="card px-4 py-3">
+              <div className="text-xs text-neutral-500">Đang đăng nhập</div>
+              <div className="mono mt-1 text-2xl">{counts.ok}</div>
+            </div>
+            <div className={`card px-4 py-3 ${counts.problem ? 'border-danger-300' : ''}`}>
+              <div className="text-xs text-neutral-500">Cần xử lý</div>
+              <div className="mono mt-1 text-2xl">{counts.problem}</div>
+            </div>
+            <div className="card px-4 py-3">
+              <div className="text-xs text-neutral-500">Chưa gán dự án</div>
+              <div className="mono mt-1 text-2xl">{counts.unassigned}</div>
+            </div>
+          </div>
+
+          <section className="card space-y-2 p-4">
+            <label htmlFor="new-account-label" className="block text-sm text-neutral-300">
+              Thêm tài khoản
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <input
+                id="new-account-label"
+                className="input min-w-0 flex-1"
+                value={newLabel}
+                placeholder="Ghi chú (không bắt buộc), vd: Kênh Pokemon phụ"
+                onChange={(e) => setNewLabel(e.target.value)}
+              />
+              <button type="button" className="btn btn-primary" disabled={create.isPending} onClick={() => create.mutate()}>
+                Thêm và đăng nhập
+              </button>
+            </div>
+            <p className="text-xs text-neutral-500">
+              Một cửa sổ Chrome sẽ mở ra — đăng nhập tay (kể cả 2FA/captcha) rồi đóng cửa sổ. App tự đọc tên tài khoản sau
+              khi bạn đóng.
+            </p>
+            {create.error && <p className="text-sm text-danger">{(create.error as Error).message}</p>}
+          </section>
+
+          {query.isLoading && <div className="skeleton h-24" />}
+          {!query.isLoading && !accounts.length && <p className="text-sm text-neutral-500">Chưa có tài khoản nào.</p>}
+          <ul className="space-y-3">
+            {accounts.map((a) => (
+              <AccountRow key={a.id} account={a} onChanged={refresh} />
+            ))}
+          </ul>
+        </>
+      )}
     </div>
   )
 }

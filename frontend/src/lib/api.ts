@@ -80,6 +80,8 @@ export interface ProjectState {
   export_blur_region: number[] | null
   tiktok_caption?: string
   tiktok_posts?: { account_id: string; username: string; caption: string; posted_at: string }[]
+  facebook_caption?: string
+  facebook_posts?: FacebookPostRecord[]
 }
 
 export interface ProjectSummary {
@@ -215,6 +217,39 @@ export interface QueueItem {
   publish_failed_at?: string | null
   publish_fail_count?: number
   caption_vi?: string | null
+  tiktok_posted_at?: string | null
+  fb_posted_at?: string | null
+  fb_video_id?: string | null
+  fb_permalink?: string | null
+  fb_publish_error?: string | null
+  fb_publish_failed_at?: string | null
+  fb_publish_fail_count?: number
+}
+
+export type Platform = 'tiktok' | 'facebook'
+
+export interface FacebookPostRecord {
+  page_id: string
+  page_name: string
+  video_id: string
+  permalink_url: string | null
+  caption: string
+  posted_at: string
+}
+
+export interface FacebookPage {
+  page_id: string
+  name: string
+  category: string | null
+  picture_url: string | null
+  token_expires_at: number | null
+  token_masked: string
+  source: string
+  status: 'unknown' | 'ok' | 'expired' | 'error'
+  status_detail: string | null
+  checked_at: string | null
+  added_at: string
+  projects: { social_id: string; title: string }[]
 }
 
 export interface SocialProjectSummary {
@@ -251,8 +286,15 @@ export interface SocialProjectState extends SocialProjectSummary {
   douyin_backoff_level: number
   tiktok_session_path: string
   tiktok_account_id: string
+  tiktok_enabled: boolean
+  tiktok_post_times: string[]
+  facebook_enabled: boolean
   facebook_page_id: string
-  facebook_page_token: string
+  facebook_posts_per_day: number
+  facebook_post_times: string[]
+  facebook_last_post_at: string | null
+  facebook_next_post_at: string | null
+  post_time_jitter_min: number
 }
 
 export type MonitorDailyStatus =
@@ -285,6 +327,8 @@ export interface MonitorPipelineEntry {
 }
 
 export interface MonitorPublishEntry {
+  platform: Platform
+  post_times: string[]
   social_id: string
   social_title: string
   next_post_at: string | null
@@ -333,6 +377,7 @@ export interface TikTokAccount {
 }
 
 export interface MonitorJobRow {
+  platform?: Platform
   social_id: string
   social_title: string
   aweme_id: string | null
@@ -721,6 +766,12 @@ export const api = {
       min_video_speed: number
       use_viesnap_fallback: boolean
       crawl_via_browser: boolean
+      tiktok_enabled: boolean
+      tiktok_post_times: string[]
+      facebook_enabled: boolean
+      facebook_posts_per_day: number
+      facebook_post_times: string[]
+      post_time_jitter_min: number
     }>,
   ) => request<SocialProjectState>(`/api/social/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteSocial: (id: string) => request<void>(`/api/social/${id}`, { method: 'DELETE' }),
@@ -776,10 +827,10 @@ export const api = {
   douyinBrowserLoginJob: () => request<JobStatus>('/api/douyin-browser/login-job'),
   tiktokLoginStatus: (id: string) =>
     request<{ logged_in: boolean; account: TikTokAccount | null }>(`/api/social/${id}/tiktok/status`),
-  assignTiktokAccount: (id: string, accountId: string) =>
+  assignTiktokAccount: (id: string, accountId: string, move = false) =>
     request<{ logged_in: boolean; account: TikTokAccount | null }>(`/api/social/${id}/tiktok-account`, {
       method: 'PUT',
-      body: JSON.stringify({ account_id: accountId }),
+      body: JSON.stringify({ account_id: accountId, move }),
     }),
   listAccounts: () => request<TikTokAccount[]>('/api/accounts'),
   createAccount: (label: string) => postJson<TikTokAccount>('/api/accounts', { label }),
@@ -797,6 +848,29 @@ export const api = {
     postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/publish`),
   publishQueueItemJobStatus: (id: string, awemeId: string) =>
     request<JobStatus>(`/api/social/${id}/queue/${awemeId}/jobs/publish`),
+  fbPublishQueueItem: (id: string, awemeId: string) =>
+    postJson<{ status: string }>(`/api/social/${id}/queue/${awemeId}/facebook-publish`),
+  fbPublishQueueItemJobStatus: (id: string, awemeId: string) =>
+    request<JobStatus>(`/api/social/${id}/queue/${awemeId}/jobs/fbpublish`),
+  assignFacebookPage: (id: string, pageId: string, move = false) =>
+    request<SocialProjectState>(`/api/social/${id}/facebook-page`, {
+      method: 'PUT',
+      body: JSON.stringify({ page_id: pageId, move }),
+    }),
+  listFacebookPages: () =>
+    request<{ pages: FacebookPage[]; pages_manager_path: string; oauth_configured: boolean; redirect_uri: string | null }>(
+      '/api/facebook-pages',
+    ),
+  importFacebookPagesManager: (path: string) =>
+    postJson<{ imported: number; pages: FacebookPage[] }>('/api/facebook-pages/import-pagesmanager', { path }),
+  addFacebookToken: (token: string) =>
+    postJson<{ imported: number; pages: FacebookPage[] }>('/api/facebook-pages/token', { token }),
+  checkFacebookPage: (pageId: string) => postJson<FacebookPage>(`/api/facebook-pages/${pageId}/check`),
+  deleteFacebookPage: (pageId: string) =>
+    request<{ status: string }>(`/api/facebook-pages/${pageId}`, { method: 'DELETE' }),
+  publishProjectFacebook: (id: string, pageId: string, caption: string) =>
+    postJson<{ status: string }>(`/api/projects/${id}/facebook-publish`, { page_id: pageId, caption }),
+  projectFacebookPublishJob: (id: string) => request<JobStatus>(`/api/projects/${id}/facebook-publish/job`),
 
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (
