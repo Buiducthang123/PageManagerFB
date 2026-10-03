@@ -126,6 +126,9 @@ def build_zip() -> tuple[bytes, str]:
         if logs_dir.is_dir():
             for f in sorted(logs_dir.glob("*.log")):
                 zf.writestr(f"logs/{f.name}", _tail(f, MAX_LOG_BYTES))
+        for name, f in _log_files(None).items():
+            if name.startswith("tai-du-lieu-ai/"):
+                zf.writestr(f"logs/{name}", _tail(f, MAX_LOG_BYTES))
         launcher_state = paths.INSTALL_ROOT / "launcher.json"
         if launcher_state.exists():
             zf.writestr("launcher.json", _tail(launcher_state, 64 * 1024))
@@ -173,6 +176,15 @@ def _log_files(project_id: Optional[str]) -> dict[str, Path]:
         for f in sorted(logs_dir.glob("*.log"), key=lambda f: (rank.get(f.name, len(rank)), f.name)):
             if f.is_file():
                 out[f.name] = f
+    # Log từng lần tải dữ liệu AI (model_setup.py ghi ở thư mục tạm) — worker chết vì
+    # crash C thì stack faulthandler nằm ở đây.
+    try:
+        from . import config
+
+        for f in sorted(config.temp_dir().glob("model_fetch_*.log")):
+            out["tai-du-lieu-ai/" + f.name.removeprefix("model_fetch_")] = f
+    except OSError:
+        pass
     return out
 
 

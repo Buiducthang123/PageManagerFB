@@ -78,7 +78,7 @@ def extract_background(
     proc = subprocess.Popen(
         # Chạy theo đường dẫn file (không `-m`): bản đóng gói biên dịch gói
         # `app` bằng Nuitka, còn worker này phát hành dạng source cạnh đó.
-        [sys.executable, str(DEMUCS_WORKER), str(raw_wav), str(output_path)],
+        [sys.executable, "-X", "faulthandler", str(DEMUCS_WORKER), str(raw_wav), str(output_path)],
         cwd=str(ROOT_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

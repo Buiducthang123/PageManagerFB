@@ -226,7 +226,7 @@ def _run_one(comp: Component) -> None:
     log_path = config.temp_dir() / f"model_fetch_{comp.id}.log"
     with log_path.open("w", encoding="utf-8", errors="replace") as out:
         proc = subprocess.Popen(
-            [sys.executable, str(WORKER), *comp.args()],
+            [sys.executable, "-X", "faulthandler", str(WORKER), *comp.args()],  # crash C → stack vào log tải
             cwd=str(WORKER.parent), env=_worker_env(), stdout=out, stderr=subprocess.STDOUT,
             creationflags=_CREATE_NO_WINDOW,
         )
