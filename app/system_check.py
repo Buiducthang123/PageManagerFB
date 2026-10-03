@@ -169,6 +169,7 @@ def _vcrt_item() -> dict:
     st = vcrt.status()
     label = "Thư viện Microsoft Visual C++"
     tech = f"System32 msvcp140 {st['system'] or 'không có'} · đi kèm {st['bundled'] or 'không có'}" + (
+        f" · System32 thiếu {', '.join(st['missing'])}" if st.get("missing") else "") + (
         " · đã nạp bản đi kèm" if st["preloaded"] else "") + (f" · {st['error']}" if st["error"] else "")
     if st["system_ok"]:
         return _item("vcrt", label, "ok", "Sẵn sàng", tech=tech)

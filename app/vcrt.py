@@ -26,12 +26,17 @@ from pathlib import Path
 from typing import Optional
 
 BUNDLED_DIR = Path(__file__).resolve().parent / "assets" / "vcrt"
-# Thứ tự nạp: msvcp140.dll trước (các file còn lại phụ thuộc nó).
-DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
-        "msvcp140_codecvt_ids.dll", "concrt140.dll")
+# Danh sách lấy từ quét `dumpbin /dependents` toàn bộ .dll/.pyd trong runtime:
+# mọi DLL Visual C++ mà thư viện cần, trừ vcruntime140.dll/_1.dll (Python đã có
+# sẵn bản 14.42 cạnh python.exe và đang nạp — không ghi đè được). Thiếu
+# vcruntime140_threads.dll thì torch báo "WinError 126 ... shm.dll" (gặp thật
+# trên máy user); vcomp140.dll (OpenMP) cho numba.
+# Thứ tự nạp: vcruntime140_threads, rồi msvcp140.dll trước các msvcp140_* (phụ thuộc nó).
+DLLS = ("vcruntime140_threads.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+        "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "concrt140.dll", "vcomp140.dll")
 MIN_VERSION = (14, 40)
 
-_state: dict = {"system": None, "bundled": None, "preloaded": False, "copied": [], "error": ""}
+_state: dict = {"system": None, "bundled": None, "preloaded": False, "copied": [], "missing": [], "error": ""}
 
 
 def file_version(path: Path) -> Optional[tuple[int, int, int, int]]:
@@ -97,9 +102,10 @@ def setup() -> None:
         _state["system"] = file_version(system_dll())
         _state["bundled"] = file_version(BUNDLED_DIR / "msvcp140.dll")
         system = _state["system"]
-        # Chỉ can thiệp khi máy THẬT SỰ cũ — máy có bản mới hơn bản đi kèm thì
-        # để nguyên (thư viện build bằng toolset mới có thể cần đúng bản mới).
-        if system is None or system[:2] < MIN_VERSION:
+        _state["missing"] = [n for n in DLLS if not system_dll(n).is_file()]
+        # Chỉ can thiệp khi máy THẬT SỰ cũ hoặc thiếu file — máy có đủ bản mới
+        # thì để nguyên (thư viện build bằng toolset mới có thể cần đúng bản mới).
+        if system is None or system[:2] < MIN_VERSION or _state["missing"]:
             if _packaged():
                 _copy_next_to_python()
             local = Path(sys.executable).resolve().parent
@@ -118,7 +124,8 @@ def status() -> dict:
     system = _state["system"] if _state["system"] is not None else file_version(system_dll())
     return {
         "system": fmt(system),
-        "system_ok": bool(system and system[:2] >= MIN_VERSION),
+        "system_ok": bool(system and system[:2] >= MIN_VERSION) and not _state["missing"],
+        "missing": list(_state["missing"]),
         "bundled": fmt(_state["bundled"]),
         "preloaded": _state["preloaded"],
         "copied": list(_state["copied"]),
