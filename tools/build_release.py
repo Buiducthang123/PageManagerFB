@@ -153,6 +153,9 @@ def assemble(version: str, pyd: Path, frontend_dist: Path, min_runtime: str, not
     for rel in DATA_DIRS:
         shutil.copytree(ROOT / "app" / rel, stage / "app" / rel, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(frontend_dist, stage / "frontend" / "dist")
+    # Thư viện thuần Python không có trên PyPI (runtime không có) — app/__init__.py thêm vào sys.path.
+    shutil.copytree(ROOT / "vendor" / "python", stage / "vendor" / "python",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     # App tự chép đè lên <cài đặt>\launcher.pyw lúc khởi động (updater.sync_launcher).
     shutil.copy2(ROOT / "tools" / "launcher" / "launcher.py", stage / "launcher.py")
     # Không được có __init__.py nào trong thư mục app/ — nếu có, Python nạp
