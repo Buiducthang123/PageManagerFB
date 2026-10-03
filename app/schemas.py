@@ -78,6 +78,10 @@ class UpdateSocialProjectRequest(BaseModel):
     facebook_posts_per_day: Optional[int] = Field(None, ge=1, le=3)
     facebook_post_times: Optional[list[str]] = None
     post_time_jitter_min: Optional[int] = Field(None, ge=0, le=60)
+    # Ảnh bìa tiếng Việt — xem ProjectState.cover_*.
+    cover_enabled: Optional[bool] = None
+    cover_bg: Optional[str] = None
+    cover_fg: Optional[str] = None
 
 
 class UpdateAutoPipelineRequest(BaseModel):
@@ -207,7 +211,28 @@ class AppSettingsResponse(BaseModel):
     tts_voices: list[ModelOption] = []
     tts_voices_vieneu: list[ModelOption] = []
     whisper_cache_dir: str = ""
+    # Thư mục draft CapCut — "" = chưa có (chưa đặt, tự dò không thấy).
     capcut_drafts_dir: str = ""
+    capcut_drafts_source: str = ""  # "env" (tự đặt) | "auto" (tự dò) | ""
+    capcut_drafts_status: str = ""  # "ok" | "warning" | "error"
+    capcut_drafts_message: str = ""
+    capcut_drafts_detected: list[str] = []
+    # Dung lượng trống ổ chứa workspace — "warning"/"error" khi sắp đầy.
+    workspace_free_gb: float = 0.0
+    workspace_disk_status: str = ""
+    # Thiết bị xử lý AI chung: "auto" | "cuda" | "cpu" (config.ai_device_mode).
+    ai_device: str = "auto"
+    gpu_available: bool = False
+    gpu_name: str = ""
+    gpu_memory_mb: int = 0
+    # Thư mục model / tạm: giá trị đang dùng + đã tự đặt hay chưa ("" = mặc định).
+    models_dir: str = ""
+    models_dir_custom: str = ""
+    temp_dir: str = ""
+    temp_dir_custom: str = ""
+    # Nâng cao
+    tts_concurrency: int = 3
+    demucs_timeout_s: int = 1800
 
 
 class UpdateAppSettingsRequest(BaseModel):
@@ -218,6 +243,14 @@ class UpdateAppSettingsRequest(BaseModel):
     whisper_device: Optional[str] = None
     whisper_language: Optional[str] = None
     translate_pace: Optional[str] = None
+    # "" = bỏ đường dẫn tự đặt, quay về tự dò; None = không đổi.
+    capcut_drafts_dir: Optional[str] = None
+    ai_device: Optional[str] = None
+    # "" = quay về mặc định (cạnh workspace); None = không đổi.
+    models_dir: Optional[str] = None
+    temp_dir: Optional[str] = None
+    tts_concurrency: Optional[int] = None
+    demucs_timeout_s: Optional[int] = None
 
 
 class TTSManifestEntryResponse(BaseModel):

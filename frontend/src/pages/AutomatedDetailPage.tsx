@@ -16,6 +16,7 @@ import DouyinBrowserPanel from '../components/DouyinBrowserPanel'
 import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from '../components/BlurStrengthControl'
 import CaptionDialog from '../components/CaptionDialog'
 import TikTokAccountIdentity from '../components/TikTokAccountIdentity'
+import { useLabels } from '../lib/labels'
 import PostScheduleEditor from '../components/PostScheduleEditor'
 
 const STATUS_LABEL: Record<QueueItemStatus, string> = {
@@ -109,6 +110,7 @@ function compareVideoAge(a: QueueItem, b: QueueItem): number {
 
 export default function AutomatedDetailPage() {
   const { socialId } = useParams<{ socialId: string }>()
+  const labels = useLabels()
   const queryClient = useQueryClient()
   const [publishingId, setPublishingId] = useState<string | null>(null)
   const [fbPublishingId, setFbPublishingId] = useState<string | null>(null)
@@ -136,6 +138,9 @@ export default function AutomatedDetailPage() {
   const [musicVolumeDb, setMusicVolumeDb] = useState(-13)
   const [blurStrength, setBlurStrength] = useState(DEFAULT_BLUR_STRENGTH)
   const [captionHashtags, setCaptionHashtags] = useState('')
+  const [coverEnabled, setCoverEnabled] = useState(true)
+  const [coverBg, setCoverBg] = useState('#F2555A')
+  const [coverFg, setCoverFg] = useState('#FFFFFF')
   const [subtitleFontSize, setSubtitleFontSize] = useState(6)
   const [minVideoSpeed, setMinVideoSpeed] = useState(0.85)
   const [useViesnapFallback, setUseViesnapFallback] = useState(true)
@@ -318,6 +323,9 @@ export default function AutomatedDetailPage() {
     setMusicVolumeDb(s.music_volume_db ?? -13)
     setBlurStrength(s.blur_strength ?? DEFAULT_BLUR_STRENGTH)
     setCaptionHashtags(s.caption_hashtags ?? '')
+    setCoverEnabled(s.cover_enabled ?? true)
+    setCoverBg(s.cover_bg || '#F2555A')
+    setCoverFg(s.cover_fg || '#FFFFFF')
     setSubtitleFontSize(s.subtitle_font_size ?? 6)
     setMinVideoSpeed(s.min_video_speed ?? 0.85)
     setUseViesnapFallback(s.use_viesnap_fallback ?? true)
@@ -337,6 +345,9 @@ export default function AutomatedDetailPage() {
         music_volume_db: musicVolumeDb,
         blur_strength: blurStrength,
         caption_hashtags: captionHashtags,
+        cover_enabled: coverEnabled,
+        cover_bg: coverBg,
+        cover_fg: coverFg,
         subtitle_font_size: subtitleFontSize,
         min_video_speed: minVideoSpeed,
         use_viesnap_fallback: useViesnapFallback,
@@ -803,15 +814,15 @@ export default function AutomatedDetailPage() {
         </summary>
         <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <label className="text-sm text-neutral-300">
-            Engine phiên dịch
+            Cách nhận diện lời thoại
             <select className={`${inputClass} mt-1`} value={engine} onChange={(e) => setEngine(e.target.value as TranscribeEngine)}>
-              <option value="ocr">OCR — đọc phụ đề cứng (mặc định)</option>
-              <option value="whisper">Whisper (nhận diện giọng nói)</option>
-              <option value="sensevoice">SenseVoice (nhận diện giọng nói)</option>
+              <option value="ocr">{labels.transcribe.ocr} — đọc phụ đề có sẵn (mặc định)</option>
+              <option value="whisper">{labels.transcribe.whisper}</option>
+              {(labels.isAdmin || engine === 'sensevoice') && <option value="sensevoice">{labels.transcribe.sensevoice}</option>}
             </select>
           </label>
           <label className="text-sm text-neutral-300">
-            Engine TTS
+            Loại giọng đọc
             <select
               className={`${inputClass} mt-1`}
               value={ttsEngine}
@@ -820,8 +831,8 @@ export default function AutomatedDetailPage() {
                 setVoice('')
               }}
             >
-              <option value="capcut">CapCut TTS</option>
-              <option value="vieneu">VieNeu-TTS</option>
+              <option value="capcut">{labels.tts.capcut}</option>
+              <option value="vieneu">{labels.tts.vieneu}</option>
             </select>
           </label>
           <label className="text-sm text-neutral-300">
@@ -843,7 +854,7 @@ export default function AutomatedDetailPage() {
               onChange={(e) => setAudioMode(e.target.value as typeof audioMode)}
             >
               <option value="original">Giữ nguyên âm thanh gốc (mặc định)</option>
-              <option value="separated">Tách nhạc nền/SFX bằng demucs</option>
+              <option value="separated">{labels.separatedAudio}</option>
               <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
             </select>
           </label>
@@ -870,6 +881,34 @@ export default function AutomatedDetailPage() {
             />
           </label>
           <BlurStrengthControl value={blurStrength} onChange={setBlurStrength} />
+          <div className="text-sm text-neutral-300">
+            Ảnh bìa tiếng Việt
+            <label className="mt-1 flex items-center gap-2">
+              <input type="checkbox" checked={coverEnabled} onChange={(e) => setCoverEnabled(e.target.checked)} />
+              Thay ảnh bìa chữ Trung (khung đầu video) bằng tiêu đề Việt
+            </label>
+            {coverEnabled && (
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2">
+                  Màu nền
+                  <input type="color" value={coverBg} onChange={(e) => setCoverBg(e.target.value)} className="h-8 w-12 cursor-pointer" />
+                </label>
+                <label className="flex items-center gap-2">
+                  Màu chữ
+                  <input type="color" value={coverFg} onChange={(e) => setCoverFg(e.target.value)} className="h-8 w-12 cursor-pointer" />
+                </label>
+                <span
+                  className="rounded-full px-3 py-1 text-sm font-bold"
+                  style={{ background: coverBg, color: coverFg }}
+                >
+                  Xem trước màu
+                </span>
+              </div>
+            )}
+            <span className="mt-1 block text-xs text-neutral-500">
+              Áp dụng cho video xử lý sau khi lưu. Sửa tiêu đề từng video trong trang dự án pipeline của video đó.
+            </span>
+          </div>
           <label className="text-sm text-neutral-300">
             Hashtag cố định (luôn thêm vào caption)
             <input
@@ -912,16 +951,18 @@ export default function AutomatedDetailPage() {
               checked={useViesnapFallback}
               onChange={(e) => setUseViesnapFallback(e.target.checked)}
             />
-            Dùng dịch vụ bên thứ 3 (viesnap) làm tầng dự phòng dò link tải — giảm bị Douyin giới hạn tốc độ API
+            {labels.isAdmin
+              ? 'Dùng dịch vụ bên thứ 3 (viesnap) làm tầng dự phòng dò link tải — giảm bị Douyin giới hạn tốc độ API'
+              : 'Dùng dịch vụ tải bên ngoài làm dự phòng khi lấy link video — giảm bị Douyin giới hạn'}
           </label>
         </div>
 
         <div>
           <p className="mb-1.5 text-sm text-neutral-300">
-            Khoanh vùng OCR quét (tuỳ chọn, dùng chung mọi video của dự án — để trống = quét mặc định)
+            Khoanh vùng đọc phụ đề (tuỳ chọn, dùng chung mọi video của dự án — để trống = quét mặc định)
           </p>
           <p className="mb-1.5 text-xs text-neutral-500">
-            Thu hẹp vùng đọc chữ giúp giảm hẳn OCR đọc nhầm hoạ tiết/nhân vật phức tạp ngoài dải phụ đề thành "chữ
+            Thu hẹp vùng đọc chữ giúp giảm hẳn việc đọc nhầm hoạ tiết/nhân vật phức tạp ngoài dải phụ đề thành "chữ
             giả" — áp dụng cho cả bước đọc lời thoại lẫn bước tự dò vùng che phụ đề cũ.
           </p>
           {previewProjectQuery.data?.video_url ? (

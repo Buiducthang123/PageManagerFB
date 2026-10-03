@@ -71,7 +71,7 @@ export default function ProjectList() {
   return (
     <div className="mx-auto max-w-4xl">
       <h1 className="mb-1 text-2xl">Dự án reup</h1>
-      <p className="mb-6 text-sm text-neutral-400">Upload video tiếng Trung → Whisper → Gemini dịch tiếng Việt.</p>
+      <p className="mb-6 text-sm text-neutral-400">Tải video tiếng Trung lên — app nhận diện lời thoại và dịch sang tiếng Việt.</p>
 
       <form
         className="mb-8 flex flex-col gap-3"

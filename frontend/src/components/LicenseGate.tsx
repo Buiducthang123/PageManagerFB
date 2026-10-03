@@ -1,0 +1,187 @@
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { api, LICENSE_EVENT, type LicenseStatus } from '../lib/api'
+import { LicenseContext, makeHasFeature } from '../lib/license'
+import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
+import UpdateBanner from './UpdateBanner'
+
+function formatMinutes(total: number): string {
+  const h = Math.floor(total / 60)
+  const m = Math.round(total % 60)
+  return h > 0 ? `${h} giờ ${m} phút` : `${m} phút`
+}
+
+function LoginScreen({ license }: { license: LicenseStatus }) {
+  const queryClient = useQueryClient()
+  const [email, setEmail] = useState(license.last_email || '')
+  const [password, setPassword] = useState('')
+  const loginMutation = useMutation({
+    mutationFn: () => api.login(email.trim(), password),
+    onSuccess: (status) => {
+      setPassword('')
+      queryClient.setQueryData(['license'], status)
+      void queryClient.invalidateQueries()
+    },
+  })
+  const submit = (e: FormEvent) => {
+    e.preventDefault()
+    if (email.trim() && password) loginMutation.mutate()
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-bg px-4 text-text">
+      <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-lg border border-divider bg-surface p-6">
+        <div className="flex items-center gap-3">
+          <span className="block h-[18px] w-[18px] rounded border border-accent" />
+          <h1 className="font-heading text-lg font-medium">OddlyLab Reup</h1>
+        </div>
+        {license.login_notice && (
+          <p className="rounded-md border border-accent/40 bg-accent-900/30 px-3 py-2 text-sm text-accent-200">
+            {license.login_notice}
+          </p>
+        )}
+        {license.message && !loginMutation.error && <p className="text-sm text-danger">{license.message}</p>}
+        <label className="block text-sm text-neutral-300">
+          Email
+          <input
+            className={inputClass}
+            type="email"
+            autoComplete="username"
+            autoFocus={!email}
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </label>
+        <label className="block text-sm text-neutral-300">
+          Mật khẩu
+          <input
+            className={inputClass}
+            type="password"
+            autoComplete="current-password"
+            autoFocus={!!email}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </label>
+        {loginMutation.error && <p className="text-sm text-danger">{(loginMutation.error as Error).message}</p>}
+        <button
+          type="submit"
+          className={`${primaryButtonClass} w-full`}
+          disabled={loginMutation.isPending || !email.trim() || !password}
+        >
+          {loginMutation.isPending ? 'Đang đăng nhập...' : 'Đăng nhập'}
+        </button>
+        <p className="text-xs text-neutral-500">
+          Mỗi tài khoản dùng trên 1 máy — đăng nhập ở đây sẽ đăng xuất máy khác. Quên mật khẩu: liên hệ admin.
+        </p>
+        <p className="text-xs text-neutral-500">
+          App gửi về máy chủ: số tài khoản đã liên kết, số dự án đã tạo/hoàn thành, tên máy, phiên bản app. Không gửi
+          video, nội dung dự án, mật khẩu hay API key.
+        </p>
+      </form>
+    </div>
+  )
+}
+
+function BlockedScreen({ license, onLogout }: { license: LicenseStatus; onLogout: () => void }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-bg px-4 text-text">
+      <div className="w-full max-w-sm space-y-4 rounded-lg border border-divider bg-surface p-6 text-center">
+        <h1 className="text-lg">Cần cập nhật</h1>
+        <p className="text-sm text-neutral-300">{license.message}</p>
+        <p className="text-xs text-neutral-500">Bản đang dùng: {license.app_version}</p>
+        <UpdateBanner blocking />
+        <button type="button" className={secondaryButtonClass} onClick={onLogout}>
+          Đăng xuất
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function LockedOverlay({ license }: { license: LicenseStatus }) {
+  const queryClient = useQueryClient()
+  const retry = useMutation({
+    mutationFn: api.licenseRetry,
+    onSuccess: (status) => queryClient.setQueryData(['license'], status),
+  })
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
+      <div className="w-full max-w-md space-y-4 rounded-lg border border-divider bg-surface p-6 text-center">
+        <h2 className="text-lg">Tạm khoá</h2>
+        <p className="text-sm text-neutral-300">{license.message || 'Mất kết nối tới máy chủ — đang thử lại…'}</p>
+        <p className="text-xs text-neutral-500">
+          Việc đang chạy dở vẫn chạy nốt. Kết nối lại được thì màn này tự đóng, mọi thứ đang mở giữ nguyên.
+        </p>
+        <button type="button" className={primaryButtonClass} disabled={retry.isPending} onClick={() => retry.mutate()}>
+          {retry.isPending ? 'Đang thử...' : 'Thử lại ngay'}
+        </button>
+        <a href="/api/system/diagnostics" download className="block text-xs">
+          Xuất log chẩn đoán (gửi admin nếu lỗi kéo dài)
+        </a>
+      </div>
+    </div>
+  )
+}
+
+export default function LicenseGate({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient()
+  const query = useQuery({
+    queryKey: ['license'],
+    queryFn: api.licenseStatus,
+    refetchInterval: (q) => (q.state.data?.status === 'locked' || q.state.data?.status === 'offline' ? 10_000 : 30_000),
+    retry: false,
+  })
+  useEffect(() => {
+    const onChange = () => void queryClient.invalidateQueries({ queryKey: ['license'] })
+    window.addEventListener(LICENSE_EVENT, onChange)
+    return () => window.removeEventListener(LICENSE_EVENT, onChange)
+  }, [queryClient])
+
+  const license = query.data ?? null
+  const value = useMemo(
+    () => ({
+      license,
+      hasFeature: makeHasFeature(license),
+      refresh: () => void queryClient.invalidateQueries({ queryKey: ['license'] }),
+    }),
+    [license, queryClient],
+  )
+  const logout = useMutation({
+    mutationFn: api.logout,
+    onSuccess: (status) => queryClient.setQueryData(['license'], status),
+  })
+
+  if (!license) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg text-sm text-neutral-500">
+        {query.error ? `Không kết nối được backend: ${(query.error as Error).message}` : 'Đang tải...'}
+      </div>
+    )
+  }
+  if (license.mode !== 'disabled') {
+    if (license.status === 'signed_out') return <LoginScreen license={license} />
+    if (license.status === 'blocked') return <BlockedScreen license={license} onLogout={() => logout.mutate()} />
+    if (license.status === 'locked' && license.mode === 'misconfigured') return <LockedOverlay license={license} />
+  }
+
+  return (
+    <LicenseContext.Provider value={value}>
+      {license.mode !== 'disabled' && license.status === 'offline' && (
+        <div className="fixed bottom-3 right-3 z-40 rounded-md border border-divider bg-surface px-3 py-1.5 text-xs text-neutral-300 shadow">
+          {license.code === 'offline' && license.message !== 'Đang offline'
+            ? license.message
+            : `Đang offline — còn ${formatMinutes(license.offline_remaining_minutes)}`}
+        </div>
+      )}
+      <UpdateBanner />
+      {license.mode !== 'disabled' && license.login_notice && license.status === 'active' && (
+        <div className="border-b border-accent/40 bg-accent-900/30 px-4 py-1.5 text-center text-xs text-accent-200">
+          {license.login_notice}
+        </div>
+      )}
+      {children}
+      {license.mode !== 'disabled' && license.status === 'locked' && <LockedOverlay license={license} />}
+    </LicenseContext.Provider>
+  )
+}

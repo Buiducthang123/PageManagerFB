@@ -7,6 +7,7 @@ import OcrCropSelector, { type CropRegion } from './OcrCropSelector'
 import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from './BlurStrengthControl'
 
 const DEFAULT_MUSIC_VOLUME_DB = -13
+import { useLabels } from '../lib/labels'
 import { useJobStatus } from '../hooks/useJobStatus'
 
 export default function DirectExportPanel({
@@ -23,6 +24,7 @@ export default function DirectExportPanel({
   busyAny: boolean
 }) {
   const queryClient = useQueryClient()
+  const labels = useLabels()
   const musicRef = useRef<HTMLInputElement>(null)
   const logoRef = useRef<HTMLInputElement>(null)
   // Project chạy tự động (auto pipeline / dự án tự động) xuất bằng cấu hình
@@ -133,7 +135,7 @@ export default function DirectExportPanel({
   return (
     <div className="space-y-4">
       <p className="text-sm text-neutral-400">
-        Dựng video hoàn chỉnh bằng ffmpeg (che phụ đề cũ, chèn phụ đề mới, trộn nhạc nền, chèn logo) rồi xuất thẳng ra
+        Dựng video hoàn chỉnh (che phụ đề cũ, chèn phụ đề mới, trộn nhạc nền, chèn logo) rồi xuất thẳng ra
         1 file mp4 — <b>không cần mở CapCut</b>. Tuỳ chọn thêm, chạy song song với "Dựng CapCut", không ảnh hưởng.
       </p>
 
@@ -229,7 +231,7 @@ export default function DirectExportPanel({
             onChange={(e) => setAudioMode(e.target.value as AudioMode)}
           >
             <option value="original">Giữ nguyên âm thanh gốc (mặc định)</option>
-            <option value="separated">Tách nhạc nền/SFX bằng demucs</option>
+            <option value="separated">{labels.separatedAudio}</option>
             <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
           </select>
         </label>

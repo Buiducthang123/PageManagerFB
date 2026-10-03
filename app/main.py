@@ -14,14 +14,14 @@ from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from . import accounts as acc_store
 from . import fb_pages as fb_store
-from . import config, downloads as dl, jobs, merges as mg, projects as pj, settings as app_settings, social as sp
+from . import config, downloads as dl, jobs, merges as mg, paths, projects as pj, settings as app_settings, social as sp, system_check
 from .models import (
     Episode,
     FacebookPostRecord,
@@ -65,10 +65,19 @@ from .schemas import (
     UpdateSocialProjectRequest,
 )
 from . import social_cleanup
+from .license import LoginError, manager as license_manager
+from .license import guard as license_guard
+from .license import usage as license_usage
+from .license import admin as license_admin
+from .license import client as license_client
+from . import updater
+from . import shutdown as app_shutdown
+from . import crashlog, diagnostics, model_setup
 from .stages import assemble as assemble_stage
 from .stages import douyin_browser as douyin_browser_stage
 from .stages import douyin_dl as douyin_dl_stage
 from .stages import dub_audio as dub_audio_stage
+from .stages import cover as cover_stage
 from .stages import export_direct as export_direct_stage
 from .stages import facebook_publish as fb_publish_stage
 from .stages import fetch_url as fetch_url_stage
@@ -81,14 +90,31 @@ from .stages import translate as translate_stage
 from .stages import tts as tts_stage
 from .stages import tts_vieneu as tts_vieneu_stage
 from .stages import video_merge as video_merge_stage
+from .stages import hardsub_clean as hardsub_stage
+from . import hardsubs as hs
 from .stages import video_split as video_split_stage
 from .utils.srt import load_srt, update_cue_text
 
-load_dotenv()
+load_dotenv(paths.ENV_FILE)
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 app = FastAPI(title="ReupVideoVjpPro")
+app.middleware("http")(license_guard.license_middleware)
+
+
+def _record_usage(project_id: str, type_: str) -> None:
+    """Thống kê cộng dồn (mục 6) — chỉ khi đang đăng nhập; lỗi thì bỏ qua,
+    không bao giờ làm hỏng job."""
+    try:
+        uid = license_manager.current_user_id()
+        if uid:
+            license_usage.record(uid, project_id, type_)
+    except Exception:
+        logger.exception("usage: ghi sự kiện {} cho {} lỗi", type_, project_id)
+
+
+pj.on_project_created.append(lambda state: _record_usage(state.project_id, "created"))
 
 
 def _summary(state) -> ProjectSummary:
@@ -110,13 +136,29 @@ def _tts_voices(engine: str) -> list[dict[str, str]]:
 
 
 def _tts_engine_label(engine: str) -> str:
-    return "VieNeu-TTS" if engine == "vieneu" else "CapCut TTS"
+    return "Giọng đọc trên máy" if engine == "vieneu" else "Giọng CapCut"
 
 
 def _require_done(state, stage: str, message: str) -> None:
     rec = state.stages.get(stage)
     if rec is None or rec.status != StageStatus.done:
         raise HTTPException(status_code=409, detail=message)
+
+
+def _reveal_in_explorer(path: Path, select: bool = True) -> None:
+    """Mở Explorer tới `path` (select=True: mở thư mục chứa + chọn sẵn file).
+
+    Phải tự dựng CHUỖI lệnh: truyền list `["explorer", f"/select,{path}"]` thì
+    đường dẫn có dấu cách (vd C:\\Users\\Nguyen Van A\\... — thư mục cài mặc định
+    của user có tên Windows chứa dấu cách) bị subprocess bọc thành
+    `"/select,C:\\..."`, Explorer không hiểu và mở thư mục mặc định (Documents).
+    Explorer chỉ nhận ngoặc kép quanh riêng phần đường dẫn."""
+    target = str(Path(path).resolve())
+    cmd = f'explorer /select,"{target}"' if select else f'explorer "{target}"'
+    try:
+        subprocess.run(cmd, check=False)  # chuỗi → Windows dùng nguyên văn, không tự quote lại
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
 
 
 def _require_episode_done(episode: Episode, stage: str, message: str) -> None:
@@ -130,9 +172,9 @@ EPISODE_STAGES = ("ingest", "transcribe", "translate", "tts", "assemble")
 # 3 engine transcribe — tra cứu 1 chỗ duy nhất thay vì ternary lặp lại ở mỗi
 # route/hàm start (project-level, episode-level, auto-pipeline validate).
 TRANSCRIBE_ENGINES: dict[str, tuple[object, str]] = {
-    "whisper": (transcribe_stage.transcribe_video, "Whisper zh"),
-    "sensevoice": (sensevoice_stage.transcribe_video, "SenseVoice"),
-    "ocr": (ocr_stage.transcribe_video, "OCR (phụ đề cứng)"),
+    "whisper": (transcribe_stage.transcribe_video, "Nhận diện giọng nói"),
+    "sensevoice": (sensevoice_stage.transcribe_video, "Nhận diện giọng nói (cách 2)"),
+    "ocr": (ocr_stage.transcribe_video, "Nhận diện bằng hình ảnh"),
 }
 DEFAULT_TRANSCRIBE_ENGINE = "ocr"
 
@@ -406,6 +448,163 @@ def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) 
             _start_episode_transcribe(project_id, next_ep.episode_id, state.auto_engine)
 
 
+# ------------------------------------------------------------------ Đăng nhập (license)
+
+
+@app.get("/api/license/status")
+def license_status_route():
+    snap = license_manager.snapshot()
+    if snap["status"] == "signed_out":
+        snap["login_notice"] = license_manager.public_notice()
+    return snap
+
+
+@app.post("/api/license/login")
+def license_login_route(body: dict):
+    try:
+        return license_manager.login(str(body.get("email") or ""), str(body.get("password") or ""))
+    except LoginError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+
+
+@app.post("/api/license/logout")
+def license_logout_route():
+    license_manager.logout()
+    return license_manager.snapshot()
+
+
+@app.post("/api/license/retry")
+def license_retry_route():
+    """Nút "Thử lại ngay" ở modal khoá — heartbeat ngay trong request."""
+    if license_manager.auth.signed_in:
+        license_manager.heartbeat()
+    return license_manager.snapshot()
+
+
+@app.post("/api/license/change-password")
+def license_change_password_route(body: dict):
+    try:
+        license_manager.change_password(str(body.get("new_password") or ""))
+    except LoginError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Tắt app
+
+
+@app.get("/api/app/running-jobs")
+def app_running_jobs_route():
+    """Để nút "Tắt app" cảnh báo nếu đang có việc chạy dở."""
+    return {"jobs": app_shutdown.running_jobs()}
+
+
+@app.post("/api/app/quit")
+def app_quit_route():
+    app_shutdown.quit_app()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Cập nhật
+
+
+@app.get("/api/update/status")
+def update_status_route():
+    return updater.status()
+
+
+@app.post("/api/update/download")
+def update_download_route():
+    try:
+        return updater.start_download()
+    except (RuntimeError, license_client.OfflineError, license_client.ApiError) as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+
+
+@app.post("/api/update/restart")
+def update_restart_route():
+    try:
+        updater.request_restart()
+    except RuntimeError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Trang /admin
+
+
+def _admin_call(fn, *args):
+    denied = license_admin.require_admin()
+    if denied:
+        raise HTTPException(status_code=denied.status, detail=str(denied))
+    try:
+        return fn(*args)
+    except license_admin.AdminError as err:
+        raise HTTPException(status_code=err.status, detail=str(err)) from err
+
+
+@app.get("/api/admin/users")
+def admin_list_users_route():
+    return _admin_call(license_admin.list_users)
+
+
+@app.post("/api/admin/users")
+def admin_create_user_route(body: dict):
+    return _admin_call(license_admin.create_user, body)
+
+
+@app.patch("/api/admin/users/{user_id}")
+def admin_update_user_route(user_id: str, body: dict):
+    _admin_call(license_admin.update_user, user_id, body)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user_route(user_id: str):
+    _admin_call(license_admin.delete_user, user_id)
+    return {"ok": True}
+
+
+@app.get("/api/admin/users/{user_id}/devices")
+def admin_user_devices_route(user_id: str):
+    return _admin_call(license_admin.recent_devices, user_id)
+
+
+@app.post("/api/admin/users/{user_id}/force-logout")
+def admin_force_logout_route(user_id: str):
+    _admin_call(license_admin.force_logout, user_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/unbind")
+def admin_unbind_route(user_id: str):
+    _admin_call(license_admin.unbind_device, user_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def admin_reset_password_route(user_id: str, body: dict):
+    _admin_call(license_admin.reset_password, user_id, str(body.get("password") or ""))
+    return {"ok": True}
+
+
+@app.get("/api/admin/config")
+def admin_get_config_route():
+    return _admin_call(license_admin.get_config)
+
+
+@app.put("/api/admin/config")
+def admin_update_config_route(body: dict):
+    return _admin_call(license_admin.update_config, body)
+
+
+def _license_counts() -> tuple[int, int]:
+    return len(acc_store.list_accounts()), len(fb_store.list_pages())
+
+
+license_manager.counts_provider = _license_counts
+
+
 # ------------------------------------------------------------------ Settings
 
 
@@ -425,9 +624,72 @@ def update_settings_route(body: UpdateAppSettingsRequest):
             whisper_device=body.whisper_device,
             whisper_language=body.whisper_language,
             translate_pace=body.translate_pace,
+            capcut_drafts_dir=body.capcut_drafts_dir,
+            ai_device=body.ai_device,
+            models_dir=body.models_dir,
+            temp_dir=body.temp_dir,
+            tts_concurrency=body.tts_concurrency,
+            demucs_timeout_s=body.demucs_timeout_s,
         )
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
+
+
+@app.post("/api/settings/gemini/test")
+def test_gemini_key_route(body: dict):
+    """Thử key vừa nhập (chưa lưu) hoặc key đang lưu nếu để trống."""
+    status, message = system_check.test_gemini_key(str(body.get("api_key") or "").strip() or None)
+    return {"status": status, "message": message}
+
+
+@app.get("/api/system/check")
+def system_check_route():
+    return {"items": system_check.run_checks()}
+
+
+@app.get("/api/system/diagnostics")
+def system_diagnostics_route():
+    """Tải file zip chẩn đoán (log + cấu hình đã che key/token) để gửi admin."""
+    data, filename = diagnostics.build_zip()
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/system/models")
+def system_models_route():
+    return model_setup.status()
+
+
+@app.post("/api/system/models/install")
+def system_models_install_route(body: dict):
+    ids = [str(i) for i in (body.get("ids") or [])]
+    return {"queued": model_setup.start(ids), **model_setup.status()}
+
+
+@app.post("/api/system/models/cancel")
+def system_models_cancel_route():
+    model_setup.cancel()
+    return model_setup.status()
+
+
+@app.get("/api/system/logs")
+def system_logs_route(project_id: str = ""):
+    return {"logs": diagnostics.list_logs(project_id or None)}
+
+
+@app.get("/api/system/logs/{name:path}")
+def system_log_route(name: str, lines: int = 1000, project_id: str = ""):
+    try:
+        text = diagnostics.read_log(name, max(50, min(lines, 5000)), project_id or None)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=f"Không có file log {name}") from err
+    return {"name": name, "text": text}
+
+
+@app.post("/api/settings/capcut-drafts/check")
+def check_capcut_drafts_route(body: dict):
+    status, message = app_settings.check_capcut_drafts_dir(str(body.get("path") or ""))
+    return {"status": status, "message": message}
 
 
 # ------------------------------------------------------------------ Projects
@@ -647,7 +909,7 @@ def split_project_route(project_id: str, body: SplitProjectRequest):
     # episodes mới có ý nghĩa — xem comment ProjectState.split_mode), nên kết
     # quả Whisper cũ (nếu có) chỉ nằm im vô hại trên đĩa, không cần chặn.
     if jobs.is_job_running(f"{project_id}:transcribe"):
-        raise HTTPException(status_code=409, detail="Whisper đang chạy cho video gốc — đợi xong hoặc bấm Dừng trước")
+        raise HTTPException(status_code=409, detail="Đang nhận diện lời thoại cho video gốc — đợi xong hoặc bấm Dừng trước")
     if not state.video_relpath or not state.duration_sec:
         raise HTTPException(status_code=409, detail="Chưa có video/độ dài video")
 
@@ -881,7 +1143,7 @@ def _start_episode_transcribe(
             ep = pj.find_episode(s, episode_id)
             ep.stages["transcribe"].status = StageStatus.done
             ep.stages["transcribe"].output = "sub_zh.srt"
-            ep.stages["transcribe"].progress = f"{len(cues)} câu · {lang}"
+            ep.stages["transcribe"].progress = f"{len(cues)} câu"  # chi tiết engine/thiết bị nằm trong log
             ep.stages["transcribe"].error = None
             ep.stages["transcribe"].engine = engine
             ep.stages["transcribe"].at = datetime.now()
@@ -911,9 +1173,9 @@ def _start_episode_translate(project_id: str, episode_id: str) -> jobs.JobState 
     dict_path = pj.entity_dict_path(project_id)
 
     def target(job: jobs.JobState) -> None:
-        job.items = [jobs.JobItem(id="gemini", label="Gemini zh→vi")]
+        job.items = [jobs.JobItem(id="gemini", label="Dịch sang tiếng Việt")]
         job.items[0].status = "running"
-        job.current_label = "Gemini"
+        job.current_label = "Đang dịch..."
         shutil.rmtree(root / "audio", ignore_errors=True)
         with pj.locked_project(project_id) as s:
             ep = pj.find_episode(s, episode_id)
@@ -975,7 +1237,7 @@ def _start_episode_translate(project_id: str, episode_id: str) -> jobs.JobState 
 def start_episode_translate_route(project_id: str, episode_id: str):
     state = pj.load_project(project_id)
     episode = _get_episode_or_404(state, episode_id)
-    _require_episode_done(episode, "transcribe", "Chưa có phụ đề tiếng Trung — chạy Whisper trước")
+    _require_episode_done(episode, "transcribe", "Chưa có phụ đề tiếng Trung — chạy bước Nhận diện lời thoại trước")
     job = _start_episode_translate(project_id, episode_id)
     if job is None:
         raise HTTPException(status_code=409, detail="Gemini đang chạy cho tập này")
@@ -1115,7 +1377,7 @@ def _start_episode_assemble(
         if mute_original_audio:
             bg_label = "Tắt âm thanh gốc"
         elif audio_mode == "separated":
-            bg_label = "Tách nhạc nền (demucs)"
+            bg_label = "Tách nhạc nền"
         else:
             bg_label = "Trích audio gốc (giữ nguyên)"
         job.items = [
@@ -1216,6 +1478,7 @@ def _start_episode_assemble(
             ep = pj.find_episode(s, episode_id)
             ep.stages["assemble"].status = StageStatus.done
             ep.stages["assemble"].output = str(draft_path)
+            _record_usage(project_id, "completed")
             ep.stages["assemble"].progress = f"draft: {draft_name}"
             ep.stages["assemble"].error = None
             ep.stages["assemble"].at = datetime.now()
@@ -1461,10 +1724,7 @@ def reveal_video(project_id: str):
     video_path = pj.project_dir(project_id) / state.video_relpath
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="File video không tồn tại trên đĩa")
-    try:
-        subprocess.run(["explorer", f"/select,{video_path}"], check=False)
-    except FileNotFoundError as err:
-        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    _reveal_in_explorer(video_path)
     return {"status": "ok"}
 
 
@@ -1571,7 +1831,7 @@ def _start_transcribe(
                 logger.warning(
                     "_start_transcribe: OCR không thấy phụ đề cứng cho '{}' — tự thử lại bằng Whisper", project_id
                 )
-                pj.append_log(project_id, "transcribe", f"OCR không thấy phụ đề cứng — tự chuyển sang Whisper: {err}")
+                pj.append_log(project_id, "transcribe", f"Không thấy phụ đề có sẵn trên video — tự chuyển sang nhận diện giọng nói ({err})")
                 run_engine, run_fn, run_label = _resolve_transcribe_engine("whisper")
                 run_extra = {}
                 job.items[0] = jobs.JobItem(id=run_engine, label=run_label)
@@ -1598,7 +1858,7 @@ def _start_transcribe(
         with pj.locked_project(project_id) as s:
             s.stages["transcribe"].status = StageStatus.done
             s.stages["transcribe"].output = "sub_zh.srt"
-            s.stages["transcribe"].progress = f"{len(cues)} câu · {lang}"
+            s.stages["transcribe"].progress = f"{len(cues)} câu"  # chi tiết engine/thiết bị nằm trong log
             s.stages["transcribe"].error = None
             s.stages["transcribe"].engine = run_engine
             s.stages["transcribe"].at = datetime.now()
@@ -1626,9 +1886,9 @@ def _start_translate(project_id: str) -> jobs.JobState | None:
     n = len(load_srt(root / "sub_zh.srt")) or 1
 
     def target(job: jobs.JobState) -> None:
-        job.items = [jobs.JobItem(id="gemini", label="Gemini zh→vi")]
+        job.items = [jobs.JobItem(id="gemini", label="Dịch sang tiếng Việt")]
         job.items[0].status = "running"
-        job.current_label = "Gemini"
+        job.current_label = "Đang dịch..."
         shutil.rmtree(root / "audio", ignore_errors=True)
         with pj.locked_project(project_id) as s:
             pj.reset_from(s, "tts")
@@ -1687,7 +1947,7 @@ def _start_translate(project_id: str) -> jobs.JobState | None:
 @app.post("/api/projects/{project_id}/translate", status_code=202)
 def start_translate_route(project_id: str):
     state = pj.load_project(project_id)
-    _require_done(state, "transcribe", "Chưa có phụ đề tiếng Trung — chạy Whisper trước")
+    _require_done(state, "transcribe", "Chưa có phụ đề tiếng Trung — chạy bước Nhận diện lời thoại trước")
     job = _start_translate(project_id)
     if job is None:
         raise HTTPException(status_code=409, detail="Gemini đang chạy cho dự án này")
@@ -2009,6 +2269,7 @@ def _start_assemble_multi(
         with pj.locked_project(project_id) as s:
             s.stages["assemble"].status = StageStatus.done
             s.stages["assemble"].output = str(draft_path)
+            _record_usage(project_id, "completed")
             s.stages["assemble"].progress = f"draft: {project_id} · {len(episodes)} tập"
             s.stages["assemble"].error = None
             s.stages["assemble"].at = datetime.now()
@@ -2051,7 +2312,7 @@ def _start_assemble(
         if mute_original_audio:
             bg_label = "Tắt âm thanh gốc"
         elif audio_mode == "separated":
-            bg_label = "Tách nhạc nền (demucs)"
+            bg_label = "Tách nhạc nền"
         else:
             bg_label = "Trích audio gốc (giữ nguyên)"
         job.items = [
@@ -2150,6 +2411,7 @@ def _start_assemble(
         with pj.locked_project(project_id) as s:
             s.stages["assemble"].status = StageStatus.done
             s.stages["assemble"].output = str(draft_path)
+            _record_usage(project_id, "completed")
             s.stages["assemble"].progress = f"draft: {project_id}"
             s.stages["assemble"].error = None
             s.stages["assemble"].at = datetime.now()
@@ -2186,6 +2448,159 @@ def _export_dir(project_id: str) -> Path:
     d = pj.project_dir(project_id) / "export"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# ------------------------------------------------------------------ Ảnh bìa tiếng Việt (app/stages/cover.py)
+
+
+def _cover_dir(project_id: str) -> Path:
+    return pj.project_dir(project_id) / "cover"
+
+
+def _cover_context(project_id: str, state) -> tuple[str, str]:
+    """(tiêu đề video gốc, ngữ cảnh cho Gemini: bảng tên riêng + lời thoại đầu)."""
+    root = pj.project_dir(project_id)
+    video_title = (state.title or "").split(" - ", 1)[-1]
+    if state.social_link is not None:
+        try:
+            ss = sp.load_state(state.social_link.social_id)
+            item = next((i for i in ss.queue if i.aweme_id == state.social_link.aweme_id), None)
+            if item is not None and item.title:
+                video_title = item.title
+        except FileNotFoundError:
+            pass
+    ctx = ""
+    try:
+        ent = json.loads((root / "entity_dict.json").read_text(encoding="utf-8")) or {}
+        if ent:
+            ctx += "Bảng tên riêng (Trung → Việt): " + "; ".join(f"{k} → {v}" for k, v in list(ent.items())[:40]) + "\n"
+    except Exception:
+        pass
+    try:
+        lines = [(c.text or "").strip() for c in load_srt(root / "sub_vi.srt")]
+        ctx += "Lời thoại đầu video (đã dịch): " + " ".join(t for t in lines if t)[:800]
+    except Exception:
+        pass
+    return video_title, ctx
+
+
+def _build_project_cover(project_id: str, title: str | None = None, avoid_title: str | None = None) -> None:
+    """Dò ảnh bìa + tạo cover.png. `title` None = dùng tiêu đề đã lưu, chưa có
+    thì nhờ Gemini viết. Ghi kết quả (hoặc lỗi) vào project."""
+    state = pj.load_project(project_id)
+    if not state.video_relpath:
+        raise ValueError("Project chưa có video")
+    video_path = pj.project_dir(project_id) / state.video_relpath
+    video_title, ctx = _cover_context(project_id, state)
+    try:
+        res = cover_stage.build_cover(
+            video_path,
+            _cover_dir(project_id),
+            title=(title or state.cover_title or None),
+            bg=state.cover_bg,
+            fg=state.cover_fg,
+            video_title=video_title,
+            context=ctx,
+            avoid_title=avoid_title,
+        )
+    except jobs.JobCancelled:
+        raise
+    except Exception as err:
+        with pj.locked_project(project_id) as s:
+            s.cover_error = str(err)
+        raise
+    with pj.locked_project(project_id) as s:
+        s.cover_error = None
+        s.cover_generated_at = datetime.now()
+        if res is None:
+            s.cover_frames, s.cover_end_s, s.cover_zh, s.cover_skip_reason = 0, None, [], None
+        else:
+            s.cover_frames, s.cover_end_s, s.cover_zh = res.frames, res.end_s, res.zh_lines
+            s.cover_skip_reason = res.skipped or None
+            if res.title:
+                s.cover_title = res.title
+
+
+def _cover_for_export(project_id: str, job: jobs.JobState) -> tuple[Path | None, float | None]:
+    """Ảnh bìa để phủ lúc xuất — tự tạo nếu chưa có. Best-effort: lỗi chỉ ghi
+    lại rồi xuất video không ảnh bìa, không làm hỏng lượt xuất."""
+    state = pj.load_project(project_id)
+    if not state.cover_enabled:
+        return None, None
+    cover_png = _cover_dir(project_id) / "cover.png"
+    try:
+        if state.cover_frames is None or (state.cover_frames and not cover_png.exists()):
+            job.current_label = "Tạo ảnh bìa tiếng Việt"
+            _build_project_cover(project_id)
+            state = pj.load_project(project_id)
+    except jobs.JobCancelled:
+        raise
+    except Exception as err:
+        logger.warning("Tạo ảnh bìa lỗi (project {}) — xuất không ảnh bìa: {}", project_id, err)
+        return None, None
+    if state.cover_frames and cover_png.exists() and state.cover_end_s:
+        return cover_png, state.cover_end_s
+    return None, None
+
+
+def _cover_view(project_id: str) -> dict:
+    state = pj.load_project(project_id)
+    ver = int(state.cover_generated_at.timestamp()) if state.cover_generated_at else 0
+    has_img = (_cover_dir(project_id) / "cover.png").exists()
+    has_orig = (_cover_dir(project_id) / "original.png").exists()
+    return {
+        "enabled": state.cover_enabled,
+        "bg": state.cover_bg,
+        "fg": state.cover_fg,
+        "title": state.cover_title,
+        "frames": state.cover_frames,
+        "zh": state.cover_zh,
+        "error": state.cover_error,
+        "skip_reason": state.cover_skip_reason,
+        "generated_at": state.cover_generated_at,
+        "original_url": f"/api/projects/{project_id}/assets/cover/original.png?v={ver}" if has_orig else None,
+        "cover_url": f"/api/projects/{project_id}/assets/cover/cover.png?v={ver}" if has_img else None,
+    }
+
+
+@app.get("/api/projects/{project_id}/cover")
+def get_cover_route(project_id: str):
+    try:
+        return _cover_view(project_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+
+
+@app.post("/api/projects/{project_id}/cover")
+def update_cover_route(project_id: str, body: dict):
+    """Đổi cài đặt ảnh bìa và/hoặc tạo lại. body: enabled, bg, fg, title
+    (sửa tay), rewrite (true = nhờ AI viết tiêu đề mới), rebuild (true = tạo
+    lại ảnh). Đổi màu/tiêu đề tự tạo lại ảnh. Xuất lại video để áp dụng."""
+    avoid_title = None
+    try:
+        with pj.locked_project(project_id) as s:
+            if "enabled" in body:
+                s.cover_enabled = bool(body["enabled"])
+            if body.get("bg"):
+                s.cover_bg = str(body["bg"])
+            if body.get("fg"):
+                s.cover_fg = str(body["fg"])
+            if body.get("title") is not None and str(body["title"]).strip():
+                s.cover_title = str(body["title"]).strip()
+            if body.get("rewrite"):
+                avoid_title = s.cover_title
+                s.cover_title = None
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if body.get("rescan"):
+        # Quét lại video tìm cảnh trùng (bỏ kết quả đã lưu).
+        (_cover_dir(project_id) / "meta.json").unlink(missing_ok=True)
+    if any(body.get(k) for k in ("bg", "fg", "title", "rewrite", "rebuild", "rescan")):
+        try:
+            _build_project_cover(project_id, avoid_title=avoid_title)
+        except Exception as err:
+            raise HTTPException(status_code=400, detail=f"Tạo ảnh bìa lỗi: {err}") from err
+    return _cover_view(project_id)
 
 
 def _export_asset_path(project_id: str, stem: str) -> Path | None:
@@ -2236,7 +2651,7 @@ def _start_export(
     def target(job: jobs.JobState) -> None:
         bg_label = (
             "Tắt âm thanh gốc" if mute_original_audio
-            else "Tách nhạc nền (demucs)" if audio_mode == "separated"
+            else "Tách nhạc nền" if audio_mode == "separated"
             else "Trích audio gốc (giữ nguyên)"
         )
         job.items = [jobs.JobItem(id="background", label=bg_label), jobs.JobItem(id="render", label="Dựng video")]
@@ -2299,7 +2714,7 @@ def _start_export(
             # cứng nằm gần đáy khung hình (xem detect_subtitle_region). Rơi
             # vào nhánh này khi lượt dò SỚM chưa kịp xong lúc export bắt đầu
             # (pipeline chạy nhanh hơn OCR) hoặc chưa từng chạy (project cũ).
-            job.current_label = "Tự dò vùng phụ đề cũ (OCR)"
+            job.current_label = "Tự dò vùng phụ đề cũ"
             search_region = tuple(state.auto_ocr_crop_region) if state.auto_ocr_crop_region else None
 
             def on_ocr_progress(done: int, tot: int, label: str) -> None:
@@ -2338,6 +2753,7 @@ def _start_export(
         render_music_db = music_volume_db if music_volume_db is not None else state.auto_music_volume_db
 
         try:
+            cover_image_path, cover_end_s = _cover_for_export(project_id, job)
             manifest_path = root / "audio" / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
             vi_cues = load_srt(root / "sub_vi.srt")
@@ -2357,6 +2773,8 @@ def _start_export(
                 music_volume_db=render_music_db,
                 subtitle_font_size=subtitle_font_size,
                 blur_strength=blur_strength,
+                cover_image_path=cover_image_path,
+                cover_end_s=cover_end_s,
                 on_progress=on_render_progress,
                 job=job,
             )
@@ -2391,6 +2809,7 @@ def _start_export(
         with pj.locked_project(project_id) as s:
             s.export.status = StageStatus.done
             s.export.output = str(output_path)
+            _record_usage(project_id, "completed")
             s.export.progress = "final.mp4"
             s.export.error = None
             s.export.at = datetime.now()
@@ -2494,10 +2913,7 @@ def reveal_export_video(project_id: str):
     video_path = _export_dir(project_id) / "final.mp4"
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="Chưa xuất video hoặc file không tồn tại trên đĩa")
-    try:
-        subprocess.run(["explorer", f"/select,{video_path}"], check=False)
-    except FileNotFoundError as err:
-        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    _reveal_in_explorer(video_path)
     return {"status": "ok"}
 
 
@@ -2838,6 +3254,210 @@ def delete_merge_route(merge_id: str):
         raise HTTPException(status_code=404, detail=str(err)) from err
 
 
+# ------------------------------------------------------------------ Làm sạch video (xoá phụ đề cứng, không thuộc project nào)
+
+# Chỉ 1 video được xử lý tại 1 thời điểm — LaMa + OCR chiếm gần hết GPU 4GB,
+# chạy song song dễ hết VRAM. Lượt sau chờ lượt trước (vẫn Dừng được khi chờ).
+_hardsub_gpu_lock = threading.Lock()
+
+
+def _start_hardsub_job(item_id: str) -> None:
+    root = hs.item_dir(item_id)
+
+    def target(job: jobs.JobState) -> None:
+        job.items = [jobs.JobItem(id="clean", label="Làm sạch video")]
+        job.total = 100
+        job.current_label = "Chờ lượt (đang có video khác xử lý)..."
+        hs.update_meta(item_id, status="running", error=None, warning=None)
+
+        def fail(msg: str, status: str = "failed") -> None:
+            job.items[0].status = "failed"
+            job.items[0].error = msg
+            job.status = status
+            job.error = msg
+            hs.update_meta(item_id, status="failed", error=msg)
+
+        try:
+            while not _hardsub_gpu_lock.acquire(timeout=1):
+                job.raise_if_cancelled()
+        except jobs.JobCancelled:
+            fail("Đã dừng theo yêu cầu người dùng", "cancelled")
+            return
+
+        try:
+            meta = hs.load_meta(item_id)
+            opts = meta.get("options") or {}
+            job.items[0].status = "running"
+            job.current_label = "Đang khởi động (nạp dữ liệu AI)..."
+            started = time.time()
+
+            def on_progress(pct: int, label: str) -> None:
+                job.done_count = pct
+                job.current_label = label
+
+            out_path = root / hs.OUTPUT_FILENAME
+            hardsub_stage.clean_video(
+                root / meta["input_path"],
+                out_path,
+                icon_pad=float(opts.get("icon_pad") or 0),
+                all_text=bool(opts.get("all_text")),
+                nvenc=bool(opts.get("nvenc")),
+                # lượt tạo trước khi có chế độ STTN không có khoá này -> giữ cách vá cũ khi chạy lại
+                engine=opts.get("engine") or "fast",
+                log_path=root / "worker.log",
+                on_progress=on_progress,
+                on_warning=lambda msg: hs.update_meta(item_id, warning=msg),
+                job=job,
+            )
+        except jobs.JobCancelled:
+            fail("Đã dừng theo yêu cầu người dùng", "cancelled")
+            return
+        except hardsub_stage.HardsubError as err:
+            fail(str(err))
+            return
+        except Exception as err:
+            logger.exception("Làm sạch video lỗi {}", item_id)
+            fail(str(err))
+            return
+        finally:
+            _hardsub_gpu_lock.release()
+            for part in root.glob("*.part.mp4"):
+                part.unlink(missing_ok=True)
+
+        job.items[0].status = "done"
+        job.done_count = 100
+        job.status = "done"
+        hs.update_meta(
+            item_id,
+            status="done",
+            output_filename=hs.OUTPUT_FILENAME,
+            elapsed_s=round(time.time() - started, 1),
+        )
+
+    jobs.start_job(f"hardsub:{item_id}", 100, target)
+
+
+@app.get("/api/hardsub")
+def list_hardsub_route():
+    return hs.list_items()
+
+
+@app.get("/api/hardsub/environment")
+def hardsub_environment_route(refresh: bool = False):
+    return hardsub_stage.environment_status(force=refresh)
+
+
+@app.post("/api/hardsub", status_code=202)
+async def create_hardsub_route(
+    files: list[UploadFile] = File(...),
+    icon_pad: float = Form(0.0),
+    all_text: bool = Form(False),
+    nvenc: bool = Form(False),
+    engine: str = Form("sttn"),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="Chưa chọn video")
+    env_status = hardsub_stage.environment_status()
+    if not env_status["ok"]:
+        raise HTTPException(status_code=400, detail=env_status["message"])
+    if engine not in hardsub_stage.ENGINES:
+        raise HTTPException(status_code=400, detail=f"Chế độ vá không hợp lệ: {engine}")
+    options = {"icon_pad": max(0.0, min(icon_pad, 3.0)), "all_text": all_text, "nvenc": nvenc, "engine": engine}
+    created = []
+    for f in files:
+        name = f.filename or "video.mp4"
+        meta = hs.create_item(name, options)
+        item_id = meta["item_id"]
+        ext = Path(name).suffix.lower() or ".mp4"
+        dest = hs.item_dir(item_id) / f"input{ext}"
+        with dest.open("wb") as out:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        hs.update_meta(item_id, input_path=dest.name)
+        _start_hardsub_job(item_id)
+        created.append(item_id)
+    return {"item_ids": created, "status": "started"}
+
+
+@app.post("/api/hardsub/{item_id}/retry", status_code=202)
+def retry_hardsub_route(item_id: str):
+    try:
+        meta = hs.load_meta(item_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if jobs.is_job_running(f"hardsub:{item_id}"):
+        raise HTTPException(status_code=409, detail="Đang chạy")
+    if not meta.get("input_path") or not (hs.item_dir(item_id) / meta["input_path"]).exists():
+        raise HTTPException(status_code=409, detail="Không còn file video gốc — tải lên lại")
+    _start_hardsub_job(item_id)
+    return {"status": "started"}
+
+
+@app.get("/api/hardsub/{item_id}/jobs/status", response_model=JobStatusResponse)
+def hardsub_job_status_route(item_id: str):
+    job = jobs.get_job(f"hardsub:{item_id}")
+    if job is None:
+        try:
+            meta = hs.load_meta(item_id)
+        except FileNotFoundError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        orphaned = meta.get("status") == "running"
+        if orphaned:
+            hs.update_meta(item_id, status="failed", error="Phiên trước bị gián đoạn (server restart) — bấm chạy lại.")
+        return JobStatusResponse(registered=False, orphaned=orphaned)
+    return JobStatusResponse(
+        registered=True,
+        status=job.status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[JobItemResponse(id=it.id, label=it.label, status=it.status, error=it.error) for it in job.items],
+        error=job.error,
+        started_at=job.started_at,
+    )
+
+
+@app.post("/api/hardsub/{item_id}/jobs/cancel")
+def cancel_hardsub_job_route(item_id: str):
+    if not jobs.request_cancel(f"hardsub:{item_id}"):
+        raise HTTPException(status_code=409, detail="Không có job nào đang chạy")
+    return {"status": "cancelling"}
+
+
+@app.get("/api/hardsub/{item_id}/video/{which}")
+def hardsub_video_route(item_id: str, which: str, download: bool = False):
+    try:
+        meta = hs.load_meta(item_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    if which == "input":
+        name = meta.get("input_path")
+    elif which == "output":
+        name = meta.get("output_filename") if meta.get("status") == "done" else None
+    else:
+        raise HTTPException(status_code=404, detail="Không rõ video")
+    path = hs.item_dir(item_id) / name if name else None
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="Không tìm thấy file video")
+    if download:
+        safe_name = pj.slugify(meta.get("title") or item_id) + ("_clean" if which == "output" else "") + path.suffix
+        return FileResponse(path, filename=safe_name, media_type="video/mp4")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.delete("/api/hardsub/{item_id}", status_code=204)
+def delete_hardsub_route(item_id: str):
+    if jobs.is_job_running(f"hardsub:{item_id}"):
+        raise HTTPException(status_code=409, detail="Đang xử lý — đợi xong hoặc bấm Dừng trước")
+    try:
+        hs.delete_item(item_id)
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+
+
 # ------------------------------------------------------------------ Tải video riêng (không thuộc project nào)
 
 
@@ -2897,7 +3517,11 @@ def create_download_route(body: CreateDownloadRequest):
     else:
         raise HTTPException(status_code=400, detail=f'Mode "{body.mode}" không hợp lệ')
     if not config.douyin_dl_available():
-        raise HTTPException(status_code=409, detail="Chưa cấu hình DOUYIN_DL_DIR — xem README để clone douyin-downloader")
+        raise HTTPException(
+            status_code=409,
+            detail="Tải hàng loạt cần douyin-downloader có cookie Douyin (config.yml) — máy này chưa cấu hình. "
+            "Tải từng video thì dán link ở trang dự án (không cần cookie)",
+        )
     # Chạy 2 lượt douyin-downloader ĐỒNG THỜI (mỗi lượt tự mở 1 trình duyệt
     # headless riêng lấy token) đã xác nhận thật làm Douyin trả về thiếu/rỗng
     # kết quả dù tiến trình báo "thành công" — giới hạn CHẠY 1 LƯỢT TẠI 1 THỜI
@@ -3072,13 +3696,7 @@ def reveal_download_route(download_id: str):
     select_path = target / files[0] if files else target
     if not select_path.exists():
         raise HTTPException(status_code=404, detail="Thư mục/file không còn trên đĩa")
-    try:
-        if files:
-            subprocess.run(["explorer", f"/select,{select_path}"], check=False)
-        else:
-            subprocess.run(["explorer", str(select_path)], check=False)
-    except FileNotFoundError as err:
-        raise HTTPException(status_code=500, detail="Chỉ hỗ trợ mở Explorer trên Windows") from err
+    _reveal_in_explorer(select_path, select=bool(files))
     return {"status": "ok"}
 
 
@@ -3186,6 +3804,12 @@ def update_social_route(social_id: str, body: UpdateSocialProjectRequest):
                 state.use_viesnap_fallback = body.use_viesnap_fallback
             if body.crawl_via_browser is not None:
                 state.crawl_via_browser = body.crawl_via_browser
+            if body.cover_enabled is not None:
+                state.cover_enabled = body.cover_enabled
+            if body.cover_bg:
+                state.cover_bg = body.cover_bg
+            if body.cover_fg:
+                state.cover_fg = body.cover_fg
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
     sp.sync_index_entry(social_id)
@@ -3439,6 +4063,9 @@ def _start_social_activate(social_id: str, aweme_id: str) -> dict:
         s.auto_pipeline = True
         s.auto_engine = social_state.engine
         s.auto_ocr_crop_region = social_state.ocr_crop_region
+        s.cover_enabled = social_state.cover_enabled
+        s.cover_bg = social_state.cover_bg
+        s.cover_fg = social_state.cover_fg
         s.auto_tts_engine = social_state.tts_engine
         s.auto_voice = social_state.voice
         s.auto_audio_mode = social_state.audio_mode
@@ -3489,35 +4116,38 @@ def _start_social_activate(social_id: str, aweme_id: str) -> dict:
             except FileNotFoundError:
                 pass
 
-        # `item.play_url` là link CDN Douyin CÓ CHỮ KÝ HẾT HẠN NHANH — nhưng
-        # THƯỜNG VẪN DÙNG ĐƯỢC nếu kích hoạt sớm sau lúc crawl. Thử tải bằng
-        # bản đã lưu TRƯỚC — chỉ khi thất bại mới gọi API Douyin dò lại link
-        # mới (đã xác nhận thật: gọi API dò lại ở MỌI lần kích hoạt, kể cả
-        # khi link cũ vẫn còn dùng được, là nguyên nhân chính khiến tài khoản
-        # bị risk-control tạm khoá API — xem `DOUYIN_API_MIN_INTERVAL_S`).
-        try:
-            dest, original, duration = fetch_url_stage.download_from_direct_url(
-                root, item.play_url, item.title or aweme_id, on_progress=on_progress
-            )
-        except jobs.JobCancelled:
-            _mark_cancelled(project.project_id, "ingest", job)
-            return
-        except Exception as first_err:
-            # Tầng dự phòng 2: dịch vụ bên thứ 3 (viesnap) — dò lại play_url
-            # KHÔNG cần gọi API Douyin của mình (không tốn hạn mức, không
-            # góp phần risk-control) — đã xác nhận thật hoạt động, kể cả với
-            # link trần dựng từ aweme_id (không cần `share_url` có sẵn hay
-            # không). Chỉ khi tầng này CŨNG thất bại mới rơi xuống tầng cuối
-            # (gọi thẳng API Douyin, có giới hạn tốc độ + risk-control).
-            viesnap_result = None
-            if social_state.use_viesnap_fallback:
-                video_url = item.share_url or f"https://www.douyin.com/video/{aweme_id}"
+        # Thứ tự lấy link (người dùng chốt ưu tiên viesnap):
+        # 1) viesnap (dịch vụ bên thứ 3) — link MỚI, CDN nhanh, không gọi API
+        #    Douyin của mình (không tốn hạn mức/không góp phần risk-control).
+        #    Đã xác nhận thật: link lưu lúc crawl có khi trỏ node CDN
+        #    "experiment" chỉ ~0.2 MB/s, còn link viesnap cùng video ~17 MB/s.
+        # 2) `item.play_url` lưu lúc crawl — chữ ký hết hạn nhanh nhưng thường
+        #    còn dùng được nếu kích hoạt sớm.
+        # 3) Dò lại link mới qua API Douyin (có giới hạn tốc độ + risk-control).
+        # Tầng 1-2 có ngưỡng tốc độ: quá chậm thì bỏ, xuống tầng kế.
+        viesnap_result = None
+        if social_state.use_viesnap_fallback:
+            video_url = item.share_url or f"https://www.douyin.com/video/{aweme_id}"
+            try:
                 viesnap_result = fetch_url_stage.download_from_viesnap(
-                    root, video_url, item.title or aweme_id, on_progress=on_progress
+                    root, video_url, item.title or aweme_id, on_progress=on_progress, min_mbps=1.0
                 )
-            if viesnap_result is not None:
-                dest, original, duration = viesnap_result
-            else:
+            except jobs.JobCancelled:
+                _mark_cancelled(project.project_id, "ingest", job)
+                return
+            if viesnap_result is None:
+                logger.info("Kích hoạt '{}': viesnap không dùng được — thử link lưu lúc crawl", aweme_id)
+        if viesnap_result is not None:
+            dest, original, duration = viesnap_result
+        else:
+            try:
+                dest, original, duration = fetch_url_stage.download_from_direct_url(
+                    root, item.play_url, item.title or aweme_id, on_progress=on_progress, min_mbps=1.0
+                )
+            except jobs.JobCancelled:
+                _mark_cancelled(project.project_id, "ingest", job)
+                return
+            except Exception as first_err:
                 fresh_play_url = None
                 if social_state.crawl_via_browser:
                     # Dò lại bằng Chrome thật: mở trang video như người xem,
@@ -3904,6 +4534,7 @@ def _account_views() -> list[dict]:
             "duplicate_uid": bool(a.uid) and uid_count.get(a.uid, 0) > 1,
             "busy": _account_window_open(a.id) or jobs.is_job_running(f"account:{a.id}:check"),
             "window_open": _account_window_open(a.id),
+            "has_credentials": acc_store.has_credentials(a.id),
         }
         for a in accounts
     ]
@@ -3920,8 +4551,38 @@ def list_accounts_route():
 
 @app.post("/api/accounts", status_code=201)
 def create_account_route(body: dict):
+    """`credentials` (tuỳ chọn): tài khoản/mật khẩu/email để đăng nhập tay —
+    lưu mã hoá ngay lúc tạo, hiện sẵn khi mở cửa sổ đăng nhập."""
     account = acc_store.create_account(label=str(body.get("label") or ""))
+    creds = body.get("credentials")
+    if isinstance(creds, dict):
+        acc_store.save_credentials(account.id, {k: str(creds.get(k) or "") for k in acc_store.CREDENTIAL_FIELDS})
     return _account_view(account.id)
+
+
+@app.get("/api/accounts/{account_id}/credentials")
+def get_account_credentials_route(account_id: str):
+    """Thông tin đăng nhập đã lưu (giải mã). Tách khỏi danh sách tài khoản —
+    chỉ trả khi người dùng chủ động bấm xem."""
+    if acc_store.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    try:
+        creds = acc_store.load_credentials(account_id)
+    except ValueError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    if creds is None:
+        raise HTTPException(status_code=404, detail="Tài khoản này chưa lưu thông tin đăng nhập")
+    return creds
+
+
+@app.put("/api/accounts/{account_id}/credentials")
+def update_account_credentials_route(account_id: str, body: dict):
+    """Sửa/thêm tay (vd đã đổi mật khẩu, hoặc tài khoản thêm bằng đăng nhập
+    tay). Gửi toàn bộ 4 ô; để trống hết = xoá thông tin đã lưu."""
+    if acc_store.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    acc_store.save_credentials(account_id, {k: str(body.get(k) or "") for k in acc_store.CREDENTIAL_FIELDS})
+    return {"status": "ok", "has_credentials": acc_store.has_credentials(account_id)}
 
 
 @app.patch("/api/accounts/{account_id}")
@@ -4035,17 +4696,22 @@ def _fb_accounts_redirect(**params: str) -> RedirectResponse:
 
 
 @app.get("/api/facebook/login")
-def fb_login_route():
+def fb_login_route(request: Request):
     """Mở từ trình duyệt (không gọi bằng fetch): chuyển sang hộp thoại đăng
     nhập Facebook. Facebook gọi lại /api/facebook/callback qua tên miền ngrok."""
     if not fb_publish_stage.oauth_configured():
-        return _fb_accounts_redirect(fb_error="Chưa cấu hình FB_APP_ID / FB_APP_SECRET trong file .env")
+        return _fb_accounts_redirect(fb_error="Chưa cấu hình đăng nhập Facebook (thiếu FB App ID, hoặc FB_APP_SECRET khi chạy không đăng nhập)")
     redirect_uri = fb_publish_stage.resolve_redirect_uri()
     if not redirect_uri:
         return _fb_accounts_redirect(
             fb_error="Chưa bật ngrok — chạy \"ngrok http 5175\" rồi bấm Kết nối Facebook lại"
         )
     state = secrets.token_hex(16)
+    if fb_publish_stage._use_edge_function():
+        # Trạm chuyển tiếp fb-callback đọc cổng từ state để đẩy về đúng tool
+        # trên máy này (cổng trình duyệt đang mở — 8001 bản cài, 5175 khi dev).
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        state = f"{port}-{state}"
     now = time.time()
     with _fb_oauth_lock:
         for k in [k for k, (exp, _) in _fb_oauth_states.items() if exp < now]:
@@ -5384,6 +6050,10 @@ def _maybe_check_fb_pages(active: list, now: datetime) -> None:
 
 
 def _social_scheduler_tick() -> None:
+    # Bị đá ra / khoá / chưa đăng nhập / không có quyền → bộ lập lịch nền
+    # dừng nhận việc mới (13.4). Job đang chạy dở vẫn chạy nốt.
+    if not license_manager.allows("automated"):
+        return
     try:
         states = _load_all_social_states()
     except Exception:
@@ -5466,11 +6136,15 @@ def _social_scheduler_tick() -> None:
     # 4) Đăng bài — mỗi nền tảng 1 bài tại 1 thời điểm (TikTok mở Chrome,
     # Facebook gọi API — 2 nền tảng chạy song song được), dự án trễ giờ hẹn
     # lâu nhất được đăng trước.
-    for platform, suffix, start in (
-        ("tiktok", ":publish", _start_social_publish),
-        ("facebook", ":fbpublish", _start_social_fb_publish),
+    for platform, suffix, start, feature in (
+        ("tiktok", ":publish", _start_social_publish, "tiktok_publish"),
+        ("facebook", ":fbpublish", _start_social_fb_publish, "facebook_publish"),
     ):
         if _running_job_suffix(suffix):
+            continue
+        if not license_manager.allows(feature):
+            # Có "Dự án tự động" nhưng không có quyền đăng nền tảng này: vẫn
+            # crawl + xử lý video, chỉ bỏ bước tự đăng (mục 5).
             continue
         for entry in (e for e in _publish_plan(active, now, platform) if e["status"] == "due"):
             try:
@@ -5662,11 +6336,21 @@ def _social_scheduler_loop() -> None:
 
 @app.on_event("startup")
 def _start_social_scheduler() -> None:
+    crashlog.start()
+    model_setup.start_migration()
+    updater.sync_launcher()
+    try:
+        fixed = pj.recover_interrupted()
+        if fixed:
+            logger.warning("khởi động: {} bước dự án bị cắt ngang lần chạy trước — đã đánh dấu lỗi", fixed)
+    except Exception:
+        logger.exception("khởi động: dọn bước dự án bị cắt ngang lỗi")
     try:
         acc_store.migrate_legacy_profiles()
     except Exception:
         logger.exception("accounts: chuyển profile TikTok cũ sang trang Tài khoản lỗi")
     threading.Thread(target=_social_scheduler_loop, daemon=True).start()
+    license_manager.start()
 
 
 @app.get("/api/projects/{project_id}/assets/{asset_path:path}")
@@ -5688,4 +6372,9 @@ if FRONTEND_DIST.exists():
     def spa_fallback(full_path: str = ""):
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found")
+        # File tĩnh ở gốc dist (favicon...) — chặn đi ngược thư mục bằng resolve.
+        if full_path:
+            candidate = (FRONTEND_DIST / full_path).resolve()
+            if candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
+                return FileResponse(candidate)
         return FileResponse(FRONTEND_DIST / "index.html")

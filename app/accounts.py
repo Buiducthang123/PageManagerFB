@@ -12,6 +12,7 @@ from typing import Iterator, Optional
 from loguru import logger
 
 from . import projects as pj
+from . import secret_store
 from . import social as sp
 from .models import TikTokAccount
 
@@ -62,6 +63,40 @@ def locked_account(account_id: str) -> Iterator[TikTokAccount]:
 
 def default_profile_dir(account_id: str) -> Path:
     return ACCOUNTS_DIR / account_id / "profile"
+
+
+# Thông tin đăng nhập (tài khoản/mật khẩu/email/mật khẩu email) của tài khoản
+# nhập bằng cookie — để đăng nhập lại tay khi cookie hết hạn. Lưu riêng 1 file
+# đã mã hoá DPAPI (app/secret_store.py), KHÔNG nằm trong index.json và không
+# bao giờ trả về trong danh sách tài khoản — chỉ lấy qua đúng 1 API riêng.
+CREDENTIAL_FIELDS = ("username", "password", "email", "email_password")
+
+
+def _credentials_path(account_id: str) -> Path:
+    return ACCOUNTS_DIR / account_id / "credentials.json"
+
+
+def has_credentials(account_id: str) -> bool:
+    return _credentials_path(account_id).exists()
+
+
+def save_credentials(account_id: str, creds: dict[str, str]) -> None:
+    clean = {k: str(creds.get(k) or "").strip() for k in CREDENTIAL_FIELDS}
+    path = _credentials_path(account_id)
+    if not any(clean.values()):
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"v": 1, "data": secret_store.protect(json.dumps(clean))}), encoding="utf-8")
+
+
+def load_credentials(account_id: str) -> Optional[dict[str, str]]:
+    path = _credentials_path(account_id)
+    if not path.exists():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(secret_store.unprotect(raw["data"]))
+    return {k: str(data.get(k) or "") for k in CREDENTIAL_FIELDS}
 
 
 def create_account(label: str = "", profile_dir: Optional[Path] = None) -> TikTokAccount:

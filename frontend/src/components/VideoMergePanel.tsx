@@ -129,7 +129,8 @@ export default function VideoMergePanel() {
 
   const addFiles = (picked: FileList | null) => {
     if (!picked || picked.length === 0) return
-    setFiles((prev) => [...prev, ...Array.from(picked)])
+    const added = Array.from(picked) // copy trước khi reset input (FileList "sống")
+    setFiles((prev) => [...prev, ...added])
     if (fileRef.current) fileRef.current.value = ''
   }
 

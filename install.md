@@ -92,6 +92,24 @@ Link TikTok luôn dùng snaptiktok.to vì douyin-downloader không hỗ trợ Ti
 Trang "Tải video" độc lập (tải theo trang cá nhân/từ khoá) thì bắt buộc phải
 setup vì không có tool thay thế.
 
+### venv GPU riêng (trang "Làm sạch video" — xoá phụ đề cứng)
+
+Worker `app/stages/hardsub_worker.py` cần torch **CUDA** + `rapidocr_onnxruntime`,
+không cài chung vào `.venv` chính (venv chính dùng torch CPU). Tạo venv riêng:
+
+```powershell
+python -m venv D:\hardsub_venv
+D:\hardsub_venv\Scripts\pip install opencv-python numpy rapidocr_onnxruntime
+D:\hardsub_venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu121
+D:\hardsub_venv\Scripts\pip uninstall -y onnxruntime
+D:\hardsub_venv\Scripts\pip install onnxruntime-gpu==1.22.0
+```
+
+Rồi đặt `HARDSUB_PYTHON=D:\hardsub_venv\Scripts\python.exe` trong `.env`. Lần
+chạy đầu worker tự tải model vào `~/.cache/remove_hardsub/`: STTN `sttn.pth`
+(~66MB, chế độ "Mượt" — mặc định; MIT, trọng số lấy từ video-subtitle-remover)
+và LaMa `big-lama.pt` (~200MB, chế độ "Nhanh").
+
 ## 3. Frontend (Node)
 
 ```powershell

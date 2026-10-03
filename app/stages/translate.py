@@ -438,9 +438,63 @@ Lời thoại tiếng Việt của video:
         return fallback + ("\n\n" + " ".join(f"#{t}" for t in tags) if tags else "")
 
 
+PRONOUN_GUIDE_FILE = "pronoun_guide.txt"
+_GUIDE_SCHEMA = {"type": "object", "properties": {"guide": {"type": "string"}}, "required": ["guide"]}
+
+# Quy tắc xưng hô chung — dịch từng câu không biết ai nói với ai thì Gemini rơi
+# về "tôi/cậu" mặc định, đọc lên lạnh tanh (đã gặp thật: con gái nói với chồng
+# sắp cưới thành "tôi/cậu", "他说..." thuật lời bố thành "Cậu ấy...", "老爸"
+# thành "Lão bố").
+_PRONOUN_RULES = """XƯNG HÔ (rất quan trọng — quyết định cảm xúc khi lồng tiếng): xưng hô theo QUAN HỆ giữa
+người nói và người nghe như người Việt nói thật (bố/mẹ–con, vợ chồng/người yêu: anh–em, ông/bà–cháu, anh/chị–em,
+bạn bè: mình/tớ–cậu hoặc tao–mày tuỳ giọng), NHẤT QUÁN suốt video. KHÔNG mặc định "tôi/cậu/bạn" khi quan hệ đã
+rõ. Lời kể/tâm sự của người dẫn chuyện: dùng đúng ngôi người đó (vd con kể về bố: "bố mình"/"bố con" tuỳ đang
+nói với ai), giữ sắc thái tình cảm. Câu THUẬT LẠI lời người khác (他说/我爸说/她问...) phải giữ đúng người nói
+gốc. Từ gọi thân mật dịch theo nghĩa, không dịch chữ (老爸/老妈 → bố/mẹ, 丫头/闺女/妮儿 → con gái/con)."""
+
+
+def analyze_pronouns(cues: list[Cue]) -> str:
+    """Đọc TOÀN BỘ lời thoại 1 lượt, lập bảng nhân vật + xưng hô tiếng Việt
+    cho từng cặp — dùng chung cho mọi batch dịch (video dài chia batch vẫn
+    nhất quán). Best-effort: lỗi thì trả "" (vẫn dịch được, chỉ kém nhất quán)."""
+    lines = "\n".join(f"{c.id}. {c.text}" for c in cues)
+    if len(lines) > 12000:
+        lines = lines[:12000] + "\n..."
+    prompt = f"""Đây là lời thoại (tiếng Trung, đã đánh số) của 1 video sắp được lồng tiếng Việt.
+Phân tích để người dịch xưng hô ĐÚNG và CÓ CẢM XÚC:
+- Có những nhân vật nào, quan hệ giữa họ (bố–con gái, vợ chồng sắp cưới, khách mời...).
+- Ai là người kể chuyện / tâm sự (nếu có), đang nói với ai.
+- Với từng cặp người nói → người nghe: tiếng Việt nên TỰ XƯNG là gì và GỌI người kia là gì.
+- Ghi chú các câu thuật lại lời người khác (vd "我爸说...") nếu dễ nhầm người nói.
+Viết ngắn gọn, gạch đầu dòng, tối đa ~15 dòng, bằng tiếng Việt.
+
+Lời thoại:
+{lines}
+
+Trả về: {{"guide":"..."}}"""
+    try:
+        data = _generate(prompt, schema=_GUIDE_SCHEMA)
+        return str((data or {}).get("guide") or "").strip()
+    except JobCancelled:
+        raise
+    except Exception as err:
+        logger.warning("analyze_pronouns: không lập được bảng xưng hô ({}), dịch không có bảng", err)
+        return ""
+
+
+def _guide_block(pronoun_guide: str) -> str:
+    if not pronoun_guide:
+        return ""
+    return f"""
+
+Bảng nhân vật & xưng hô đã phân tích từ TOÀN BỘ video — áp dụng đúng cho mọi câu:
+{pronoun_guide}"""
+
+
 def _one_shot(
     cues: list[Cue],
     known_entity_dict: dict[str, str] | None = None,
+    pronoun_guide: str = "",
 ) -> tuple[list[dict], dict[str, str]]:
     payload = [{"id": c.id, "text": c.text} for c in cues]
     known_block = ""
@@ -467,7 +521,9 @@ Làm CẢ 4 việc trong 1 JSON:
    bỏ khi chắc chắn là rác, KHÔNG bỏ câu thoại ngắn nhưng có nghĩa (vd cảm thán "啊", "什么").
 4. Dịch đủ MỌI câu còn lại, giữ đúng id, áp dụng entity_dict nhất quán cho MỌI lần tên đó xuất hiện
    — KHÔNG được bỏ tên riêng thay bằng đại từ/mô tả mơ hồ. Giữ giọng điệu gốc (cảm thán, tiếng lóng
-   bình luận game) nhưng làm mềm ngôn từ tục tĩu quá mức để phù hợp kiểm duyệt Facebook.{known_block}
+   bình luận game) nhưng làm mềm ngôn từ tục tĩu quá mức để phù hợp kiểm duyệt Facebook.
+
+{_PRONOUN_RULES}{_guide_block(pronoun_guide)}{known_block}
 
 Câu nguồn:
 {json.dumps(payload, ensure_ascii=False)}
@@ -516,6 +572,7 @@ mạnh trước, đừng cắt phần cốt truyện. TUYỆT ĐỐI KHÔNG:
 - Bỏ tên riêng rồi thay bằng đại từ/mô tả mơ hồ (vd "cậu ấy", "người kia") — giữ nguyên tên.
 - Viết cộc lốc thiếu ngữ pháp hay khó hiểu — vẫn phải là câu tiếng Việt tự nhiên, nghe xuôi tai.
 - Cắt bỏ chi tiết cốt truyện (ai làm gì, chuyện gì xảy ra) chỉ để đọc nhanh hơn.
+- Đổi xưng hô (tự xưng/cách gọi người nghe) — giữ đúng như current_vi.
 Nếu không thể rút ngắn thêm mà vẫn giữ tự nhiên + đủ ý, giữ nguyên current_vi.
 
 Entity dict — áp dụng nhất quán, không đổi tên khác đi:
@@ -547,19 +604,20 @@ def _chunks(items: list, size: int) -> list[list]:
 def _translate_batch(
     batch: list[Cue],
     entity_dict: dict[str, str],
+    pronoun_guide: str = "",
 ) -> tuple[list[dict], dict[str, str]]:
     """Dịch 1 batch — tự tách đôi đệ quy nếu JSON lỗi (batch nhỏ, <20 câu thì
     thôi không tách nữa, để lỗi thật lộ ra thay vì tách vô hạn)."""
     try:
-        return _one_shot(batch, entity_dict)
+        return _one_shot(batch, entity_dict, pronoun_guide)
     except (json.JSONDecodeError, ValueError) as err:
         if len(batch) < 20:
             raise
         logger.warning("Batch {} câu JSON lỗi ({}), tách 2 nửa", len(batch), err)
         mid = len(batch) // 2
-        a_items, a_ent = _translate_batch(batch[:mid], entity_dict)
+        a_items, a_ent = _translate_batch(batch[:mid], entity_dict, pronoun_guide)
         time.sleep(2)
-        b_items, b_ent = _translate_batch(batch[mid:], {**entity_dict, **a_ent})
+        b_items, b_ent = _translate_batch(batch[mid:], {**entity_dict, **a_ent}, pronoun_guide)
         return a_items + b_items, {**a_ent, **b_ent}
 
 
@@ -567,6 +625,7 @@ def process_llm(
     cues: list[Cue],
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     known_entity_dict: dict[str, str] | None = None,
+    pronoun_guide: str = "",
 ) -> tuple[list[Cue], dict[str, str]]:
     total = len(cues)
     entity_dict = dict(known_entity_dict or {})
@@ -576,7 +635,7 @@ def process_llm(
     for bi, batch in enumerate(batches):
         if on_progress:
             on_progress(bi * BATCH_SIZE, total, f"dịch nhóm {bi + 1}/{len(batches)} · {len(batch)} câu")
-        items, new_ent = _translate_batch(batch, entity_dict)
+        items, new_ent = _translate_batch(batch, entity_dict, pronoun_guide)
         for item in items:
             try:
                 translated_map[int(item["id"])] = str(item["text_vi"]).strip()
@@ -596,7 +655,7 @@ def process_llm(
                 bi + 1, len(batches), len(missing), [c.id for c in missing],
             )
             try:
-                retry_items, retry_ent = _one_shot(missing, entity_dict)
+                retry_items, retry_ent = _one_shot(missing, entity_dict, pronoun_guide)
                 for item in retry_items:
                     try:
                         translated_map[int(item["id"])] = str(item["text_vi"]).strip()
@@ -678,11 +737,15 @@ def retranslate_cue(episode_root: Path, cue_id: int, entity_dict_path: Path | No
         raise ValueError(f"Không tìm thấy câu #{cue_id} trong sub_zh.srt")
 
     entity_dict = _load_entity_dict(entity_dict_path or (episode_root / "entity_dict.json"))
+    guide_path = episode_root / PRONOUN_GUIDE_FILE
+    pronoun_guide = guide_path.read_text(encoding="utf-8").strip() if guide_path.exists() else ""
     prompt = f"""Bạn là dịch giả chuyên nghiệp zh→vi cho video reup. Bản dịch sẽ được đọc thành
 giọng nói (TTS) — văn phong phải TỰ NHIÊN khi đọc to, không dịch máy móc từng chữ.
 
 Entity dict — áp dụng nhất quán nếu câu có nhắc tên riêng liên quan:
 {json.dumps(entity_dict, ensure_ascii=False)}
+
+{_PRONOUN_RULES}{_guide_block(pronoun_guide)}
 
 Dịch + clean câu nguồn sau (bỏ filler, sửa lỗi nghe nhầm rõ ràng nếu có):
 {cue.text}
@@ -729,7 +792,18 @@ def translate_project(
     dict_path = entity_dict_path or (episode_root / "entity_dict.json")
     known_entity_dict = _load_entity_dict(dict_path)
 
-    vi_cues, new_entity_dict = process_llm(cues, on_progress=on_progress, known_entity_dict=known_entity_dict)
+    if on_progress:
+        on_progress(0, len(cues), "phân tích nhân vật & xưng hô")
+    pronoun_guide = analyze_pronouns(cues)
+    guide_path = episode_root / PRONOUN_GUIDE_FILE
+    if pronoun_guide:
+        guide_path.write_text(pronoun_guide, encoding="utf-8")
+        logger.info("Bảng xưng hô:\n{}", pronoun_guide)
+    else:
+        guide_path.unlink(missing_ok=True)
+    vi_cues, new_entity_dict = process_llm(
+        cues, on_progress=on_progress, known_entity_dict=known_entity_dict, pronoun_guide=pronoun_guide
+    )
     vi_path = episode_root / "sub_vi.srt"
     write_srt(vi_path, vi_cues)
     merged_entity_dict = {**known_entity_dict, **new_entity_dict}

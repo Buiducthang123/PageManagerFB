@@ -246,6 +246,11 @@ def render_video(
     # Độ mờ nền vùng che (hệ số theo chiều cao vùng chữ) — None = mặc định
     # hệ thống BLUR_SIGMA_RATIO. Chỉnh theo từng dự án/lần xuất.
     blur_strength: Optional[float] = None,
+    # Ảnh bìa tiếng Việt (xem app/stages/cover.py) — phủ lên TOÀN khung hình
+    # trong [0, cover_end_s) (giây, THEO TIMELINE VIDEO GỐC, tự quy đổi sang
+    # timeline đầu ra), tức đúng 2-4 khung ảnh bìa chữ Trung ở đầu video.
+    cover_image_path: Optional[Path] = None,
+    cover_end_s: Optional[float] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     job: Optional[jobs_mod.JobState] = None,
 ) -> Path:
@@ -432,6 +437,19 @@ def render_video(
     else:
         filter_parts.append(f"[{v_label}]null[vout]")
         v_label = "vout"
+
+    # --- Bước 4b: ảnh bìa tiếng Việt — phủ SAU cùng (trên cả phụ đề mới và
+    # logo) vì nó là 1 khung hình hoàn chỉnh thay cho ảnh bìa chữ Trung.
+    if cover_image_path is not None and cover_image_path.exists() and cover_end_s and cover_end_s > 0:
+        out_end = timing.map_time(plan_result.stretch_intervals, round(cover_end_s * 1_000_000)) / 1_000_000
+        if out_end > 0:
+            idx_cover = len(inputs) // 2
+            inputs += ["-i", str(cover_image_path)]
+            filter_parts.append(f"[{idx_cover}:v]scale={video_w_px}:{video_h_px},setsar=1[coverimg]")
+            filter_parts.append(
+                f"[{v_label}][coverimg]overlay=0:0:enable='lt(t,{out_end:.3f})'[vcover]"
+            )
+            v_label = "vcover"
     progress(3, 5, "chèn logo")
 
     # --- Bước 5: giọng đọc TTS đặt đúng mốc + trộn với nhạc nền/nhạc ngoài ---

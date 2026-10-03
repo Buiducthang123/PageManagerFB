@@ -14,11 +14,13 @@ from typing import Iterator
 from dotenv import load_dotenv
 
 from .models import EPISODE_STAGE_ORDER, STAGE_ORDER, Episode, ProjectState, StageRecord, StageStatus
+from .paths import ENV_FILE, INSTALL_ROOT
 
-load_dotenv()
+load_dotenv(ENV_FILE)
 
 APP_DIR = Path(__file__).resolve().parent
-ROOT_DIR = APP_DIR.parent
+# Thư mục chứa workspace/.env — bản đóng gói nằm NGOÀI thư mục code (app/paths.py).
+ROOT_DIR = INSTALL_ROOT
 
 _custom_workspace = os.environ.get("WORKSPACE_DIR", "").strip()
 WORKSPACE_DIR = Path(_custom_workspace).expanduser().resolve() if _custom_workspace else ROOT_DIR / "workspace"
@@ -191,6 +193,10 @@ def all_episodes_stage_done(state: ProjectState, stage: str) -> bool:
     return all((ep.stages.get(stage) or StageRecord()).status == "done" for ep in state.episodes)
 
 
+# Gọi sau khi tạo dự án (main.py đăng ký ghi thống kê, mục 6 kế hoạch quản lý user).
+on_project_created: list = []
+
+
 def create_project(title: str, project_type: str = "single") -> ProjectState:
     _ensure_workspace()
     title = title.strip()
@@ -209,6 +215,8 @@ def create_project(title: str, project_type: str = "single") -> ProjectState:
             0,
             {"project_id": project_id, "title": title, "created_at": state.created_at.isoformat()},
         )
+    for hook in on_project_created:
+        hook(state)
     return state
 
 
@@ -242,6 +250,30 @@ def list_projects() -> list[ProjectState]:
         except FileNotFoundError:
             continue
     return out
+
+
+INTERRUPTED_ERROR = "App bị tắt giữa chừng lúc đang chạy bước này — bấm chạy lại"
+
+
+def recover_interrupted() -> int:
+    """Gọi lúc backend khởi động (chưa job nào chạy): bước nào còn `running`
+    trong project.json là bước bị cắt ngang do app chết/tắt giữa chừng — đánh
+    dấu lỗi để giao diện hiện nút chạy lại thay vì quay vòng mãi. Trả số bước đã sửa."""
+    fixed = 0
+    for item in _load_index()["projects"]:
+        pid = item["project_id"]
+        try:
+            if '"running"' not in project_json_path(pid).read_text(encoding="utf-8"):
+                continue  # đa số dự án không có gì để sửa — khỏi khoá + ghi lại file
+            with locked_project(pid) as state:
+                records = [*state.stages.values(), *(r for ep in state.episodes for r in ep.stages.values())]
+                for rec in records:
+                    if rec.status == StageStatus.running:
+                        rec.status, rec.error, rec.progress = StageStatus.failed, INTERRUPTED_ERROR, None
+                        fixed += 1
+        except (OSError, ValueError):
+            continue
+    return fixed
 
 
 def reset_from(state: ProjectState, stage: str) -> None:

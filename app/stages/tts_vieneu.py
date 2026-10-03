@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -69,7 +68,7 @@ def _load_model():
     except ImportError as err:
         raise TTSError("Chưa cài package `vieneu` (pip install vieneu)") from err
 
-    device = (os.environ.get("VIENEU_DEVICE") or config.VIENEU_DEVICE).strip().lower()
+    device = config.engine_device("VIENEU_DEVICE", config.VIENEU_DEVICE)
     try:
         _model = Vieneu(mode="v3turbo", device=device)
     except Exception as err:

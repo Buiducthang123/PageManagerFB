@@ -8,6 +8,9 @@ import requests
 from loguru import logger
 
 from .. import config
+from ..license import manager as license_manager
+from ..license import client as license_client
+from ..license import constants as license_constants
 
 # Đăng Reels lên Facebook Page qua Graph API chính thức (không dùng Chrome như
 # TikTok) — port lại từ PagesManagerSupperTool (backend/src/facebook/
@@ -118,8 +121,33 @@ CALLBACK_PATH = "/api/facebook/callback"
 NGROK_API = "http://127.0.0.1:4040/api/tunnels"
 
 
+def _use_edge_function() -> bool:
+    """Bật đăng nhập (Supabase) → đổi token qua Edge Function `fb-token`, máy
+    user không cần FB_APP_SECRET (kế hoạch 13.1). Chạy dev chưa bật đăng nhập
+    thì giữ cách cũ (secret trong .env)."""
+    return license_manager.mode == "enabled"
+
+
 def oauth_configured() -> bool:
+    if _use_edge_function():
+        return bool(config.FB_APP_ID)
     return bool(config.FB_APP_ID and config.FB_APP_SECRET)
+
+
+def _edge_exchange(body: dict, label: str) -> dict:
+    try:
+        data = license_manager.call_function("fb-token", body)
+    except license_client.OfflineError as err:
+        raise FacebookPublishError(f"{label}: không kết nối được máy chủ — {err}") from err
+    except license_client.ApiError as err:
+        msg = str(err)
+        low = msg.lower()
+        if "app not active" in low or "not available" in low or "app_not_setup" in low or "can't load url" in low:
+            msg = "Tài khoản Facebook này chưa được admin thêm vào app — liên hệ admin"
+        raise FacebookPublishError(f"{label}: {msg}") from err
+    if not isinstance(data, dict):
+        raise FacebookPublishError(f"{label}: máy chủ trả dữ liệu lạ")
+    return data
 
 
 def resolve_redirect_uri() -> Optional[str]:
@@ -127,6 +155,10 @@ def resolve_redirect_uri() -> Optional[str]:
     "auto") thì dùng nguyên; không thì hỏi ngrok đang chạy trên máy (API cục
     bộ cổng 4040) tên miền của tunnel trỏ vào cổng frontend — tên miền ngrok
     miễn phí đổi mỗi lần bật lại, tự dò thì khỏi sửa .env. None = ngrok chưa chạy."""
+    if _use_edge_function():
+        # App Live bắt redirect HTTPS → đi qua trạm chuyển tiếp fb-callback
+        # trên Supabase, nó đẩy tiếp về localhost:<cổng trong state> (13.8).
+        return f"{license_constants.SUPABASE_URL.rstrip('/')}/functions/v1/fb-callback"
     if config.FB_REDIRECT_URI and config.FB_REDIRECT_URI.lower() != "auto":
         return config.FB_REDIRECT_URI
     try:
@@ -156,6 +188,14 @@ def login_dialog_url(state: str, redirect_uri: str) -> str:
 def exchange_code(code: str, redirect_uri: str) -> str:
     """Mã `code` Facebook trả về callback → user token (ngắn hạn).
     `redirect_uri` phải y hệt lúc mở hộp thoại đăng nhập."""
+    if _use_edge_function():
+        data = _edge_exchange(
+            {"action": "exchange_code", "code": code, "redirect_uri": redirect_uri}, "Đổi mã đăng nhập Facebook"
+        )
+        token = data.get("access_token")
+        if not token:
+            raise FacebookPublishError("Facebook không trả access_token sau khi đăng nhập")
+        return token
     data = _get(
         "/oauth/access_token",
         {
@@ -174,7 +214,10 @@ def exchange_code(code: str, redirect_uri: str) -> str:
 
 def exchange_long_lived(user_token: str) -> Optional[str]:
     """Đổi user token ngắn hạn → dài hạn (~60 ngày). Chỉ chạy được khi có
-    FB_APP_ID/FB_APP_SECRET trong .env — không có thì trả None."""
+    FB_APP_ID/FB_APP_SECRET trong .env (hoặc qua Edge Function khi bật đăng
+    nhập) — không có thì trả None."""
+    if _use_edge_function():
+        return _edge_exchange({"action": "extend", "token": user_token}, "Đổi token dài hạn").get("access_token")
     if not (config.FB_APP_ID and config.FB_APP_SECRET):
         return None
     data = _get(

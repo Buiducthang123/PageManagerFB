@@ -388,6 +388,12 @@ def _detect_subtitle_region_uncached(
     # Dải được chọn phải có ít nhất ngần này box — 1-2 box lẻ ở 1 dải hiếm
     # hoi (nhiễu) không đủ tin để lấy làm vùng phụ đề cho cả video.
     _MIN_GROUP_BOXES = 3
+    # Hộp thấp hơn ngần này × cỡ chữ trung vị của dải VÀ tâm lệch xa hơn
+    # _OUTLIER_CENTER_DX so với tâm trung vị = chữ khác loại (watermark, chú
+    # thích nhỏ), không phải phụ đề. Đo thật: watermark cao 0.55-0.73 lần trung
+    # vị, tâm lệch ~0.4; phụ đề hơi nhỏ nhất gặp được 0.80 lần nhưng tâm lệch 0.
+    _MIN_HEIGHT_RATIO = 0.8
+    _OUTLIER_CENTER_DX = 0.1
     candidate_bins = sorted(range(_NUM_BINS), key=lambda b: bin_counts[b], reverse=True)
     matched: list[tuple[float, float, float, float, str]] = []
     for bin_idx in candidate_bins:
@@ -406,6 +412,23 @@ def _detect_subtitle_region_uncached(
         # y≈0.74 — bản cũ chọn dải biển hiệu, thấy tâm-x rải rác rồi trả None
         # luôn, transcribe lùi về crop 25% đáy cắt đôi dòng phụ đề → OCR ra
         # chữ rác, 1 câu kéo dài 85s.
+        # Bỏ chữ NHỎ hẳn so với cỡ chữ phổ biến của dải trước khi xét vị trí —
+        # watermark di động (vd "@老黑说趣" trôi khắp khung, có lúc xuống đúng
+        # dải phụ đề) cao chỉ ~0.6 lần phụ đề. Đã gặp thật: 3 hộp watermark ở
+        # tâm x≈0.1 lẫn vào 23 hộp phụ đề căn giữa (tâm 0.5) đẩy std tâm lên
+        # 0.123 → bỏ cả dải, video xuất không che gì; nới ngưỡng thì vùng che lại
+        # kéo rộng sang trái tới chỗ watermark.
+        # Chỉ bỏ khi VỪA nhỏ VỪA lệch xa vị trí ngang chung: chỉ xét cỡ chữ thì
+        # loại nhầm phụ đề thật hơi nhỏ (đo thật: 1 câu ở 0.80 lần trung vị,
+        # sát ngưỡng) — câu đó vẫn nằm đúng giữa dải, watermark thì không.
+        median_h = float(np.median([b[3] - b[2] for b in group]))
+        median_cx = float(np.median([(b[0] + b[1]) / 2 for b in group]))
+        group = [
+            b for b in group
+            if (b[3] - b[2]) >= _MIN_HEIGHT_RATIO * median_h or abs((b[0] + b[1]) / 2 - median_cx) <= _OUTLIER_CENTER_DX
+        ]
+        if len(group) < _MIN_GROUP_BOXES:
+            continue
         std_x = float(np.std([(b[0] + b[1]) / 2 for b in group]))
         if std_x > _MAX_CENTER_X_STD:
             logger.info(
@@ -565,7 +588,7 @@ def transcribe_video(
         sig_blind = False
         for i, frame in enumerate(frames):
             if on_progress:
-                on_progress(i, total, f"OCR khung {i + 1}/{total}")
+                on_progress(i, total, f"Đọc phụ đề khung {i + 1}/{total}")
             sig = _frame_signature(frame)
             if (
                 not sig_blind

@@ -6,9 +6,9 @@ import {
   DEFAULT_MIN_VIDEO_SPEED,
   DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
   MIN_VIDEO_SPEED_OPTIONS,
-  STAGE_LABELS,
   STAGE_ORDER,
   TRANSCRIBE_ENGINE_LABELS,
+  USER_TRANSCRIBE_ENGINE_LABELS,
   type AudioMode,
   type EpisodeDetail,
   type StageName,
@@ -26,10 +26,14 @@ import ConfirmDialog from '../components/ConfirmDialog'
 import SplitTimeline from '../components/SplitTimeline'
 import OcrCropSelector, { type CropRegion } from '../components/OcrCropSelector'
 import ProjectSidebar from '../components/ProjectSidebar'
+import { useLabels } from '../lib/labels'
+import LogViewer from '../components/LogViewer'
+import { useIsAdmin } from '../lib/license'
 import PinnedVideoPanel from '../components/PinnedVideoPanel'
 import HorizontalStepper from '../components/HorizontalStepper'
 import CollapsibleStageSection from '../components/CollapsibleStageSection'
 import DirectExportPanel from '../components/DirectExportPanel'
+import CoverPanel from '../components/CoverPanel'
 import TikTokPublishPanel from '../components/TikTokPublishPanel'
 import FacebookPublishPanel from '../components/FacebookPublishPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
@@ -58,9 +62,10 @@ function StageHeader({
   cancelling?: boolean
   onCancel?: () => void
 }) {
+  const labels = useLabels()
   return (
     <div className="mb-3 flex items-center justify-between gap-3">
-      <h2 className="text-lg">{STAGE_LABELS[name]}</h2>
+      <h2 className="text-lg">{labels.stage[name]}</h2>
       <div className="flex items-center gap-2">
         {busy && onCancel && (
           <button type="button" className="btn btn-ghost btn-sm text-danger" disabled={cancelling} onClick={onCancel}>
@@ -69,6 +74,19 @@ function StageHeader({
         )}
         <StatusBadge status={record.status} />
       </div>
+    </div>
+  )
+}
+
+/** Lỗi của 1 bước + nút mở log ngay tại chỗ (không phải sang trang Kiểm tra hệ thống). */
+function StageError({ text, onShowLog, className = '' }: { text: string | null; onShowLog: () => void; className?: string }) {
+  if (!text) return null
+  return (
+    <div className={`${className} flex flex-wrap items-start gap-x-3 gap-y-1`}>
+      <p className="min-w-0 flex-1 whitespace-pre-line break-words text-sm text-danger [overflow-wrap:anywhere]">{text}</p>
+      <button type="button" className={secondaryButtonClass} onClick={onShowLog}>
+        Xem log
+      </button>
     </div>
   )
 }
@@ -85,6 +103,12 @@ export default function ProjectDetail() {
   const [shareUrl, setShareUrl] = useState('')
   const [tab, setTab] = useState<'table' | 'zh' | 'vi' | 'entity'>('table')
   const [engine, setEngine] = useState<TranscribeEngine>('ocr')
+  const [showLogs, setShowLogs] = useState(false)
+  const openLogs = () => setShowLogs(true)
+  // User thường: giao diện rút gọn, không tên kỹ thuật (Whisper, sub_zh.srt...).
+  const isAdmin = useIsAdmin()
+  const engineLabels = isAdmin ? TRANSCRIBE_ENGINE_LABELS : USER_TRANSCRIBE_ENGINE_LABELS
+  const labels = useLabels()
   const [ocrCrop, setOcrCrop] = useState<CropRegion | null>(null)
   const [ttsEngine, setTtsEngine] = useState<TTSEngine>('capcut')
   const [voice, setVoice] = useState('')
@@ -393,10 +417,11 @@ export default function ProjectDetail() {
             Tự động chạy hết pipeline
           </label>
           <p className="mt-1 text-xs text-neutral-400">
-            Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt Whisper → Gemini → TTS →
-            CapCut cho tới hết, dùng engine/giọng đang chọn bên dưới ({TRANSCRIBE_ENGINE_LABELS[engine]}
+            Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt {labels.stage.transcribe} →{' '}
+            {labels.stage.translate} → {labels.stage.tts} → {labels.stage.assemble} cho tới hết, dùng cách nhận diện/giọng
+            đang chọn bên dưới ({engineLabels[engine]}
             {' · '}
-            {ttsEngine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}
+            {labels.tts[ttsEngine]}
             {selectedVoice ? ` · ${voiceOptions.find((v) => v.id === selectedVoice)?.label ?? selectedVoice}` : ''}).
             Dừng lại ở draft CapCut — review + export vẫn phải làm tay.
           </p>
@@ -409,37 +434,39 @@ export default function ProjectDetail() {
 
           <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
             <label className="flex-1 text-sm text-neutral-300">
-              Engine nhận diện
+              Cách nhận diện
               <div className="mt-1 flex gap-4">
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
-                  Whisper
+                  {engineLabels.whisper}
                 </label>
-                <label className="flex items-center gap-1.5">
-                  <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
-                  SenseVoice
-                </label>
+                {isAdmin && (
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
+                    {engineLabels.sensevoice}
+                  </label>
+                )}
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
-                  OCR
+                  {engineLabels.ocr}
                 </label>
               </div>
             </label>
             <label className="flex-1 text-sm text-neutral-300">
-              Engine TTS
+              Loại giọng đọc
               <div className="mt-1 flex gap-4">
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
-                  CapCut TTS
+                  {labels.tts.capcut}
                 </label>
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
-                  VieNeu-TTS
+                  {labels.tts.vieneu}
                 </label>
               </div>
             </label>
             <label className="min-w-64 flex-1 text-sm text-neutral-300">
-              Giọng đọc mặc định (áp dụng khi chạy TTS tập bất kỳ)
+              Giọng đọc mặc định (áp dụng khi tạo giọng đọc cho tập bất kỳ)
               <div className="mt-1 flex gap-2">
                 <select className={`${inputClass} mt-0 flex-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
                   {voiceOptions.map((v) => (
@@ -527,32 +554,34 @@ export default function ProjectDetail() {
 
           <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
             <label className="flex-1 text-sm text-neutral-300">
-              Engine nhận diện
+              Cách nhận diện
               <div className="mt-1 flex gap-4">
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
-                  Whisper
+                  {engineLabels.whisper}
                 </label>
-                <label className="flex items-center gap-1.5">
-                  <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
-                  SenseVoice
-                </label>
+                {isAdmin && (
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
+                    {engineLabels.sensevoice}
+                  </label>
+                )}
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
-                  OCR
+                  {engineLabels.ocr}
                 </label>
               </div>
             </label>
             <label className="flex-1 text-sm text-neutral-300">
-              Engine TTS
+              Loại giọng đọc
               <div className="mt-1 flex gap-4">
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
-                  CapCut TTS
+                  {labels.tts.capcut}
                 </label>
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
-                  VieNeu-TTS
+                  {labels.tts.vieneu}
                 </label>
               </div>
             </label>
@@ -576,7 +605,7 @@ export default function ProjectDetail() {
                 onChange={(e) => setAudioMode(e.target.value as AudioMode)}
               >
                 <option value="original">Giữ nguyên âm thanh gốc (mặc định)</option>
-                <option value="separated">Tách nhạc nền/SFX (demucs)</option>
+                <option value="separated">{labels.separatedAudio}</option>
                 <option value="mute">Tắt hoàn toàn âm thanh gốc</option>
               </select>
             </label>
@@ -664,11 +693,11 @@ export default function ProjectDetail() {
         )}
         <div className="min-w-0 flex-1 space-y-4.5">
         <HorizontalStepper
-          steps={STAGE_ORDER.map((s) => ({ id: s, label: STAGE_LABELS[s], status: project.stages[s].status }))}
+          steps={STAGE_ORDER.map((s) => ({ id: s, label: labels.stage[s], status: project.stages[s].status }))}
         />
         <CollapsibleStageSection
           id="stage-ingest"
-          label={STAGE_LABELS.ingest}
+          label={labels.stage.ingest}
           status={ingest.status}
           meta={
             ingest.status === 'done'
@@ -701,7 +730,7 @@ export default function ProjectDetail() {
             </button>
           </div>
         )}
-        {ingest.error && <p className="mb-3 text-sm text-danger">{ingest.error}</p>}
+        <StageError className="mb-3" text={ingest.error} onShowLog={openLogs} />
 
         <div className="mb-3 flex gap-4 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
@@ -797,11 +826,13 @@ export default function ProjectDetail() {
 
       <CollapsibleStageSection
         id="stage-transcribe"
-        label={STAGE_LABELS.transcribe}
+        label={labels.stage.transcribe}
         status={transcribe.status}
         meta={
           transcribe.status === 'done'
-            ? `${transcribe.output ?? 'sub_zh.srt'}${transcribe.engine ? ` · ${TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}` : ''}`
+            ? isAdmin
+              ? `${transcribe.output ?? 'sub_zh.srt'}${transcribe.engine ? ` · ${TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}` : ''}`
+              : `Xong${transcribe.engine ? ` · ${USER_TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? ''}` : ''}`
             : transcribe.progress
         }
         defaultExpanded={ingest.status === 'done' && transcribe.status !== 'done'}
@@ -818,11 +849,18 @@ export default function ProjectDetail() {
           ) : undefined
         }
       >
-        <p className="mb-3 text-sm text-neutral-400">
-          Nhận diện giọng nói → <span className="mono">sub_zh.srt</span>
-          {transcribe.engine && <> · lần chạy trước dùng <b>{TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}</b></>}
-        </p>
-        <div className="mb-3 flex gap-4 text-sm text-neutral-300">
+        {isAdmin ? (
+          <p className="mb-3 text-sm text-neutral-400">
+            Nhận diện giọng nói → <span className="mono">sub_zh.srt</span>
+            {transcribe.engine && <> · lần chạy trước dùng <b>{TRANSCRIBE_ENGINE_LABELS[transcribe.engine as TranscribeEngine] ?? transcribe.engine}</b></>}
+          </p>
+        ) : (
+          <p className="mb-3 text-sm text-neutral-400">
+            Lấy lời thoại tiếng Trung trong video để dịch. Video có sẵn phụ đề chữ Trung thì chọn <b>bằng hình ảnh</b>
+            (chính xác hơn); không có phụ đề thì chọn <b>bằng giọng nói</b>.
+          </p>
+        )}
+        <div className="mb-3 flex flex-wrap gap-4 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
             <input
               type="radio"
@@ -831,8 +869,9 @@ export default function ProjectDetail() {
               disabled={busyAny}
               onChange={() => setEngine('whisper')}
             />
-            Whisper (faster-whisper medium, GPU)
+            {isAdmin ? 'Whisper (faster-whisper medium, GPU)' : USER_TRANSCRIBE_ENGINE_LABELS.whisper}
           </label>
+          {isAdmin && (
           <label className="flex items-center gap-1.5">
             <input
               type="radio"
@@ -843,6 +882,7 @@ export default function ProjectDetail() {
             />
             SenseVoice (funasr, CPU)
           </label>
+          )}
           <label className="flex items-center gap-1.5">
             <input
               type="radio"
@@ -851,17 +891,19 @@ export default function ProjectDetail() {
               disabled={busyAny}
               onChange={() => setEngine('ocr')}
             />
-            OCR — đọc phụ đề cứng (chậm, thử nghiệm)
+            {isAdmin ? 'OCR — đọc phụ đề cứng (chậm, thử nghiệm)' : `${USER_TRANSCRIBE_ENGINE_LABELS.ocr} (đọc phụ đề có sẵn trên video)`}
           </label>
         </div>
         {engine === 'ocr' && video_url && (
           <div className="mb-3">
-            <p className="mb-1.5 text-sm text-neutral-300">Khoanh vùng phụ đề (để trống = mặc định 25% đáy khung hình)</p>
-            <OcrCropSelector videoUrl={video_url} crop={ocrCrop} onChange={setOcrCrop} />
+            <p className="mb-1.5 text-sm text-neutral-300">
+              {isAdmin ? 'Khoanh vùng phụ đề (để trống = mặc định 25% đáy khung hình)' : 'Chọn vùng có phụ đề (không chọn thì app tự lấy phần dưới video)'}
+            </p>
+            <OcrCropSelector videoUrl={video_url} crop={ocrCrop} onChange={setOcrCrop} simple={!isAdmin} />
           </div>
         )}
         {transcribe.progress && <p className="mb-2 text-sm text-neutral-300">{transcribe.progress}</p>}
-        {transcribe.error && <p className="mb-2 text-sm text-danger">{transcribe.error}</p>}
+        <StageError className="mb-2" text={transcribe.error} onShowLog={openLogs} />
         <JobProgressBar job={transcribeJob.data} />
         <button
           type="button"
@@ -872,17 +914,17 @@ export default function ProjectDetail() {
           {busyWhisper
             ? 'Đang nhận diện...'
             : transcribe.status === 'done'
-              ? `Chạy lại ${TRANSCRIBE_ENGINE_LABELS[engine]}`
-              : `Chạy ${TRANSCRIBE_ENGINE_LABELS[engine]}`}
+              ? isAdmin ? `Chạy lại ${engineLabels[engine]}` : 'Nhận diện lại'
+              : isAdmin ? `Chạy ${engineLabels[engine]}` : 'Bắt đầu nhận diện'}
         </button>
         {whisperMutation.error && <p className="mt-2 text-sm text-danger">{(whisperMutation.error as Error).message}</p>}
       </CollapsibleStageSection>
 
       <CollapsibleStageSection
         id="stage-translate"
-        label={STAGE_LABELS.translate}
+        label={labels.stage.translate}
         status={translate.status}
-        meta={translate.status === 'done' ? (translate.output ?? 'sub_vi.srt') : translate.progress}
+        meta={translate.status === 'done' ? (isAdmin ? (translate.output ?? 'sub_vi.srt') : 'Xong') : translate.progress}
         defaultExpanded={transcribe.status === 'done' && translate.status !== 'done'}
         headerExtra={
           busyGemini ? (
@@ -897,12 +939,16 @@ export default function ProjectDetail() {
           ) : undefined
         }
       >
-        <p className="mb-3 text-sm text-neutral-400">
-          Gemini: entity dict + clean + dịch zh→vi → <span className="mono">sub_vi.srt</span> +{' '}
-          <span className="mono">entity_dict.json</span>
-        </p>
+        {isAdmin ? (
+          <p className="mb-3 text-sm text-neutral-400">
+            Gemini: entity dict + clean + dịch zh→vi → <span className="mono">sub_vi.srt</span> +{' '}
+            <span className="mono">entity_dict.json</span>
+          </p>
+        ) : (
+          <p className="mb-3 text-sm text-neutral-400">Dịch lời thoại sang tiếng Việt bằng AI (dùng Gemini key trong Cài đặt).</p>
+        )}
         {translate.progress && <p className="mb-2 text-sm text-neutral-300">{translate.progress}</p>}
-        {translate.error && <p className="mb-2 text-sm text-danger">{translate.error}</p>}
+        <StageError className="mb-2" text={translate.error} onShowLog={openLogs} />
         <JobProgressBar job={translateJob.data} />
         <button
           type="button"
@@ -914,18 +960,22 @@ export default function ProjectDetail() {
           }
           onClick={() => geminiMutation.mutate()}
         >
-          {busyGemini ? 'Đang phân tích...' : translate.status === 'done' ? 'Chạy lại Gemini' : 'Chạy Gemini'}
+          {busyGemini
+            ? isAdmin ? 'Đang phân tích...' : 'Đang dịch...'
+            : translate.status === 'done'
+              ? isAdmin ? 'Chạy lại Gemini' : 'Dịch lại'
+              : isAdmin ? 'Chạy Gemini' : 'Bắt đầu dịch'}
         </button>
         {geminiMutation.error && <p className="mt-2 text-sm text-danger">{(geminiMutation.error as Error).message}</p>}
       </CollapsibleStageSection>
 
       <CollapsibleStageSection
         id="stage-tts"
-        label={STAGE_LABELS.tts}
+        label={labels.stage.tts}
         status={tts.status}
         meta={
           tts.status === 'done'
-            ? `${tts_manifest.length} câu${tts.engine ? ` · ${tts.engine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}` : ''}`
+            ? `${tts_manifest.length} câu${tts.engine ? ` · ${labels.tts[tts.engine as TTSEngine] ?? tts.engine}` : ''}`
             : tts.progress
         }
         defaultExpanded={translate.status === 'done' && tts.status !== 'done'}
@@ -942,18 +992,22 @@ export default function ProjectDetail() {
           ) : undefined
         }
       >
-        <p className="mb-3 text-sm text-neutral-400">
-          Đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
-          {tts.engine && <> · lần chạy trước dùng <b>{tts.engine === 'vieneu' ? 'VieNeu-TTS' : 'CapCut TTS'}</b></>}
-        </p>
+        {isAdmin ? (
+          <p className="mb-3 text-sm text-neutral-400">
+            Đọc từng câu <span className="mono">sub_vi.srt</span> → <span className="mono">audio/segment_NNN.mp3</span>
+            {tts.engine && <> · lần chạy trước dùng <b>{labels.tts[tts.engine as TTSEngine] ?? tts.engine}</b></>}
+          </p>
+        ) : (
+          <p className="mb-3 text-sm text-neutral-400">Đọc phụ đề tiếng Việt thành giọng nói.</p>
+        )}
         <div className="mb-3 flex gap-4 text-sm text-neutral-300">
           <label className="flex items-center gap-1.5">
             <input type="radio" checked={ttsEngine === 'capcut'} disabled={busyAny} onChange={() => changeTtsEngine('capcut')} />
-            CapCut TTS (cloud)
+            {isAdmin ? 'CapCut TTS (cloud)' : 'Giọng CapCut (cần mạng)'}
           </label>
           <label className="flex items-center gap-1.5">
             <input type="radio" checked={ttsEngine === 'vieneu'} disabled={busyAny} onChange={() => changeTtsEngine('vieneu')} />
-            VieNeu-TTS (local, tiếng Việt)
+            {isAdmin ? 'VieNeu-TTS (local, tiếng Việt)' : 'Giọng đọc trên máy (không cần mạng)'}
           </label>
         </div>
         <label className="mb-1 block text-sm text-neutral-300">
@@ -995,7 +1049,7 @@ export default function ProjectDetail() {
           />
         )}
         {tts.progress && <p className="mb-2 text-sm text-neutral-300">{tts.progress}</p>}
-        {tts.error && <p className="mb-2 text-sm text-danger">{tts.error}</p>}
+        <StageError className="mb-2" text={tts.error} onShowLog={openLogs} />
         <JobProgressBar job={ttsJob.data} />
         <div className="flex flex-wrap gap-2">
           <button
@@ -1059,15 +1113,15 @@ export default function ProjectDetail() {
             <p className="mb-3 text-sm text-neutral-400">
               {isMulti
                 ? 'Tách nhạc nền từng tập + ráp TẤT CẢ các tập nối tiếp nhau thành 1 draft CapCut duy nhất, ghi'
-                : 'Tách nhạc nền/tiếng động (demucs) + ráp video gốc (tắt thoại) + giọng đọc TTS + phụ đề thành 1 draft, ghi'}{' '}
+                : `${isAdmin ? 'Tách nhạc nền/tiếng động (demucs)' : 'Tách nhạc nền/tiếng động'} + ráp video gốc (tắt thoại) + giọng đọc + phụ đề thành 1 draft, ghi`}{' '}
               thẳng vào thư mục CapCut thật:{' '}
               <span className="mono text-xs">{settingsQuery.data?.capcut_drafts_dir ?? '...'}</span>
             </p>
             {isMulti && !allEpisodesTTSDone && (
-              <p className="mb-3 text-sm text-neutral-400">Cần mọi tập chạy xong TTS trước khi ráp draft chung.</p>
+              <p className="mb-3 text-sm text-neutral-400">Cần mọi tập tạo xong giọng đọc trước khi ráp draft chung.</p>
             )}
             {assemble.progress && <p className="mb-2 text-sm text-neutral-300">{assemble.progress}</p>}
-            {assemble.error && <p className="mb-2 text-sm text-danger">{assemble.error}</p>}
+            <StageError className="mb-2" text={assemble.error} onShowLog={openLogs} />
             <details className="mb-3 rounded-lg border border-neutral-800 p-3">
               <summary className="cursor-pointer text-sm text-neutral-300 select-none">Tuỳ chọn nâng cao</summary>
               <label className="mt-3 mb-3 block text-sm text-neutral-300">
@@ -1079,7 +1133,7 @@ export default function ProjectDetail() {
                   onChange={(e) => setAudioMode(e.target.value as AudioMode)}
                 >
                   <option value="original">Giữ nguyên âm thanh gốc (mặc định — không tách, không tắt)</option>
-                  <option value="separated">Tách nhạc nền/SFX bằng demucs</option>
+                  <option value="separated">{labels.separatedAudio}</option>
                   <option value="mute">Tắt hoàn toàn âm thanh gốc (bỏ qua tách nhạc nền)</option>
                 </select>
               </label>
@@ -1097,7 +1151,7 @@ export default function ProjectDetail() {
                 </label>
               )}
               <label className="block text-sm text-neutral-300">
-                Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc TTS)
+                Video được chậm tối đa (để nhường thêm thời gian cho giọng đọc)
                 <select
                   className={`${inputClass} max-w-sm`}
                   value={minVideoSpeed}
@@ -1159,7 +1213,7 @@ export default function ProjectDetail() {
         return (
           <CollapsibleStageSection
             id="stage-assemble"
-            label={STAGE_LABELS.assemble}
+            label={labels.stage.assemble}
             status={assemble.status}
             meta={assemble.status === 'done' ? 'draft CapCut đã ghi' : assemble.progress}
             defaultExpanded={tts.status === 'done'}
@@ -1169,6 +1223,26 @@ export default function ProjectDetail() {
           </CollapsibleStageSection>
         )
       })()}
+
+      {!isMulti && !isSplit && video_url && (
+        <CollapsibleStageSection
+          id="stage-cover"
+          label="Ảnh bìa tiếng Việt"
+          status={project.cover_frames && !project.cover_skip_reason ? 'done' : 'pending'}
+          meta={
+            project.cover_frames === 0
+              ? 'Video không có ảnh bìa'
+              : project.cover_skip_reason
+                ? 'Giữ ảnh bìa gốc'
+                : project.cover_title
+                ? project.cover_title
+                : 'Tự tạo lúc xuất video'
+          }
+          defaultExpanded={false}
+        >
+          <CoverPanel projectId={projectId} canBuild={!busyAny} />
+        </CollapsibleStageSection>
+      )}
 
       {!isMulti && !isSplit && (
         <CollapsibleStageSection
@@ -1227,13 +1301,13 @@ export default function ProjectDetail() {
               Đối chiếu
             </button>
             <button type="button" className={tab === 'zh' ? primaryButtonClass : secondaryButtonClass} onClick={() => setTab('zh')}>
-              sub_zh.srt
+              {isAdmin ? 'sub_zh.srt' : 'Phụ đề tiếng Trung'}
             </button>
             <button type="button" className={tab === 'vi' ? primaryButtonClass : secondaryButtonClass} onClick={() => setTab('vi')}>
-              sub_vi.srt
+              {isAdmin ? 'sub_vi.srt' : 'Phụ đề tiếng Việt'}
             </button>
             <button type="button" className={tab === 'entity' ? primaryButtonClass : secondaryButtonClass} onClick={() => setTab('entity')}>
-              Entity dict
+              {isAdmin ? 'Entity dict' : 'Tên riêng'}
             </button>
           </div>
 
@@ -1389,9 +1463,14 @@ export default function ProjectDetail() {
         </section>
       )}
 
-      {data.logs.length > 0 && (
-        <section id="stage-log">
-          <h2 className="mb-2 text-sm text-neutral-400">Log</h2>
+      <section id="stage-log">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h2 className="text-sm text-neutral-400">Log</h2>
+          <button type="button" className={secondaryButtonClass} onClick={openLogs}>
+            Xem log chi tiết
+          </button>
+        </div>
+        {data.logs.length > 0 && (
           <ul className="space-y-1 font-mono text-xs text-neutral-500">
             {data.logs.map((l, i) => (
               <li key={`${l.ts}-${i}`}>
@@ -1399,8 +1478,9 @@ export default function ProjectDetail() {
               </li>
             ))}
           </ul>
-        </section>
-      )}
+        )}
+      </section>
+      {showLogs && <LogViewer projectId={projectId} onClose={() => setShowLogs(false)} />}
 
       </div>
       </div>
@@ -1408,7 +1488,7 @@ export default function ProjectDetail() {
       <ConfirmDialog
         open={deletingEpisodeId !== null}
         title="Xoá tập?"
-        message="Video, phụ đề và audio TTS của tập này sẽ bị xoá khỏi đĩa. Cần ráp lại draft CapCut sau khi xoá."
+        message="Video, phụ đề và giọng đọc của tập này sẽ bị xoá khỏi đĩa. Cần ráp lại draft CapCut sau khi xoá."
         confirmLabel="Xoá"
         danger
         onCancel={() => setDeletingEpisodeId(null)}

@@ -107,7 +107,10 @@ def assemble_project(
     def sec_to_us(seconds: float) -> int:
         return _sec_to_us(seconds, SEC)
 
-    out_root = config.capcut_drafts_dir()
+    try:
+        out_root = config.capcut_drafts_dir()
+    except config.CapcutDraftsDirError as err:
+        raise AssembleError(str(err)) from err
     folder = cc.DraftFolder(str(out_root))
 
     video_material = cc.VideoMaterial(str(video_path))
@@ -341,7 +344,10 @@ def assemble_multi(
     def sec_to_us(seconds: float) -> int:
         return _sec_to_us(seconds, SEC)
 
-    out_root = config.capcut_drafts_dir()
+    try:
+        out_root = config.capcut_drafts_dir()
+    except config.CapcutDraftsDirError as err:
+        raise AssembleError(str(err)) from err
     folder = cc.DraftFolder(str(out_root))
 
     first_video_material = cc.VideoMaterial(str(sources[0].video_path))

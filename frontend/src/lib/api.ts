@@ -40,6 +40,12 @@ export const TRANSCRIBE_ENGINE_LABELS: Record<TranscribeEngine, string> = {
   sensevoice: 'SenseVoice',
   ocr: 'OCR (phụ đề cứng)',
 }
+/** Nhãn cho user thường (không phải admin) — không dùng tên kỹ thuật. */
+export const USER_TRANSCRIBE_ENGINE_LABELS: Record<TranscribeEngine, string> = {
+  whisper: 'Nhận diện bằng giọng nói',
+  sensevoice: 'Nhận diện bằng giọng nói (cách 2)',
+  ocr: 'Nhận diện bằng hình ảnh',
+}
 export type TTSEngine = 'capcut' | 'vieneu'
 
 export interface Episode {
@@ -82,6 +88,9 @@ export interface ProjectState {
   tiktok_posts?: { account_id: string; username: string; caption: string; posted_at: string }[]
   facebook_caption?: string
   facebook_posts?: FacebookPostRecord[]
+  cover_frames?: number | null
+  cover_title?: string | null
+  cover_skip_reason?: string | null
 }
 
 export interface ProjectSummary {
@@ -147,6 +156,22 @@ export interface MergeItem {
   error: string | null
   input_filenames: string[]
   output_filename: string | null
+}
+
+export type HardsubEngine = 'sttn' | 'fast'
+
+export interface HardsubItem {
+  item_id: string
+  title: string
+  created_at: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  error: string | null
+  warning?: string | null
+  input_filename: string
+  input_path: string | null
+  options: { icon_pad: number; all_text: boolean; nvenc: boolean; engine?: HardsubEngine }
+  output_filename: string | null
+  elapsed_s: number | null
 }
 
 export type DownloadMode = 'single' | 'profile' | 'search' | 'info'
@@ -228,6 +253,22 @@ export interface QueueItem {
 
 export type Platform = 'tiktok' | 'facebook'
 
+export interface CoverInfo {
+  enabled: boolean
+  bg: string
+  fg: string
+  title: string | null
+  /** null = chưa dò; 0 = video không có ảnh bìa */
+  frames: number | null
+  zh: string[]
+  error: string | null
+  /** khác null = có ảnh bìa nhưng không tìm được nền thật → giữ ảnh bìa gốc */
+  skip_reason: string | null
+  generated_at: string | null
+  original_url: string | null
+  cover_url: string | null
+}
+
 export interface FacebookPostRecord {
   page_id: string
   page_name: string
@@ -295,6 +336,9 @@ export interface SocialProjectState extends SocialProjectSummary {
   facebook_last_post_at: string | null
   facebook_next_post_at: string | null
   post_time_jitter_min: number
+  cover_enabled: boolean
+  cover_bg: string
+  cover_fg: string
 }
 
 export type MonitorDailyStatus =
@@ -358,6 +402,13 @@ export interface MonitorPublishEntry {
 
 export type AccountStatus = 'unknown' | 'ok' | 'expired' | 'mismatch' | 'error'
 
+export interface AccountCredentials {
+  username: string
+  password: string
+  email: string
+  email_password: string
+}
+
 export interface TikTokAccount {
   id: string
   label: string
@@ -374,6 +425,8 @@ export interface TikTokAccount {
   duplicate_uid: boolean
   busy: boolean
   window_open: boolean
+  /** Có lưu tài khoản/mật khẩu/email (mã hoá) để đăng nhập lại tay */
+  has_credentials: boolean
 }
 
 export interface MonitorJobRow {
@@ -487,8 +540,151 @@ export interface AppSettings {
   tts_voices: ModelOption[]
   tts_voices_vieneu: ModelOption[]
   whisper_cache_dir: string
+  /** "" = chưa có (chưa đặt, tự dò không thấy) */
   capcut_drafts_dir: string
+  /** "env" = tự đặt trong Cài đặt, "auto" = tự dò thư mục mặc định */
+  capcut_drafts_source: '' | 'env' | 'auto'
+  capcut_drafts_status: CapcutDirStatus
+  capcut_drafts_message: string
+  capcut_drafts_detected: string[]
+  workspace_free_gb: number
+  workspace_disk_status: CapcutDirStatus
+  /** Thiết bị xử lý AI chung cho cả máy */
+  ai_device: AiDevice
+  gpu_available: boolean
+  gpu_name: string
+  gpu_memory_mb: number
+  /** Đường dẫn đang dùng; *_custom = "" nghĩa là đang dùng mặc định */
+  models_dir: string
+  models_dir_custom: string
+  temp_dir: string
+  temp_dir_custom: string
+  tts_concurrency: number
+  demucs_timeout_s: number
 }
+
+export type CapcutDirStatus = 'ok' | 'warning' | 'error'
+export type AiDevice = 'auto' | 'cuda' | 'cpu'
+
+export interface SystemCheckItem {
+  id: string
+  label: string
+  status: CapcutDirStatus
+  message: string
+  hint: string
+  /** Trang trong app để sửa mục này, vd "/settings" */
+  link?: string
+  /** Chi tiết kỹ thuật (tên engine, phiên bản, đường dẫn) — chỉ hiện cho admin */
+  tech?: string
+}
+
+export type ModelSetupStatus = 'idle' | 'queued' | 'downloading' | 'done' | 'error' | 'cancelled'
+
+export interface ModelSetupItem {
+  id: string
+  label: string
+  purpose: string
+  /** Tên model thật + chỗ lưu — chỉ hiện cho admin */
+  tech: string
+  installed: boolean
+  status: ModelSetupStatus
+  /** Đang có dự án tự tải ngầm model này (không qua nút Cài đặt môi trường) */
+  external_download: boolean
+  external_mb: number
+  downloaded_mb: number
+  total_mb: number
+  speed_mbps: number
+  error: string
+  error_tech: string
+}
+
+export interface ModelSetupState {
+  busy: boolean
+  items: ModelSetupItem[]
+  models_dir: string
+  free_gb: number
+}
+
+export interface LogFileInfo {
+  name: string
+  size: number
+  mtime: number
+}
+
+export type LicenseStatusName = 'disabled' | 'signed_out' | 'active' | 'offline' | 'locked' | 'blocked'
+
+export interface LicenseStatus {
+  /** "disabled" = chạy từ source chưa bật đăng nhập; "enabled"; "misconfigured" */
+  mode: string
+  status: LicenseStatusName
+  code: string
+  message: string
+  email: string
+  display_name: string
+  role: string
+  features: string[]
+  expires_at: string | null
+  device_name: string
+  offline_minutes: number
+  offline_remaining_minutes: number
+  login_notice: string
+  app_version: string
+  last_email: string
+}
+
+export interface AdminUser {
+  id: string
+  email: string
+  display_name: string
+  role: 'admin' | 'user'
+  enabled: boolean
+  features: string[]
+  session_ttl_hours: number | null
+  account_expires_at: string | null
+  force_logout_at: string | null
+  active_device_name: string | null
+  active_login_at: string | null
+  signed_in: boolean
+  created_at: string
+  tiktok_accounts: number | null
+  facebook_pages: number | null
+  app_version: string | null
+  last_seen_at: string | null
+  note: string
+  projects_created: number
+  projects_completed: number
+  device_switches_7d: number
+}
+
+export interface AdminConfig {
+  min_app_version: string | null
+  offline_grace_minutes: number
+  heartbeat_seconds: number
+  login_notice: string
+}
+
+export type AdminUserPatch = Partial<
+  Pick<AdminUser, 'display_name' | 'enabled' | 'features' | 'role' | 'session_ttl_hours' | 'account_expires_at' | 'note'>
+>
+
+export interface UpdateStatus {
+  status: 'idle' | 'downloading' | 'installing' | 'ready' | 'error'
+  progress: number
+  message: string
+  version: string
+  current: string
+  packaged: boolean
+  available: boolean
+  latest?: string
+  notes?: string
+  force?: boolean
+  runtime_ok?: boolean
+  min_runtime?: string
+  check_error?: string
+}
+
+/** Phát khi API trả 401/423 do đăng nhập/khoá — LicenseGate tải lại trạng thái. */
+export const LICENSE_EVENT = 'license-changed'
 
 export class ApiError extends Error {
   status: number
@@ -508,6 +704,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       const body = await res.json()
       if (body?.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+      if (body?.license && (res.status === 401 || res.status === 423)) window.dispatchEvent(new Event(LICENSE_EVENT))
     } catch {
       /* ignore */
     }
@@ -706,6 +903,29 @@ export const api = {
   downloadMergeUrl: (mergeId: string) => `/api/merges/${mergeId}/download`,
   deleteMerge: (mergeId: string) => request<void>(`/api/merges/${mergeId}`, { method: 'DELETE' }),
 
+  // --- Làm sạch video: xoá phụ đề cứng (đứng riêng, không thuộc project nào) ---
+  listHardsub: () => request<HardsubItem[]>('/api/hardsub'),
+  createHardsub: (
+    files: File[],
+    opts: { iconPad: number; allText: boolean; nvenc: boolean; engine: HardsubEngine },
+  ) => {
+    const form = new FormData()
+    files.forEach((f) => form.append('files', f))
+    form.append('icon_pad', String(opts.iconPad))
+    form.append('all_text', String(opts.allText))
+    form.append('nvenc', String(opts.nvenc))
+    form.append('engine', opts.engine)
+    return request<{ item_ids: string[]; status: string }>('/api/hardsub', { method: 'POST', body: form })
+  },
+  retryHardsub: (id: string) => postJson<{ status: string }>(`/api/hardsub/${id}/retry`),
+  hardsubEnvironment: (refresh = false) =>
+    request<{ ok: boolean; cuda: boolean; message: string }>(`/api/hardsub/environment${refresh ? '?refresh=true' : ''}`),
+  hardsubJobStatus: (id: string) => request<JobStatus>(`/api/hardsub/${id}/jobs/status`),
+  cancelHardsubJob: (id: string) => postJson<{ status: string }>(`/api/hardsub/${id}/jobs/cancel`),
+  hardsubVideoUrl: (id: string, which: 'input' | 'output', download = false) =>
+    `/api/hardsub/${id}/video/${which}${download ? '?download=true' : ''}`,
+  deleteHardsub: (id: string) => request<void>(`/api/hardsub/${id}`, { method: 'DELETE' }),
+
   // --- Tải video riêng (Douyin, đứng riêng không thuộc project nào) ---
   listDownloads: () => request<DownloadItem[]>('/api/downloads'),
   pickDownloadFolder: () => postJson<{ path: string | null }>('/api/downloads/pick-folder'),
@@ -772,6 +992,9 @@ export const api = {
       facebook_posts_per_day: number
       facebook_post_times: string[]
       post_time_jitter_min: number
+      cover_enabled: boolean
+      cover_bg: string
+      cover_fg: string
     }>,
   ) => request<SocialProjectState>(`/api/social/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteSocial: (id: string) => request<void>(`/api/social/${id}`, { method: 'DELETE' }),
@@ -833,7 +1056,14 @@ export const api = {
       body: JSON.stringify({ account_id: accountId, move }),
     }),
   listAccounts: () => request<TikTokAccount[]>('/api/accounts'),
-  createAccount: (label: string) => postJson<TikTokAccount>('/api/accounts', { label }),
+  createAccount: (label: string, credentials?: AccountCredentials) =>
+    postJson<TikTokAccount>('/api/accounts', { label, credentials }),
+  getAccountCredentials: (id: string) => request<AccountCredentials>(`/api/accounts/${id}/credentials`),
+  updateAccountCredentials: (id: string, creds: AccountCredentials) =>
+    request<{ status: string; has_credentials: boolean }>(`/api/accounts/${id}/credentials`, {
+      method: 'PUT',
+      body: JSON.stringify(creds),
+    }),
   updateAccount: (id: string, label: string) =>
     request<TikTokAccount>(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify({ label }) }),
   deleteAccount: (id: string) => request<{ status: string }>(`/api/accounts/${id}`, { method: 'DELETE' }),
@@ -871,6 +1101,11 @@ export const api = {
   publishProjectFacebook: (id: string, pageId: string, caption: string) =>
     postJson<{ status: string }>(`/api/projects/${id}/facebook-publish`, { page_id: pageId, caption }),
   projectFacebookPublishJob: (id: string) => request<JobStatus>(`/api/projects/${id}/facebook-publish/job`),
+  getCover: (id: string) => request<CoverInfo>(`/api/projects/${id}/cover`),
+  updateCover: (
+    id: string,
+    body: Partial<{ enabled: boolean; bg: string; fg: string; title: string; rewrite: boolean; rebuild: boolean; rescan: boolean }>,
+  ) => postJson<CoverInfo>(`/api/projects/${id}/cover`, body),
 
   getSettings: () => request<AppSettings>('/api/settings'),
   updateSettings: (
@@ -882,6 +1117,63 @@ export const api = {
       whisper_device: string
       whisper_language: string
       translate_pace: string
+      capcut_drafts_dir: string
+      ai_device: AiDevice
+      models_dir: string
+      temp_dir: string
+      tts_concurrency: number
+      demucs_timeout_s: number
     }>,
   ) => request<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  checkCapcutDraftsDir: (path: string) =>
+    postJson<{ status: CapcutDirStatus; message: string }>('/api/settings/capcut-drafts/check', { path }),
+  /** api_key rỗng = thử key đang lưu */
+  testGeminiKey: (apiKey: string) =>
+    postJson<{ status: CapcutDirStatus; message: string }>('/api/settings/gemini/test', { api_key: apiKey }),
+  systemCheck: () => request<{ items: SystemCheckItem[] }>('/api/system/check'),
+  systemModels: () => request<ModelSetupState>('/api/system/models'),
+  installModels: (ids: string[]) => postJson<ModelSetupState>('/api/system/models/install', { ids }),
+  cancelModels: () => postJson<ModelSetupState>('/api/system/models/cancel', {}),
+  /** projectId: thêm log của dự án đó (tên dạng "du-an/pipeline.jsonl") vào danh sách */
+  systemLogs: (projectId?: string) =>
+    request<{ logs: LogFileInfo[] }>(`/api/system/logs${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
+  systemLog: (name: string, lines = 1000, projectId?: string) =>
+    request<{ name: string; text: string }>(
+      `/api/system/logs/${name.split('/').map(encodeURIComponent).join('/')}?lines=${lines}${
+        projectId ? `&project_id=${encodeURIComponent(projectId)}` : ''
+      }`,
+    ),
+
+  adminUsers: () => request<AdminUser[]>('/api/admin/users'),
+  adminCreateUser: (body: {
+    email: string
+    password: string
+    display_name: string
+    features: string[]
+    session_ttl_hours: number | null
+  }) => postJson<{ user_id: string }>('/api/admin/users', body),
+  adminUpdateUser: (id: string, patch: AdminUserPatch) =>
+    request<{ ok: boolean }>(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  adminDeleteUser: (id: string) => request<{ ok: boolean }>(`/api/admin/users/${id}`, { method: 'DELETE' }),
+  adminForceLogout: (id: string) => postJson<{ ok: boolean }>(`/api/admin/users/${id}/force-logout`),
+  adminUnbind: (id: string) => postJson<{ ok: boolean }>(`/api/admin/users/${id}/unbind`),
+  adminResetPassword: (id: string, password: string) =>
+    postJson<{ ok: boolean }>(`/api/admin/users/${id}/reset-password`, { password }),
+  adminDevices: (id: string) => request<{ device_name: string; at: string }[]>(`/api/admin/users/${id}/devices`),
+  adminConfig: () => request<AdminConfig>('/api/admin/config'),
+  adminUpdateConfig: (body: Partial<AdminConfig>) =>
+    request<AdminConfig>('/api/admin/config', { method: 'PUT', body: JSON.stringify(body) }),
+
+  appRunningJobs: () => request<{ jobs: string[] }>('/api/app/running-jobs'),
+  quitApp: () => postJson<{ ok: boolean }>('/api/app/quit'),
+  updateStatus: () => request<UpdateStatus>('/api/update/status'),
+  updateDownload: () => postJson<UpdateStatus>('/api/update/download'),
+  updateRestart: () => postJson<{ ok: boolean }>('/api/update/restart'),
+
+  licenseStatus: () => request<LicenseStatus>('/api/license/status'),
+  login: (email: string, password: string) => postJson<LicenseStatus>('/api/license/login', { email, password }),
+  logout: () => postJson<LicenseStatus>('/api/license/logout'),
+  licenseRetry: () => postJson<LicenseStatus>('/api/license/retry'),
+  changePassword: (newPassword: string) =>
+    postJson<{ ok: boolean }>('/api/license/change-password', { new_password: newPassword }),
 }

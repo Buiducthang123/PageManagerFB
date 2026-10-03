@@ -65,7 +65,7 @@ def _load_model():
     _preload_cuda_dlls()
     from faster_whisper import WhisperModel
 
-    preferred = (os.environ.get("WHISPER_DEVICE") or config.WHISPER_DEVICE).strip().lower()
+    preferred = config.whisper_device()
     model_name = (os.environ.get("WHISPER_MODEL") or config.WHISPER_MODEL).strip()
     attempts: list[tuple[str, str]] = []
     if preferred in ("cuda", "auto") and _cuda_ok():

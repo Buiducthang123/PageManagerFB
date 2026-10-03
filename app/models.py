@@ -109,6 +109,22 @@ class ProjectState(BaseModel):
     # Đăng tay lên Facebook Page (Reels) — cùng ý nghĩa 2 field TikTok ở trên.
     facebook_caption: str = ""
     facebook_posts: list["FacebookPostRecord"] = Field(default_factory=list)
+    # Ảnh bìa tiếng Việt (app/stages/cover.py) — phủ lên 2-4 khung ảnh bìa chữ
+    # Trung ở đầu video lúc xuất. Video không có ảnh bìa thì không làm gì.
+    cover_enabled: bool = True
+    cover_bg: str = "#F2555A"
+    cover_fg: str = "#FFFFFF"
+    # Tiêu đề Việt đang dùng (AI viết lần đầu, người dùng sửa được). None = chưa tạo.
+    cover_title: Optional[str] = None
+    # None = chưa dò; 0 = video không có ảnh bìa.
+    cover_frames: Optional[int] = None
+    cover_end_s: Optional[float] = None  # giây (timeline video GỐC) hết ảnh bìa
+    cover_zh: list[str] = Field(default_factory=list)  # chữ tiêu đề Trung nhận diện được
+    cover_generated_at: Optional[datetime] = None
+    cover_error: Optional[str] = None
+    # Có ảnh bìa nhưng không tìm được cảnh trùng để lấy nền thật → giữ ảnh bìa
+    # gốc; lý do để hiện cho người dùng. None = không bỏ qua.
+    cover_skip_reason: Optional[str] = None
 
 
 class TikTokPostRecord(BaseModel):
@@ -267,6 +283,10 @@ class SocialProjectState(BaseModel):
     caption_hashtags: str = ""
     # Cỡ chữ phụ đề mới — xem ProjectState.auto_subtitle_font_size.
     subtitle_font_size: int = 6
+    # Ảnh bìa tiếng Việt — xem ProjectState.cover_*; copy sang mỗi video lúc kích hoạt.
+    cover_enabled: bool = True
+    cover_bg: str = "#F2555A"
+    cover_fg: str = "#FFFFFF"
     queue: list[QueueItem] = Field(default_factory=list)
     last_crawl_at: Optional[datetime] = None
     # Crawl lỗi/bị huỷ liên tiếp — bộ lập lịch nghỉ tăng dần trước khi tự crawl

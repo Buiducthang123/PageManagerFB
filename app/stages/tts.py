@@ -173,7 +173,7 @@ def _synthesize_cues(
     voice: str,
     on_progress: Optional[Callable[[int, int, str], None]],
 ) -> list[dict]:
-    """Sinh audio TTS song song (tối đa `config.TTS_CONCURRENCY` câu cùng lúc —
+    """Sinh audio TTS song song (tối đa `config.tts_concurrency()` câu cùng lúc —
     API là network call nên chờ tuần tự lãng phí thời gian round-trip), lưu
     audio/segment_NNN.mp3, trả về manifest [{id, start, end, path, duration_ms,
     error}] theo đúng thứ tự cue gốc — path=None nếu câu rỗng/lỗi."""
@@ -182,7 +182,7 @@ def _synthesize_cues(
     results: dict[int, dict] = {}
     done_count = 0
 
-    pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
+    pool = ThreadPoolExecutor(max_workers=config.tts_concurrency())
     try:
         futures = {pool.submit(_synthesize_one, cue, voice, output_dir): cue for cue in cues}
         pending = set(futures)
@@ -240,7 +240,7 @@ def retry_failed_segments(
 
     total = len(failed) or 1
     done_count = 0
-    pool = ThreadPoolExecutor(max_workers=config.TTS_CONCURRENCY)
+    pool = ThreadPoolExecutor(max_workers=config.tts_concurrency())
     try:
         futures = {pool.submit(_redo, entry): entry for entry in failed}
         pending = set(futures)

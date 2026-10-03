@@ -12,3 +12,15 @@ frontend/node_modules/.tmp/
 *.log
 .DS_Store
 Thumbs.db
+
+# Khoá bí mật (vd khoá ký heartbeat) — không bao giờ commit
+secrets/
+
+# Sản phẩm build (tools/build_release.py, build_runtime.py, installer)
+/build/
+/dist/
+
+# log runtime (crashlog.py / launcher)
+/logs/
+# Supabase CLI cache cục bộ
+supabase/.temp/

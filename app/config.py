@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()
+from .paths import DEFAULT_WORKSPACE, ENV_FILE
+
+load_dotenv(ENV_FILE)
+
+# Sau load_dotenv: nạp gói license là khởi tạo LicenseManager (đọc env).
+from .license import constants as _license_constants  # noqa: E402
 
 # Đặt SỚM nhất có thể (trước khi torch/numpy/mkl được import ở bất kỳ đâu
 # trong app) — từng gặp Demucs (CPU) treo cứng toàn bộ process, 0% CPU, không
@@ -75,6 +81,64 @@ try:
 except ValueError:
     TTS_CONCURRENCY = 3
 
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+    return max(lo, min(hi, value))
+
+
+def tts_concurrency() -> int:
+    """Đọc lại mỗi lần (không cache lúc import) để đổi trong Cài đặt có hiệu
+    lực ngay ở job TTS kế tiếp."""
+    return _env_int("TTS_CONCURRENCY", 3, 1, 16)
+
+
+def demucs_timeout_s() -> int:
+    return _env_int("DEMUCS_TIMEOUT_S", 1800, 300, 4 * 3600)
+
+
+# Thiết bị xử lý AI chung cho cả máy (trang Cài đặt): "auto" = giữ mặc định
+# an toàn của từng engine (Whisper thử CUDA rồi lùi CPU; SenseVoice/VieNeu chạy
+# CPU — xem lý do ở SENSEVOICE_DEVICE/VIENEU_DEVICE), "cuda" = ép GPU cho tất
+# cả (máy không có CUDA thì vẫn lùi CPU), "cpu" = ép CPU cho tất cả (máy không
+# có card NVIDIA). Biến riêng từng engine trong .env chỉ có tác dụng ở "auto".
+AI_DEVICE_MODES = ("auto", "cuda", "cpu")
+
+
+def ai_device_mode() -> str:
+    mode = (os.environ.get("AI_DEVICE") or "auto").strip().lower()
+    return mode if mode in AI_DEVICE_MODES else "auto"
+
+
+def _torch_cuda_ok() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def engine_device(env_var: str, auto_default: str) -> str:
+    """Thiết bị cho 1 engine dùng torch (SenseVoice, VieNeu). Whisper không
+    qua hàm này vì tự thử CUDA rồi lùi CPU (transcribe._load_model)."""
+    mode = ai_device_mode()
+    if mode == "cpu":
+        return "cpu"
+    if mode == "cuda":
+        return "cuda" if _torch_cuda_ok() else "cpu"
+    return (os.environ.get(env_var) or auto_default).strip().lower() or auto_default
+
+
+def whisper_device() -> str:
+    mode = ai_device_mode()
+    if mode != "auto":
+        return mode
+    return (os.environ.get("WHISPER_DEVICE") or WHISPER_DEVICE).strip().lower() or "auto"
+
 # Engine transcribe thứ 3 (đọc phụ đề CỨNG in sẵn trên khung hình, không dựa
 # âm thanh — xem app/stages/transcribe_ocr.py). Đã đo thực tế: ~0.6-1.2s/khung
 # trên CPU (RapidOCR/onnxruntime) — 1 khung/giây là mốc cân bằng tốc độ/độ
@@ -94,6 +158,12 @@ OCR_DEVICE = os.environ.get("OCR_DEVICE", "cpu").strip() or "cpu"
 # transcribe bình thường (1fps) để nhanh trên video dài.
 OCR_DETECT_REGION_FPS = 0.3
 
+# "Làm sạch video" (xoá phụ đề cứng, app/stages/hardsub_worker.py) cần torch
+# CUDA + rapidocr_onnxruntime — KHÔNG có trong venv chính (torch CPU), nên chạy
+# bằng Python của 1 venv GPU riêng, trỏ tới qua biến này. Để trống = dùng
+# chính Python đang chạy server (chỉ chạy được nếu venv này đủ thư viện).
+HARDSUB_PYTHON = os.environ.get("HARDSUB_PYTHON", "").strip().strip("'\"")
+
 # Đường dẫn thư mục đã clone thủ công github.com/jiji262/douyin-downloader
 # (mặc định workspace/vendor/douyin-downloader/, cùng chỗ với capcut-tts-api
 # — xem install.md) — dùng để ingest link Douyin qua CLI (subprocess) thay vì
@@ -103,61 +173,149 @@ OCR_DETECT_REGION_FPS = 0.3
 DOUYIN_DL_DIR = os.environ.get("DOUYIN_DL_DIR", "").strip()
 
 
+def chrome_installed() -> bool:
+    """douyin_browser mở Chrome THẬT đã cài (channel="chrome"), không dùng
+    Chromium đi kèm playwright — máy không cài Chrome thì tầng tải đó không chạy."""
+    roots = [os.environ.get(k, "") for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+    return any(r and (Path(r) / "Google" / "Chrome" / "Application" / "chrome.exe").exists() for r in roots)
+
+
 def douyin_dl_available() -> bool:
-    return bool(DOUYIN_DL_DIR) and (Path(DOUYIN_DL_DIR) / "run.py").exists()
+    """Có repo douyin-downloader VÀ có config.yml (chứa cookie Douyin). Bản cài
+    gửi khách có sẵn repo nhưng cố ý không kèm config.yml (cookie của admin) —
+    trước đây chỉ kiểm tra run.py nên máy khách luôn chọn tầng này rồi hỏng."""
+    root = Path(DOUYIN_DL_DIR) if DOUYIN_DL_DIR else None
+    return bool(root) and (root / "run.py").exists() and (root / "config.yml").exists()
+
+
+def _workspace_base() -> Path:
+    workspace = os.environ.get("WORKSPACE_DIR", "").strip()
+    return Path(workspace).expanduser().resolve() if workspace else DEFAULT_WORKSPACE
+
+
+def models_dir() -> Path:
+    """Thư mục gốc chứa model AI (whisper/, sensevoice/, big-lama.pt). Mặc định
+    cạnh workspace; đổi được trong Cài đặt (env `MODELS_DIR`) — máy user hay
+    chỉ có ổ C nhỏ, model nặng vài GB."""
+    custom = os.environ.get("MODELS_DIR", "").strip()
+    path = Path(custom).expanduser().resolve() if custom else _workspace_base() / "models"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def sensevoice_cache_dir() -> Path:
     custom = os.environ.get("SENSEVOICE_CACHE_DIR", "").strip()
-    if custom:
-        path = Path(custom).expanduser().resolve()
-    else:
-        workspace = os.environ.get("WORKSPACE_DIR", "").strip()
-        base = Path(workspace).expanduser().resolve() if workspace else Path(__file__).resolve().parent.parent / "workspace"
-        path = base / "models" / "sensevoice"
+    path = Path(custom).expanduser().resolve() if custom else models_dir() / "sensevoice"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def whisper_cache_dir() -> Path:
     custom = os.environ.get("WHISPER_CACHE_DIR", "").strip()
-    if custom:
-        path = Path(custom).expanduser().resolve()
-    else:
-        workspace = os.environ.get("WORKSPACE_DIR", "").strip()
-        base = Path(workspace).expanduser().resolve() if workspace else Path(__file__).resolve().parent.parent / "workspace"
-        path = base / "models" / "whisper"
+    path = Path(custom).expanduser().resolve() if custom else models_dir() / "whisper"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def lama_model_path() -> Path:
+    return models_dir() / "big-lama.pt"
+
+
+def temp_dir() -> Path:
+    """Thư mục tạm (TEMP/TMP của cả process). Mặc định giữ chỗ cũ
+    (`<cache whisper>/tmp`); đổi được trong Cài đặt (env `TEMP_DIR`)."""
+    custom = os.environ.get("TEMP_DIR", "").strip()
+    path = Path(custom).expanduser().resolve() if custom else whisper_cache_dir() / "tmp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+class CapcutDraftsDirError(RuntimeError):
+    """Chưa cài / cài sai thư mục draft CapCut — chặn dựng draft thay vì ghi
+    vào chỗ CapCut không thấy."""
+
+
+def default_capcut_drafts_candidates() -> list[Path]:
+    """Thư mục draft MẶC ĐỊNH của CapCut quốc tế và Jianying (CapCut Trung) trên
+    Windows. Người dùng đổi vị trí lưu trong cài đặt CapCut thì không nằm ở đây
+    — phải nhập tay trong trang Cài đặt."""
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local:
+        return []
+    base = Path(local)
+    return [
+        base / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft",
+        base / "JianyingPro" / "User Data" / "Projects" / "com.lveditor.draft",
+    ]
+
+
+def detect_capcut_drafts_dirs() -> list[Path]:
+    return [p for p in default_capcut_drafts_candidates() if p.is_dir()]
+
+
+def check_capcut_drafts_dir(path: Path) -> tuple[str, str]:
+    """("ok"|"warning"|"error", lời nhắn). warning = thư mục có thật nhưng chưa
+    thấy dấu hiệu của CapCut (vd CapCut mới cài, chưa có draft nào) — vẫn cho
+    dùng."""
+    if not path.exists():
+        return "error", "Thư mục không tồn tại"
+    if not path.is_dir():
+        return "error", "Đường dẫn không phải thư mục"
+    if (path / "root_meta_info.json").exists():
+        return "ok", "Đúng thư mục draft CapCut"
+    try:
+        for child in path.iterdir():
+            if child.is_dir() and ((child / "draft_content.json").exists() or (child / "draft_info.json").exists()):
+                return "ok", "Đúng thư mục draft CapCut"
+    except OSError as err:
+        return "error", f"Không đọc được thư mục: {err}"
+    return "warning", "Chưa thấy draft CapCut nào trong thư mục này — kiểm tra lại nếu CapCut đã có draft"
+
+
+def capcut_drafts_dir_setting() -> tuple[Optional[Path], str]:
+    """(thư mục draft, nguồn): nguồn "env" = người dùng tự đặt trong Cài đặt,
+    "auto" = tự dò thấy thư mục mặc định của CapCut, "" = chưa có."""
+    custom = os.environ.get("CAPCUT_DRAFTS_DIR", "").strip()
+    if custom:
+        return Path(custom).expanduser().resolve(), "env"
+    found = detect_capcut_drafts_dirs()
+    if found:
+        return found[0], "auto"
+    return None, ""
 
 
 def capcut_drafts_dir() -> Path:
     """Thư mục draft CapCut THẬT trên máy — assemble ghi draft thẳng vào đây
-    để CapCut tự nhận ra. Cùng biến env `CAPCUT_DRAFTS_DIR` với CapcutSupperTool
-    (D:\\CapcutSupperTool) — máy này đã set sẵn 'D:\\Capcut Data\\CapCut Drafts'.
-    Không set thì fallback vào workspace (vẫn ghi được, chỉ là CapCut không tự
-    thấy — phải tự copy thư mục qua tay)."""
-    custom = os.environ.get("CAPCUT_DRAFTS_DIR", "").strip()
-    if custom:
-        path = Path(custom).expanduser().resolve()
-    else:
-        workspace = os.environ.get("WORKSPACE_DIR", "").strip()
-        base = Path(workspace).expanduser().resolve() if workspace else Path(__file__).resolve().parent.parent / "workspace"
-        path = base / "capcut_drafts"
-    path.mkdir(parents=True, exist_ok=True)
+    để CapCut tự nhận ra. Đặt trong trang Cài đặt (env `CAPCUT_DRAFTS_DIR`,
+    dùng chung với CapcutSupperTool), không đặt thì tự dò thư mục mặc định.
+    Trước đây không đặt thì ghi vào workspace/capcut_drafts — dựng "thành
+    công" nhưng CapCut không thấy draft, người dùng không biết vì sao; giờ báo
+    lỗi rõ để vào Cài đặt sửa."""
+    path, _ = capcut_drafts_dir_setting()
+    if path is None:
+        raise CapcutDraftsDirError(
+            "Chưa cài thư mục draft CapCut — mở Cài đặt, bấm \"Tự dò\" hoặc dán đường dẫn "
+            "thư mục lưu draft của CapCut"
+        )
+    status, message = check_capcut_drafts_dir(path)
+    if status == "error":
+        raise CapcutDraftsDirError(f"Thư mục draft CapCut không dùng được ({path}): {message} — sửa trong Cài đặt")
     return path
 
 
 def apply_whisper_cache_env() -> Path:
-    """Đưa cache HuggingFace + TEMP sang workspace trên ổ D — ổ C thường hết chỗ."""
+    """Đưa MỌI cache model (HuggingFace, modelscope, torch hub) + TEMP vào thư
+    mục model — ổ C thường hết chỗ. Đặt 1 chỗ duy nhất cho cả app: từng có
+    stage tự đổi HF_HOME sang chỗ khác, model bị tải trùng / lọt sang ~/.cache."""
     cache = whisper_cache_dir()
     hf = cache / "huggingface"
-    tmp = cache / "tmp"
+    tmp = temp_dir()
     hf.mkdir(parents=True, exist_ok=True)
-    tmp.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(hf)
     os.environ["HF_HUB_CACHE"] = str(hf / "hub")
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf / "hub")
+    os.environ["MODELSCOPE_CACHE"] = str(sensevoice_cache_dir() / "modelscope")
+    os.environ["TORCH_HOME"] = str(models_dir() / "torch")
     os.environ["TEMP"] = str(tmp)
     os.environ["TMP"] = str(tmp)
     os.environ["TMPDIR"] = str(tmp)
@@ -171,7 +329,8 @@ apply_whisper_cache_env()
 # (dán token đã "Extend" sẵn ở Access Token Debugger thì không cần), và không
 # được đóng gói vào bản build gửi khách.
 FB_GRAPH_VERSION = os.environ.get("FB_GRAPH_VERSION", "v21.0").strip() or "v21.0"
-FB_APP_ID = os.environ.get("FB_APP_ID", "").strip()
+# Không có trong .env (bản đóng gói) → dùng App ID công khai nhúng sẵn.
+FB_APP_ID = os.environ.get("FB_APP_ID", "").strip() or _license_constants.FB_APP_ID
 FB_APP_SECRET = os.environ.get("FB_APP_SECRET", "").strip()
 # Đăng nhập Facebook (OAuth) ngay trong tool: ngrok trỏ vào cổng frontend
 # (5175, Vite chuyển /api sang backend). FB_REDIRECT_URI="auto" (mặc định) =

@@ -5,8 +5,9 @@ import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from './StatusBadge'
 import JobProgressBar from './JobProgressBar'
 import { useJobStatus } from '../hooks/useJobStatus'
+import { USER_STAGE_LABELS, useLabels } from '../lib/labels'
 
-const EPISODE_STAGE_LABELS: Record<EpisodeStageName, string> = {
+const ADMIN_EPISODE_STAGE_LABELS: Record<EpisodeStageName, string> = {
   ingest: 'Video',
   transcribe: 'Whisper',
   translate: 'Gemini',
@@ -53,6 +54,7 @@ export default function EpisodeCard({
   minVideoSpeed?: number
 }) {
   const queryClient = useQueryClient()
+  const labels = useLabels()
   const { episode } = detail
   const episodeId = episode.episode_id
   const [expanded, setExpanded] = useState(episode.stages.tts.status !== 'done')
@@ -173,7 +175,7 @@ export default function EpisodeCard({
             ] as EpisodeStageName[]
           ).map((s) => (
             <span key={s} className="flex items-center gap-1 text-[10px] text-neutral-500">
-              {EPISODE_STAGE_LABELS[s]}
+              {(labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS)[s]}
               <StatusBadge status={episode.stages[s].status} />
             </span>
           ))}
@@ -283,7 +285,7 @@ export default function EpisodeCard({
                 disabled={busyAny || transcribeMutation.isPending}
                 onClick={() => transcribeMutation.mutate()}
               >
-                {busyWhisper ? 'Đang nhận diện...' : transcribe.status === 'done' ? 'Chạy lại Whisper' : 'Chạy Whisper'}
+                {busyWhisper ? 'Đang nhận diện...' : labels.isAdmin ? (transcribe.status === 'done' ? 'Chạy lại Whisper' : 'Chạy Whisper') : transcribe.status === 'done' ? 'Nhận diện lại' : 'Bắt đầu nhận diện'}
               </button>
               {busyWhisper && (
                 <button
@@ -309,7 +311,7 @@ export default function EpisodeCard({
                 disabled={busyAny || translateMutation.isPending}
                 onClick={() => translateMutation.mutate()}
               >
-                {busyGemini ? 'Đang dịch...' : translate.status === 'done' ? 'Chạy lại Gemini' : 'Chạy Gemini'}
+                {busyGemini ? 'Đang dịch...' : labels.isAdmin ? (translate.status === 'done' ? 'Chạy lại Gemini' : 'Chạy Gemini') : translate.status === 'done' ? 'Dịch lại' : 'Bắt đầu dịch'}
               </button>
               {busyGemini && (
                 <button
@@ -330,7 +332,7 @@ export default function EpisodeCard({
             <div className="flex flex-wrap items-center gap-2">
               <JobProgressBar job={ttsJob.data} />
               <button type="button" className={primaryButtonClass} disabled={busyAny || ttsMutation.isPending} onClick={() => ttsMutation.mutate()}>
-                {busyTTS ? 'Đang đọc...' : tts.status === 'done' ? 'Chạy lại TTS' : 'Chạy TTS'}
+                {busyTTS ? 'Đang đọc...' : labels.isAdmin ? (tts.status === 'done' ? 'Chạy lại TTS' : 'Chạy TTS') : tts.status === 'done' ? 'Đọc lại' : 'Tạo giọng đọc'}
               </button>
               {tts.status === 'done' && tts.progress?.includes('lỗi') && (
                 <button type="button" className={secondaryButtonClass} disabled={busyAny} onClick={() => retryTTSMutation.mutate()}>

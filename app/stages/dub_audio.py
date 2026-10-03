@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
@@ -12,12 +11,7 @@ from .. import jobs as jobs_mod
 
 DEFAULT_MODEL = "htdemucs"
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
-
-try:
-    DEMUCS_TIMEOUT_S = int(os.environ.get("DEMUCS_TIMEOUT_S", "1800").strip() or "1800")
-except ValueError:
-    DEMUCS_TIMEOUT_S = 1800
-
+DEMUCS_WORKER = Path(__file__).with_name("_demucs_worker.py")
 
 class DubAudioError(RuntimeError):
     pass
@@ -80,9 +74,11 @@ def extract_background(
     _extract_wav(video_path, raw_wav)
 
     if on_progress:
-        on_progress(0, 1, "tách nhạc nền (demucs, có thể mất vài phút)")
+        on_progress(0, 1, "tách nhạc nền (có thể mất vài phút)")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "app.stages._demucs_worker", str(raw_wav), str(output_path)],
+        # Chạy theo đường dẫn file (không `-m`): bản đóng gói biên dịch gói
+        # `app` bằng Nuitka, còn worker này phát hành dạng source cạnh đó.
+        [sys.executable, str(DEMUCS_WORKER), str(raw_wav), str(output_path)],
         cwd=str(ROOT_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -94,6 +90,7 @@ def extract_background(
     cancelled = False
     try:
         start = time.time()
+        timeout_s = config.demucs_timeout_s()
         while True:
             try:
                 stdout, stderr = proc.communicate(timeout=0.5)
@@ -111,12 +108,12 @@ def extract_background(
                     stdout, stderr = proc.communicate()
                     cancelled = True
                     break
-                if time.time() - start > DEMUCS_TIMEOUT_S:
+                if time.time() - start > timeout_s:
                     proc.kill()
                     proc.communicate()
                     raise DubAudioError(
-                        f"Demucs treo/chạy quá {DEMUCS_TIMEOUT_S}s — đã huỷ tiến trình con. "
-                        f"Thử lại, hoặc tăng DEMUCS_TIMEOUT_S trong .env nếu video quá dài."
+                        f"Demucs treo/chạy quá {timeout_s}s — đã huỷ tiến trình con. "
+                        f"Thử lại, hoặc tăng \"Thời gian chờ tối đa Demucs\" trong Cài đặt → Nâng cao nếu video quá dài."
                     )
     finally:
         if job is not None:

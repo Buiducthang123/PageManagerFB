@@ -21,10 +21,13 @@ export default function OcrCropSelector({
   videoUrl,
   crop,
   onChange,
+  simple = false,
 }: {
   videoUrl: string
   crop: CropRegion | null
   onChange: (crop: CropRegion | null) => void
+  /** Lời hướng dẫn ngắn cho user thường (không phải admin) */
+  simple?: boolean
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -91,11 +94,17 @@ export default function OcrCropSelector({
 
   return (
     <div className="space-y-2">
-      <p className="text-xs text-neutral-500">
-        Tua tới đoạn có <b>phụ đề lời thoại thật</b> rồi kéo chọn ĐỘ CAO dải phụ đề (bề ngang luôn lấy gần trọn khung
-        hình để không cắt cụt câu dài) — khung hình đầu video thường chỉ có tên chương trình/logo, không phải vị trí
-        phụ đề chạy suốt video.
-      </p>
+      {simple ? (
+        <p className="text-xs text-neutral-500">
+          Tua tới đoạn đang có phụ đề, rồi kéo chuột chọn vùng chứa dòng phụ đề.
+        </p>
+      ) : (
+        <p className="text-xs text-neutral-500">
+          Tua tới đoạn có <b>phụ đề lời thoại thật</b> rồi kéo chọn ĐỘ CAO dải phụ đề (bề ngang luôn lấy gần trọn khung
+          hình để không cắt cụt câu dài) — khung hình đầu video thường chỉ có tên chương trình/logo, không phải vị trí
+          phụ đề chạy suốt video.
+        </p>
+      )}
       <div
         ref={containerRef}
         className="relative w-full cursor-row-resize touch-none select-none overflow-hidden rounded-lg bg-black"

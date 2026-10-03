@@ -24,11 +24,10 @@ class SenseVoiceError(RuntimeError):
 
 
 def _apply_cache_env() -> Path:
-    cache = config.sensevoice_cache_dir()
-    os.environ["MODELSCOPE_CACHE"] = str(cache / "modelscope")
-    os.environ["HF_HOME"] = str(cache / "huggingface")
-    os.environ["HF_HUB_CACHE"] = str(cache / "huggingface" / "hub")
-    return cache
+    # HF_HOME KHÔNG đổi ở đây nữa — để chung 1 chỗ (config.apply_whisper_cache_env),
+    # đổi giữa chừng làm model HF khác (VieNeu, Demucs) tải trùng sang chỗ mới.
+    config.apply_whisper_cache_env()
+    return config.sensevoice_cache_dir()
 
 
 def _load_model():
@@ -42,7 +41,7 @@ def _load_model():
     torch.set_num_threads(1)
     from funasr import AutoModel
 
-    device = (os.environ.get("SENSEVOICE_DEVICE") or config.SENSEVOICE_DEVICE).strip().lower()
+    device = config.engine_device("SENSEVOICE_DEVICE", config.SENSEVOICE_DEVICE)
     logger.info("Tải SenseVoiceSmall trên {} cache={}", device, cache)
     try:
         _model = AutoModel(
@@ -74,7 +73,7 @@ def transcribe_video(
         language = "auto"
 
     if on_progress:
-        on_progress(0, 1, "SenseVoice · đang xử lý")
+        on_progress(0, 1, "Đang nhận diện giọng nói...")
 
     try:
         res = model.generate(
@@ -101,9 +100,9 @@ def transcribe_video(
         cues.append(Cue(id=i, start=format_ts(start), end=format_ts(end), text=text))
 
     if on_progress:
-        on_progress(1, 1, "SenseVoice · xong")
+        on_progress(1, 1, "Nhận diện xong")
 
-    device = (os.environ.get("SENSEVOICE_DEVICE") or config.SENSEVOICE_DEVICE).strip().lower()
+    device = config.engine_device("SENSEVOICE_DEVICE", config.SENSEVOICE_DEVICE)
     output_srt.parent.mkdir(parents=True, exist_ok=True)
     write_srt(output_srt, cues)
     return cues, f"sensevoice · {language} · {device}"

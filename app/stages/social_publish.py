@@ -422,22 +422,63 @@ def _set_video_file(page: Page, video_path: Path) -> None:
 _CAPTION_SELECTORS = ['div[contenteditable="true"]', 'textarea[placeholder*="caption" i]', "textarea"]
 
 
-def _wait_for_upload_processed(page: Page, timeout_s: float = 180.0) -> None:
+_UPLOAD_PROGRESS_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+
+def _wait_for_upload_processed(
+    page: Page,
+    timeout_s: float = 180.0,
+    stall_timeout_s: float = 45.0,
+    max_timeout_s: float = 1800.0,
+) -> None:
     """TikTok cần thời gian upload + xử lý video thật trước khi chuyển từ màn
     "Select video to upload" sang màn chỉnh sửa (nơi có ô caption) — đã xác
     nhận thật qua screenshot lỗi: đợi cố định 15s là KHÔNG ĐỦ cho video qua
     mạng thật (15s vẫn còn đang quay spinner Upload), khiến bước điền caption
     chạy hụt vì element chưa tồn tại. Đổi hẳn sang chờ ĐÚNG TÍN HIỆU (ô
-    caption thật sự xuất hiện) thay vì đoán thời gian cố định."""
+    caption thật sự xuất hiện) thay vì đoán thời gian cố định.
+
+    `timeout_s=180` cũ là NGƯỠNG CỨNG — mạng chậm + file lớn (vd 210MB, xem
+    ảnh chụp thật "14.58%, 3 minutes left" lúc lỗi) không bao giờ kịp trong 3
+    phút, bị raise SocialPublishError giữa chừng, rồi `finally: context.close()`
+    ở nơi gọi ĐÓNG LUÔN TRÌNH DUYỆT — chính là hành động HUỶ NGANG upload đang
+    tải dở (TikTok dừng nhận file khi tab đóng), không phải chỉ "báo lỗi suông".
+    Giờ đọc thêm % tiến độ hiển thị trên trang (vd "14.58%") — còn đang NHÍCH
+    LÊN thì tiếp tục chờ (tới tối đa `max_timeout_s`), chỉ thật sự coi là lỗi
+    khi tiến độ ĐỨNG YÊN (treo thật) quá `stall_timeout_s`, hoặc không đọc được
+    % nào cả (vd TikTok đổi giao diện) thì vẫn giữ mốc `timeout_s` gốc làm an
+    toàn tối thiểu."""
     start = time.time()
-    while time.time() - start < timeout_s:
+    last_progress: float | None = None
+    last_progress_at = start
+    while True:
+        now = time.time()
         for selector in _CAPTION_SELECTORS:
             if page.locator(selector).first.count() > 0:
                 return
+        body_text = ""
+        try:
+            body_text = page.locator("body").inner_text(timeout=2000) or ""
+        except Exception:
+            pass
+        m = _UPLOAD_PROGRESS_RE.search(body_text)
+        progress = float(m.group(1)) if m else None
+        if progress is not None and progress != last_progress:
+            last_progress = progress
+            last_progress_at = now
+        elapsed = now - start
+        stalled_for = now - last_progress_at
+        if elapsed >= max_timeout_s:
+            raise SocialPublishError(
+                f"Video chưa xử lý xong sau {max_timeout_s:.0f}s chờ (vẫn đang upload nhưng quá lâu) — mạng quá chậm"
+            )
+        if elapsed >= timeout_s and (progress is None or stalled_for >= stall_timeout_s):
+            raise SocialPublishError(
+                f"Video chưa xử lý xong sau {elapsed:.0f}s chờ (không thấy màn chỉnh sửa, tiến độ "
+                f"{'không đọc được' if progress is None else f'đứng yên ở {progress:.0f}%'}) — "
+                "có thể mạng chậm hoặc TikTok đổi giao diện"
+            )
         page.wait_for_timeout(1000)
-    raise SocialPublishError(
-        f"Video chưa xử lý xong sau {timeout_s:.0f}s chờ (không thấy màn chỉnh sửa) — có thể mạng chậm hoặc TikTok đổi giao diện"
-    )
 
 
 def _wait_for_upload_complete(page: Page, timeout_s: float = 180.0) -> None:
