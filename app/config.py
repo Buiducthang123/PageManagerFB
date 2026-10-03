@@ -21,6 +21,42 @@ from .license import constants as _license_constants  # noqa: E402
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+
+def _suppress_subprocess_windows() -> None:
+    """Trên Windows, mỗi lần gọi ffmpeg/ffprobe/yt-dlp... qua subprocess sẽ bật
+    một cửa sổ console đen chớp lên rồi tắt. Khi xuất video (gọi ffprobe/ffmpeg
+    liên tục) nó nháy loạn màn hình. Thay vì rải `creationflags=CREATE_NO_WINDOW`
+    ở từng chỗ (dễ sót, không phủ được thư viện bên thứ ba), patch luôn
+    `subprocess.Popen` một lần ở đây — vì cả `subprocess.run` lẫn yt-dlp/demucs
+    đều đi qua Popen. Chỉ áp dụng trên Windows; chạy idempotent (import 2 lần
+    không chồng patch)."""
+    import subprocess
+    import sys
+
+    if sys.platform != "win32" or getattr(subprocess.Popen, "_no_window_patched", False):
+        return
+
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _OrigPopen = subprocess.Popen
+
+    class _NoWindowPopen(_OrigPopen):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            # OR thêm cờ ẩn cửa sổ, giữ nguyên cờ caller đã truyền (vd.
+            # CREATE_NEW_PROCESS_GROUP dùng cho hủy tiến trình).
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
+            if kwargs.get("startupinfo") is None:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs["startupinfo"] = si
+            super().__init__(*args, **kwargs)
+
+    _NoWindowPopen._no_window_patched = True
+    subprocess.Popen = _NoWindowPopen  # type: ignore[misc]
+
+
+_suppress_subprocess_windows()
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip().strip("'\"") or DEFAULT_GEMINI_MODEL

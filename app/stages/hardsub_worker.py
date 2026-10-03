@@ -38,6 +38,33 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+
+def _suppress_subprocess_windows() -> None:
+    """Worker này chạy ở venv GPU riêng (KHÔNG import app.config nên không hưởng
+    patch ẩn cửa sổ ở đó) nhưng lại tự gọi ffmpeg/ffprobe liên tục -> mỗi lần
+    nháy một cửa sổ console đen. Patch subprocess.Popen ngay tại đây cho mọi lời
+    gọi ffmpeg/ffprobe của worker đều chạy ẩn. Chỉ áp dụng trên Windows."""
+    if sys.platform != "win32" or getattr(subprocess.Popen, "_no_window_patched", False):
+        return
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _OrigPopen = subprocess.Popen
+
+    class _NoWindowPopen(_OrigPopen):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
+            if kwargs.get("startupinfo") is None:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs["startupinfo"] = si
+            super().__init__(*args, **kwargs)
+
+    _NoWindowPopen._no_window_patched = True
+    subprocess.Popen = _NoWindowPopen  # type: ignore[misc]
+
+
+_suppress_subprocess_windows()
+
 LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 CJK_RE = re.compile(r"[㐀-鿿豈-﫿]")
 
