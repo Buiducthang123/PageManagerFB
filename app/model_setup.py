@@ -255,6 +255,12 @@ def _run_one(comp: Component) -> None:
             task.status = "error"
             task.error, task.error_tech = _tail_error(log_path)
             task.error_tech = task.error_tech or f"tiến trình tải thoát với mã {proc.returncode}"
+            if (proc.returncode or 0) & 0xFFFFFFFF == 0xC0000005:
+                # Access violation khi nạp torch/onnxruntime — gần như luôn do Visual C++
+                # Runtime của máy quá cũ (xem app/vcrt.py). Mở lại app để app chép bản mới.
+                task.error = ("Lỗi thư viện hệ thống (Microsoft Visual C++) — tắt hẳn rồi mở lại app, "
+                              "vẫn lỗi thì cài https://aka.ms/vs/17/release/vc_redist.x64.exe")
+                task.error_tech = f"access violation (0xC0000005) · {task.error_tech}"
     if task.status == "error":
         logger.warning("model_setup: tải {} lỗi: {}", comp.id, task.error_tech)
     else:
