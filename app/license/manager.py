@@ -243,6 +243,26 @@ class LicenseManager:
             self.code = ""
         self._notify()
 
+    def register(self, email: str, password: str, display_name: str, contact: str) -> None:
+        """Gửi yêu cầu tạo tài khoản — chờ admin duyệt mới đăng nhập được."""
+        if self.mode != "enabled":
+            raise LoginError("Bản này không cần đăng nhập" if self.mode == "disabled" else self.message)
+        email = email.strip().lower()
+        if len(password) < 8:
+            raise LoginError("Mật khẩu tối thiểu 8 ký tự")
+        if not display_name.strip():
+            raise LoginError("Nhập tên của bạn")
+        try:
+            client.register(email, password, display_name.strip(), contact.strip())
+        except client.OfflineError as err:
+            raise LoginError("Không kết nối được máy chủ — kiểm tra mạng rồi thử lại") from err
+        except client.ApiError as err:
+            if err.status == 404:
+                raise LoginError("Máy chủ chưa mở chức năng đăng ký — liên hệ admin") from err
+            raise LoginError(str(err) or "Không đăng ký được") from err
+        store.remember_email(email)
+        logger.info("license: gửi yêu cầu đăng ký {}", email)
+
     def change_password(self, new_password: str) -> None:
         if len(new_password) < 8:
             raise LoginError("Mật khẩu mới tối thiểu 8 ký tự")

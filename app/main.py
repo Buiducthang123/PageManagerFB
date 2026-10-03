@@ -467,6 +467,18 @@ def license_login_route(body: dict):
         raise HTTPException(status_code=400, detail=str(err)) from err
 
 
+@app.post("/api/license/register")
+def license_register_route(body: dict):
+    try:
+        license_manager.register(
+            str(body.get("email") or ""), str(body.get("password") or ""),
+            str(body.get("display_name") or ""), str(body.get("contact") or ""),
+        )
+    except LoginError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return {"ok": True}
+
+
 @app.post("/api/license/logout")
 def license_logout_route():
     license_manager.logout()
@@ -6177,6 +6189,25 @@ def cleanup_keep_route(body: dict):
         raise HTTPException(status_code=404, detail="Không tìm thấy project")
     social_cleanup.set_keep(project_id, bool(body.get("keep", True)))
     return {"status": "ok", "project_id": project_id, "keep": bool(body.get("keep", True))}
+
+
+@app.post("/api/cleanup/allow-delete")
+def cleanup_allow_delete_route(body: dict):
+    """allow=true: rút video "Sẵn sàng đăng" khỏi lịch đăng để xoá được;
+    allow=false: huỷ, video về lại trạng thái trước đó."""
+    project_id = str(body.get("project_id") or "").strip()
+    if not project_id:
+        raise HTTPException(status_code=400, detail="Thiếu project_id")
+    try:
+        if body.get("allow", True):
+            social_cleanup.allow_delete(project_id)
+        else:
+            social_cleanup.undo_allow_delete(project_id)
+    except ValueError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return {"status": "ok"}
 
 
 @app.post("/api/cleanup/delete")

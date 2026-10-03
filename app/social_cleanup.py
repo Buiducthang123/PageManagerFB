@@ -176,6 +176,76 @@ def set_keep(project_id: str, keep: bool) -> None:
     _plan_cache = None
 
 
+def released_projects() -> dict[str, str]:
+    """Project người dùng bấm "Cho phép xoá" lúc hệ thống đang bảo vệ (video
+    sẵn sàng đăng) → {project_id: trạng thái hàng đợi trước đó} để "Không xoá
+    nữa" trả về đúng trạng thái cũ (không phải xử lý lại)."""
+    return dict(_load_marker().get("released_projects") or {})
+
+
+def _queue_item_of(project_id: str):
+    """(social_id, aweme_id) của video mà project này là bản xử lý hiện tại."""
+    entry = next((e for e in cleanup_plan() if e["project_id"] == project_id), None)
+    if entry is None or not entry["is_current"] or not entry["social_id"]:
+        return None
+    return entry["social_id"], entry["aweme_id"]
+
+
+def allow_delete(project_id: str) -> None:
+    """Rút video "Sẵn sàng đăng" khỏi lịch đăng (→ Đã bỏ qua) để nó hết bị bảo
+    vệ: tự dọn sau CLEANUP_AFTER hoặc chọn "Xoá ngay" được. Video đang xử lý /
+    đang chạy 1 bước KHÔNG cho — xoá file giữa chừng làm hỏng bước đang chạy."""
+    global _plan_cache
+    ref = _queue_item_of(project_id)
+    if ref is None:
+        raise ValueError("Video này không còn trong hàng đợi của dự án tự động")
+    if any(k.startswith(f"{project_id}:") for k in jobs.running_keys()):
+        raise ValueError("Đang chạy một bước — bấm Dừng ở trang dự án trước")
+    social_id, aweme_id = ref
+    with sp.locked_state(social_id) as s:
+        item = next((i for i in s.queue if i.aweme_id == aweme_id and i.project_id == project_id), None)
+        if item is None:
+            raise ValueError("Video này không còn trong hàng đợi của dự án tự động")
+        if item.status != QueueItemStatus.ready:
+            raise ValueError("Chỉ video đang Sẵn sàng đăng mới cần bấm Cho phép xoá")
+        previous = item.status.value
+        item.status = QueueItemStatus.skipped
+    with _marker_lock:
+        marker = _load_marker()
+        released = dict(marker.get("released_projects") or {})
+        released[project_id] = previous
+        marker["released_projects"] = released
+        _save_marker(marker)
+    _plan_cache = None
+    logger.info("social_cleanup: người dùng cho phép xoá '{}' (rút khỏi lịch đăng, trước đó {})", project_id, previous)
+
+
+def undo_allow_delete(project_id: str) -> None:
+    """Huỷ "Cho phép xoá": video về lại trạng thái trước đó (Sẵn sàng đăng) —
+    chỉ khi file video vẫn còn và video vẫn đang ở Đã bỏ qua."""
+    global _plan_cache
+    previous = released_projects().get(project_id)
+    if previous is None:
+        raise ValueError("Video này không được bấm Cho phép xoá trước đó")
+    if not heavy_files(pj.project_dir(project_id)):
+        raise ValueError("File video đã bị xoá — không khôi phục được")
+    ref = _queue_item_of(project_id)
+    if ref is not None:
+        social_id, aweme_id = ref
+        with sp.locked_state(social_id) as s:
+            item = next((i for i in s.queue if i.aweme_id == aweme_id and i.project_id == project_id), None)
+            if item is not None and item.status == QueueItemStatus.skipped:
+                item.status = QueueItemStatus(previous)
+    with _marker_lock:
+        marker = _load_marker()
+        released = dict(marker.get("released_projects") or {})
+        released.pop(project_id, None)
+        marker["released_projects"] = released
+        _save_marker(marker)
+    _plan_cache = None
+    logger.info("social_cleanup: người dùng huỷ cho phép xoá '{}' → {}", project_id, previous)
+
+
 def cleanup_plan(now: datetime | None = None, use_cache: bool = False) -> list[dict]:
     """Lịch tự dọn của MỌI project do dự án tự động sinh ra còn file nặng —
     DÙNG CHUNG cho việc dọn thật (`_clean_projects`) và hiển thị (màn giám
@@ -195,6 +265,7 @@ def cleanup_plan(now: datetime | None = None, use_cache: bool = False) -> list[d
             continue
     running = jobs.running_keys()
     kept = kept_projects()
+    released = released_projects()
     plan: list[dict] = []
     if pj.PROJECTS_DIR.is_dir():
         for root in pj.PROJECTS_DIR.iterdir():
@@ -234,6 +305,10 @@ def cleanup_plan(now: datetime | None = None, use_cache: bool = False) -> list[d
             entry["rule"] = rule
             entry["rule_label"] = _RULE_LABELS.get(rule, rule)
             entry["kept_by_user"] = pid in kept
+            is_running = any(k.startswith(f"{pid}:") for k in running)
+            # Nút "Cho phép xoá" (video sẵn sàng đăng bị hệ thống bảo vệ) / "Không xoá nữa" (đã cho phép, chưa xoá).
+            entry["can_release"] = bool(current and item.status == QueueItemStatus.ready and not is_running and pid not in kept)
+            entry["released"] = bool(current and pid in released and item.status == QueueItemStatus.skipped)
             if pid in kept:
                 entry["protected_reason"] = "Bạn đã chọn giữ lại — không tự xoá"
             elif any(k.startswith(f"{pid}:") for k in running):

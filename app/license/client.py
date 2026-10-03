@@ -110,6 +110,14 @@ def request_rest(method: str, table: str, access_token: str, *, params: Optional
     return _request(method, f"/rest/v1/{table}", access_token=access_token, params=params, json_body=json_body)
 
 
+def register(email: str, password: str, display_name: str, contact: str) -> Any:
+    """Tự đăng ký (Edge Function `register`, không cần đăng nhập) — tài khoản
+    tạo ra ở trạng thái chờ admin duyệt."""
+    return _request("POST", "/functions/v1/register", json_body={
+        "email": email, "password": password, "display_name": display_name, "contact": contact,
+    })
+
+
 def function(access_token: str, name: str, body: dict) -> Any:
     return _request("POST", f"/functions/v1/{name}", access_token=access_token, json_body=body)
 

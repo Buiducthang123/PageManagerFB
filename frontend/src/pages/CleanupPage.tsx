@@ -32,6 +32,21 @@ export default function CleanupPage() {
     onSuccess: refreshAll,
   })
 
+  const allowMutation = useMutation({
+    mutationFn: ({ projectId, allow }: { projectId: string; allow: boolean }) =>
+      api.setCleanupAllowDelete(projectId, allow),
+    onSuccess: refreshAll,
+  })
+  const askAllowDelete = (e: CleanupPlanEntry) => {
+    const ok = window.confirm(
+      `Video "${e.video_title || e.aweme_id}" đang chờ đăng.\n\n` +
+        'Cho phép xoá thì video bị rút khỏi lịch đăng (chuyển sang Đã bỏ qua) và bị xoá ở lượt tự dọn tới nếu đã cũ hơn ' +
+        `${query.data?.cleanup_after_hours ?? 24} giờ — hoặc chọn rồi bấm Xoá ngay. ` +
+        'Chưa xoá thì bấm "Không xoá nữa" để đưa về lại Sẵn sàng đăng.',
+    )
+    if (ok) allowMutation.mutate({ projectId: e.project_id, allow: true })
+  }
+
   const deleteMutation = useMutation({
     mutationFn: ({ ids, mode }: { ids: string[]; mode: 'files' | 'project' }) => api.cleanupDelete(ids, mode),
     onSuccess: (res) => {
@@ -166,6 +181,7 @@ export default function CleanupPage() {
         {resultMsg && <p className="text-sm text-neutral-300">{resultMsg}</p>}
         {deleteMutation.error && <p className="text-sm text-danger">{(deleteMutation.error as Error).message}</p>}
         {keepMutation.error && <p className="text-sm text-danger">{(keepMutation.error as Error).message}</p>}
+        {allowMutation.error && <p className="text-sm text-danger">{(allowMutation.error as Error).message}</p>}
         {!rows.length ? (
           <p className="text-sm text-neutral-500">Không có video nào.</p>
         ) : (
@@ -201,7 +217,9 @@ export default function CleanupPage() {
               </thead>
               <tbody>
                 {rows.map((e) => {
-                  const busy = keepMutation.isPending && keepMutation.variables?.projectId === e.project_id
+                  const busy =
+                    (keepMutation.isPending && keepMutation.variables?.projectId === e.project_id) ||
+                    (allowMutation.isPending && allowMutation.variables?.projectId === e.project_id)
                   // Chỉ bật/tắt được với video không bị hệ thống tự bảo vệ
                   // (đang xử lý / sẵn sàng đăng / đang chạy 1 bước).
                   const canToggle = e.kept_by_user || !!e.due_at
@@ -241,7 +259,22 @@ export default function CleanupPage() {
                       <td className="py-2 pr-3 text-xs text-neutral-400">{e.protected_reason ?? e.rule_label}</td>
                       <td className="mono py-2 pr-3 text-right text-xs">{e.size_mb} MB</td>
                       <td className="py-2 text-right whitespace-nowrap">
-                        {canToggle && (
+                        {e.can_release && (
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={() => askAllowDelete(e)}>
+                            Cho phép xoá
+                          </button>
+                        )}
+                        {e.released && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            disabled={busy}
+                            onClick={() => allowMutation.mutate({ projectId: e.project_id, allow: false })}
+                          >
+                            Không xoá nữa
+                          </button>
+                        )}
+                        {canToggle && !e.released && (
                           <button
                             type="button"
                             className="btn btn-ghost btn-sm"

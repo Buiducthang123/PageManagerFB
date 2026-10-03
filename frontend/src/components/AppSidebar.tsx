@@ -3,6 +3,7 @@ import { Link, NavLink } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../lib/api'
 import { useLicense } from '../lib/license'
+import { usePendingUsers } from '../pages/ApprovalsPage'
 
 function navClass({ isActive }: { isActive: boolean }): string {
   return [
@@ -99,6 +100,16 @@ function SettingsIcon() {
   )
 }
 
+function ApprovalIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <circle cx="8" cy="7" r="2.6" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M3.5 15.5c.7-2.3 2.4-3.5 4.5-3.5 1 0 1.9.3 2.6.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="m12 14 1.8 1.8L17 12.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 function AdminIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
@@ -120,7 +131,9 @@ function SystemCheckIcon() {
 
 // `features`: hiện mục khi có ít nhất 1 quyền (rỗng = luôn hiện). Chỉ để menu
 // gọn — chặn thật ở backend (app/license/guard.py).
-const NAV_ITEMS: { to: string; end: boolean; label: string; icon: ReactNode; features: string[] }[] = [
+type NavItem = { to: string; end: boolean; label: string; icon: ReactNode; features: string[]; badge?: number }
+
+const NAV_ITEMS: NavItem[] = [
   { to: '/', end: true, label: 'Dự án', icon: <ProjectsIcon />, features: ['projects'] },
   { to: '/merge', end: false, label: 'Ghép video', icon: <MergeIcon />, features: ['merge'] },
   { to: '/clean-video', end: false, label: 'Làm sạch video', icon: <CleanVideoIcon />, features: ['clean_video'] },
@@ -247,8 +260,13 @@ App sẽ dừng chạy ngầm: Dự án tự động ngừng crawl/xử lý/đă
 
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }): ReactNode {
   const { hasFeature, license } = useLicense()
-  const items = NAV_ITEMS.filter((item) => item.features.length === 0 || item.features.some(hasFeature))
-  if (license?.mode === 'enabled' && license.role === 'admin') {
+  const items: NavItem[] = NAV_ITEMS.filter((item) => item.features.length === 0 || item.features.some(hasFeature))
+  const isAdmin = license?.mode === 'enabled' && license.role === 'admin'
+  // Số tài khoản tự đăng ký đang chờ duyệt — hiện số trên mục "Duyệt user".
+  const pendingQuery = usePendingUsers(isAdmin)
+  const pendingCount = (pendingQuery.data ?? []).filter((u) => u.approval === 'pending').length
+  if (isAdmin) {
+    items.push({ to: '/approvals', end: false, label: 'Duyệt user', icon: <ApprovalIcon />, features: [], badge: pendingCount })
     items.push({ to: '/admin', end: false, label: 'Quản lý user', icon: <AdminIcon />, features: [] })
   }
   return (
@@ -266,6 +284,11 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }): ReactNode 
           <NavLink key={item.to} to={item.to} end={item.end} className={navClass} onClick={onNavigate}>
             {item.icon}
             {item.label}
+            {!!item.badge && (
+              <span className="ml-auto rounded-full bg-accent-300/20 px-1.5 text-[11px] font-medium text-accent-300">
+                {item.badge}
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>

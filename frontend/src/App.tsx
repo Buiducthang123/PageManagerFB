@@ -15,6 +15,7 @@ import CleanupPage from './pages/CleanupPage'
 import AccountsPage from './pages/AccountsPage'
 import SystemCheckPage from './pages/SystemCheckPage'
 import AdminPage from './pages/AdminPage'
+import ApprovalsPage from './pages/ApprovalsPage'
 
 export default function App() {
   return (
@@ -38,6 +39,7 @@ export default function App() {
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/system-check" element={<SystemCheckPage />} />
           <Route path="/admin" element={<AdminPage />} />
+          <Route path="/approvals" element={<ApprovalsPage />} />
         </Routes>
       </main>
     </div>

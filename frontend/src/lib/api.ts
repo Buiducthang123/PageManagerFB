@@ -450,6 +450,10 @@ export interface CleanupPlanEntry {
   rule: string
   rule_label: string
   kept_by_user: boolean
+  /** Video sẵn sàng đăng đang bị hệ thống bảo vệ — hiện nút "Cho phép xoá" */
+  can_release?: boolean
+  /** Đã bấm "Cho phép xoá", file còn — hiện nút "Không xoá nữa" */
+  released?: boolean
 }
 
 export type SocialCleanupPlan = Record<
@@ -654,6 +658,10 @@ export interface AdminUser {
   projects_created: number
   projects_completed: number
   device_switches_7d: number
+  /** Tài khoản tự đăng ký: 'pending' chờ duyệt, 'rejected' bị từ chối. Thiếu (server cũ) = 'approved' */
+  approval?: 'pending' | 'approved' | 'rejected'
+  signup_contact?: string
+  signup_at?: string | null
 }
 
 export interface AdminConfig {
@@ -664,7 +672,10 @@ export interface AdminConfig {
 }
 
 export type AdminUserPatch = Partial<
-  Pick<AdminUser, 'display_name' | 'enabled' | 'features' | 'role' | 'session_ttl_hours' | 'account_expires_at' | 'note'>
+  Pick<
+    AdminUser,
+    'display_name' | 'enabled' | 'features' | 'role' | 'session_ttl_hours' | 'account_expires_at' | 'note' | 'approval'
+  >
 >
 
 export interface UpdateStatus {
@@ -1045,6 +1056,9 @@ export const api = {
     }>('/api/cleanup/delete', { project_ids: projectIds, mode }),
   setCleanupKeep: (projectId: string, keep: boolean) =>
     postJson<{ status: string }>('/api/cleanup/keep', { project_id: projectId, keep }),
+  /** allow=true: rút video sẵn sàng đăng khỏi lịch đăng để xoá được; false: huỷ, về trạng thái cũ */
+  setCleanupAllowDelete: (projectId: string, allow: boolean) =>
+    postJson<{ status: string }>('/api/cleanup/allow-delete', { project_id: projectId, allow }),
   douyinBrowserStatus: () => request<DouyinBrowserStatus>('/api/douyin-browser/status'),
   douyinBrowserLogin: () => postJson<{ status: string }>('/api/douyin-browser/login'),
   douyinBrowserLoginJob: () => request<JobStatus>('/api/douyin-browser/login-job'),
@@ -1173,6 +1187,9 @@ export const api = {
   licenseStatus: () => request<LicenseStatus>('/api/license/status'),
   login: (email: string, password: string) => postJson<LicenseStatus>('/api/license/login', { email, password }),
   logout: () => postJson<LicenseStatus>('/api/license/logout'),
+  /** Tự đăng ký — tài khoản chờ admin duyệt */
+  register: (body: { email: string; password: string; display_name: string; contact: string }) =>
+    postJson<{ ok: boolean }>('/api/license/register', body),
   licenseRetry: () => postJson<LicenseStatus>('/api/license/retry'),
   changePassword: (newPassword: string) =>
     postJson<{ ok: boolean }>('/api/license/change-password', { new_password: newPassword }),

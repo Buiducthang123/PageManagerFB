@@ -60,6 +60,13 @@ def update_user(user_id: str, body: dict) -> None:
         if user_id == manager.current_user_id() and body["role"] != "admin":
             raise AdminError(400, "Không tự bỏ quyền admin của tài khoản đang dùng")
         patch["role"] = body["role"]
+    if "approval" in body:
+        # Duyệt/từ chối tài khoản tự đăng ký. Từ chối thì luôn khoá kèm.
+        if body["approval"] not in ("approved", "rejected", "pending"):
+            raise AdminError(400, "Trạng thái duyệt không hợp lệ")
+        patch["approval"] = body["approval"]
+        if body["approval"] != "approved":
+            patch["enabled"] = False
     if "session_ttl_hours" in body:
         ttl = body["session_ttl_hours"]
         if ttl is not None and (not isinstance(ttl, int) or ttl < 1):

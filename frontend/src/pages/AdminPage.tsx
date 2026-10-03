@@ -4,7 +4,7 @@ import { api, type AdminConfig, type AdminUser, type AdminUserPatch } from '../l
 import { useLicense } from '../lib/license'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 
-const FEATURES: { id: string; label: string }[] = [
+export const FEATURES: { id: string; label: string }[] = [
   { id: 'projects', label: 'Dự án' },
   { id: 'capcut', label: 'Dựng CapCut' },
   { id: 'tiktok_publish', label: 'Đăng TikTok' },
@@ -24,13 +24,15 @@ const TTL_OPTIONS: { value: string; label: string }[] = [
   { value: '720', label: '30 ngày' },
 ]
 
-function fmtTime(iso: string | null): string {
+export function fmtTime(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   return d.toLocaleString('vi-VN', { dateStyle: 'short', timeStyle: 'short' })
 }
 
 function userState(u: AdminUser): { label: string; cls: string } {
+  if (u.approval === 'pending') return { label: 'Chờ duyệt', cls: 'text-accent-300' }
+  if (u.approval === 'rejected') return { label: 'Đã từ chối', cls: 'text-neutral-500' }
   if (!u.enabled) return { label: 'Bị khoá', cls: 'text-danger' }
   if (u.account_expires_at && new Date(u.account_expires_at) < new Date()) return { label: 'Hết hạn', cls: 'text-danger' }
   if (!u.last_seen_at) return { label: 'Chưa dùng', cls: 'text-neutral-500' }
@@ -40,7 +42,7 @@ function userState(u: AdminUser): { label: string; cls: string } {
   return { label: 'Gần đây', cls: 'text-neutral-300' }
 }
 
-function FeatureChecks({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+export function FeatureChecks({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
   return (
     <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
       {FEATURES.map((f) => (
@@ -57,7 +59,7 @@ function FeatureChecks({ value, onChange }: { value: string[]; onChange: (v: str
   )
 }
 
-function TtlSelect({ value, onChange }: { value: number | null; onChange: (v: number | null) => void }) {
+export function TtlSelect({ value, onChange }: { value: number | null; onChange: (v: number | null) => void }) {
   const preset = TTL_OPTIONS.some((o) => o.value === String(value ?? '')) ? String(value ?? '') : 'custom'
   return (
     <div className="flex gap-2">

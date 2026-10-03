@@ -11,10 +11,73 @@ function formatMinutes(total: number): string {
   return h > 0 ? `${h} giờ ${m} phút` : `${m} phút`
 }
 
+/** Tự đăng ký — tài khoản tạo ra bị khoá, chờ admin duyệt + cấp quyền ở trang "Duyệt user". */
+function RegisterScreen({ onDone, onBack }: { onDone: (email: string) => void; onBack: () => void }) {
+  const [email, setEmail] = useState('')
+  const [name, setName] = useState('')
+  const [contact, setContact] = useState('')
+  const [password, setPassword] = useState('')
+  const [password2, setPassword2] = useState('')
+  const mismatch = password2.length > 0 && password !== password2
+  const registerMutation = useMutation({
+    mutationFn: () => api.register({ email: email.trim(), password, display_name: name.trim(), contact: contact.trim() }),
+    onSuccess: () => onDone(email.trim()),
+  })
+  const canSubmit = !!email.trim() && !!name.trim() && password.length >= 8 && password === password2
+  const submit = (e: FormEvent) => {
+    e.preventDefault()
+    if (canSubmit) registerMutation.mutate()
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-bg px-4 text-text">
+      <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-lg border border-divider bg-surface p-6">
+        <div className="flex items-center gap-3">
+          <span className="block h-[18px] w-[18px] rounded border border-accent" />
+          <h1 className="font-heading text-lg font-medium">Đăng ký tài khoản</h1>
+        </div>
+        <p className="text-xs text-neutral-400">
+          Sau khi đăng ký, admin sẽ duyệt và cấp quyền. Duyệt xong bạn đăng nhập bằng email và mật khẩu này.
+        </p>
+        <label className="block text-sm text-neutral-300">
+          Email
+          <input className={inputClass} type="email" autoComplete="username" autoFocus value={email} onChange={(e) => setEmail(e.target.value)} />
+        </label>
+        <label className="block text-sm text-neutral-300">
+          Tên của bạn
+          <input className={inputClass} autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label className="block text-sm text-neutral-300">
+          Số điện thoại / Zalo <span className="text-neutral-500">(để admin liên hệ — không bắt buộc)</span>
+          <input className={inputClass} autoComplete="tel" maxLength={120} value={contact} onChange={(e) => setContact(e.target.value)} />
+        </label>
+        <label className="block text-sm text-neutral-300">
+          Mật khẩu <span className="text-neutral-500">(tối thiểu 8 ký tự)</span>
+          <input className={inputClass} type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        <label className="block text-sm text-neutral-300">
+          Nhập lại mật khẩu
+          <input className={inputClass} type="password" autoComplete="new-password" value={password2} onChange={(e) => setPassword2(e.target.value)} />
+        </label>
+        {mismatch && <p className="text-sm text-danger">Mật khẩu nhập lại không khớp</p>}
+        {registerMutation.error && <p className="text-sm text-danger">{(registerMutation.error as Error).message}</p>}
+        <button type="submit" className={`${primaryButtonClass} w-full`} disabled={registerMutation.isPending || !canSubmit}>
+          {registerMutation.isPending ? 'Đang gửi...' : 'Gửi yêu cầu đăng ký'}
+        </button>
+        <button type="button" className={`${secondaryButtonClass} w-full`} onClick={onBack}>
+          Đã có tài khoản? Đăng nhập
+        </button>
+      </form>
+    </div>
+  )
+}
+
 function LoginScreen({ license }: { license: LicenseStatus }) {
   const queryClient = useQueryClient()
   const [email, setEmail] = useState(license.last_email || '')
   const [password, setPassword] = useState('')
+  const [registering, setRegistering] = useState(false)
+  const [registeredNotice, setRegisteredNotice] = useState(false)
   const loginMutation = useMutation({
     mutationFn: () => api.login(email.trim(), password),
     onSuccess: (status) => {
@@ -28,6 +91,20 @@ function LoginScreen({ license }: { license: LicenseStatus }) {
     if (email.trim() && password) loginMutation.mutate()
   }
 
+  if (registering) {
+    return (
+      <RegisterScreen
+        onBack={() => setRegistering(false)}
+        onDone={(registered) => {
+          setEmail(registered)
+          setPassword('')
+          setRegisteredNotice(true)
+          setRegistering(false)
+        }}
+      />
+    )
+  }
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg px-4 text-text">
       <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-lg border border-divider bg-surface p-6">
@@ -38,6 +115,11 @@ function LoginScreen({ license }: { license: LicenseStatus }) {
         {license.login_notice && (
           <p className="rounded-md border border-accent/40 bg-accent-900/30 px-3 py-2 text-sm text-accent-200">
             {license.login_notice}
+          </p>
+        )}
+        {registeredNotice && (
+          <p className="rounded-md border border-accent/40 bg-accent-900/30 px-3 py-2 text-sm text-accent-200">
+            Đã gửi yêu cầu đăng ký. Admin duyệt xong bạn đăng nhập bằng email và mật khẩu vừa tạo.
           </p>
         )}
         {license.message && !loginMutation.error && <p className="text-sm text-danger">{license.message}</p>}
@@ -70,6 +152,16 @@ function LoginScreen({ license }: { license: LicenseStatus }) {
           disabled={loginMutation.isPending || !email.trim() || !password}
         >
           {loginMutation.isPending ? 'Đang đăng nhập...' : 'Đăng nhập'}
+        </button>
+        <button
+          type="button"
+          className={`${secondaryButtonClass} w-full`}
+          onClick={() => {
+            loginMutation.reset()
+            setRegistering(true)
+          }}
+        >
+          Chưa có tài khoản? Đăng ký
         </button>
         <p className="text-xs text-neutral-500">
           Mỗi tài khoản dùng trên 1 máy — đăng nhập ở đây sẽ đăng xuất máy khác. Quên mật khẩu: liên hệ admin.
