@@ -157,6 +157,28 @@ def _ffmpeg_item() -> dict:
     return _item("ffmpeg", label, "ok", "Sẵn sàng", tech=tech)
 
 
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+
+
+def _vcrt_item() -> dict:
+    """onnxruntime (OCR, giọng đọc trên máy) cần Visual C++ Runtime >= 14.40 —
+    bản cũ làm app crash (access violation). App tự kèm bản mới (app/vcrt.py);
+    mục này báo khi cả bản đi kèm cũng không dùng được."""
+    from . import vcrt
+
+    st = vcrt.status()
+    label = "Thư viện Microsoft Visual C++"
+    tech = f"System32 msvcp140 {st['system'] or 'không có'} · đi kèm {st['bundled'] or 'không có'}" + (
+        " · đã nạp bản đi kèm" if st["preloaded"] else "") + (f" · {st['error']}" if st["error"] else "")
+    if st["system_ok"]:
+        return _item("vcrt", label, "ok", "Sẵn sàng", tech=tech)
+    if st["preloaded"]:
+        return _item("vcrt", label, "ok", "Máy có bản cũ — app đã tự dùng bản mới đi kèm", tech=tech,
+                     hint=f"Muốn chắc chắn: cài bản mới của Microsoft ở {VCREDIST_URL}")
+    return _item("vcrt", label, "error", "Bản trên máy quá cũ — nhận diện bằng hình ảnh có thể làm app tự tắt",
+                 hint=f"Tải và cài: {VCREDIST_URL}, rồi mở lại app", tech=tech)
+
+
 def _douyin_items() -> list[dict]:
     # Đọc thẳng file đánh dấu (= douyin_browser.LOGIN_MARKER) — import douyin_browser
     # kéo theo playwright, trang này phải mở nhanh.
@@ -233,6 +255,7 @@ def run_checks() -> list[dict]:
                            f"Còn trống {m_free:.1f} / {m_total:.0f} GB ({models.drive})", tech=str(models)))
 
     items.append(_ffmpeg_item())
+    items.append(_vcrt_item())
 
     items.extend(_douyin_items())
 
