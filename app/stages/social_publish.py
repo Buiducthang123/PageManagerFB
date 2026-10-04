@@ -423,6 +423,9 @@ _CAPTION_SELECTORS = ['div[contenteditable="true"]', 'textarea[placeholder*="cap
 
 
 _UPLOAD_PROGRESS_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+# Đếm ngược thời gian còn lại của upload: "2 minutes left", "30 seconds left",
+# "1 hour left"... (mạng chậm hiện "minutes"/"hour", nhanh thì "seconds").
+_UPLOAD_COUNTDOWN_RE = re.compile(r"\d+\s*(hour|minute|min|second|sec)s?\s*left", re.IGNORECASE)
 
 
 def _wait_for_upload_processed(
@@ -481,23 +484,63 @@ def _wait_for_upload_processed(
         page.wait_for_timeout(1000)
 
 
-def _wait_for_upload_complete(page: Page, timeout_s: float = 180.0) -> None:
-    """Chờ thêm cho tới khi thanh tiến độ upload biến mất hẳn (không còn chữ
-    "seconds left"/"Uploading") trước khi bấm Publish — đã xác nhận thật gặp
-    hộp thoại "Sure you want to cancel your upload?" khi thao tác lúc video
-    còn đang tải dở (99%, "0 seconds left") — an toàn hơn là chờ thêm 1 nhịp
-    nữa trước khi bấm nút cuối cùng."""
+def _wait_for_upload_complete(
+    page: Page,
+    timeout_s: float = 180.0,
+    stall_timeout_s: float = 90.0,
+    max_timeout_s: float = 1800.0,
+) -> None:
+    """Chờ tới khi thanh tiến độ upload biến mất hẳn trước khi bấm Publish — đã
+    xác nhận thật gặp hộp thoại "Sure you want to cancel your upload?" khi thao
+    tác lúc video còn đang tải dở.
+
+    Trước đây chỉ chờ cố định 180s rồi BỎ QUA (chỉ cảnh báo) và bấm Publish
+    luôn — mạng chậm + file lớn (vd 203MB, ảnh thật "6.15%, 2 minutes left")
+    không kịp trong 180s, nên bấm Publish KHI FILE CÒN ĐANG TẢI DỞ → TikTok lỗi/
+    hỏi huỷ → `finally: context.close()` ở nơi gọi ĐÓNG TRÌNH DUYỆT = huỷ ngang
+    upload. Thêm nữa: chỉ dò chữ "seconds left" là HỤT khi mạng chậm hiện
+    "minutes left" (ảnh thật), khiến hàm tưởng đã tải xong và return sớm ở 6%.
+
+    Giờ dùng cùng chiến lược với `_wait_for_upload_processed`: còn thấy dấu hiệu
+    đang tải (uploading / "… left" / % < 100) thì tiếp tục chờ chừng nào tiến độ
+    còn NHÍCH LÊN (tới tối đa `max_timeout_s`); chỉ coi là treo thật khi % đứng
+    yên quá `stall_timeout_s`."""
     start = time.time()
-    while time.time() - start < timeout_s:
+    last_progress: float | None = None
+    last_progress_at = start
+    while True:
+        now = time.time()
         body_text = ""
         try:
             body_text = (page.locator("body").inner_text() or "").lower()
         except Exception:
             pass
-        if "seconds left" not in body_text and "uploading" not in body_text:
+        m = _UPLOAD_PROGRESS_RE.search(body_text)
+        progress = float(m.group(1)) if m else None
+        uploading = (
+            "uploading" in body_text
+            or _UPLOAD_COUNTDOWN_RE.search(body_text) is not None  # "x seconds/minutes left"
+            or (progress is not None and progress < 100)
+        )
+        if not uploading:
             return
+        if progress is not None and progress != last_progress:
+            last_progress = progress
+            last_progress_at = now
+        elapsed = now - start
+        stalled_for = now - last_progress_at
+        if elapsed >= max_timeout_s:
+            raise SocialPublishError(
+                f"Upload chưa xong sau {max_timeout_s:.0f}s chờ (mạng quá chậm) — chưa bấm Publish để khỏi huỷ upload dở"
+            )
+        # Quá ngưỡng mềm mà tiến độ đứng yên quá lâu (hoặc không đọc được %) → treo thật.
+        if elapsed >= timeout_s and (progress is None or stalled_for >= stall_timeout_s):
+            raise SocialPublishError(
+                f"Upload treo sau {elapsed:.0f}s chờ (tiến độ "
+                f"{'không đọc được' if progress is None else f'đứng yên ở {progress:.0f}%'}) — "
+                "mạng chậm hoặc TikTok đổi giao diện; chưa bấm Publish để khỏi huỷ upload dở"
+            )
         page.wait_for_timeout(1000)
-    logger.warning("social_publish: vẫn thấy dấu hiệu đang upload sau {}s chờ, vẫn tiếp tục thử bấm Publish", timeout_s)
 
 
 def _wait_for_content_check(page: Page, timeout_s: float = 90.0) -> None:
