@@ -106,7 +106,13 @@ function LoginScreen({ license }: { license: LicenseStatus }) {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-bg px-4 text-text">
+    // Cột: banner "Có bản mới" ở trên (chạy được KHI CHƯA đăng nhập — /api/update/*
+    // nằm trong OPEN_PREFIXES, không cần license), form đăng nhập ở giữa. Sửa vụ
+    // user cài bản cũ (bộ cài 1.0.x) bị kẹt: trước đây màn này không có đường tự
+    // cập nhật, mà bản cũ lại chưa có nút Đăng ký → không vào được.
+    <div className="flex min-h-screen flex-col bg-bg text-text">
+      <UpdateBanner />
+      <div className="flex flex-1 items-center justify-center px-4 py-8">
       <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-lg border border-divider bg-surface p-6">
         <div className="flex items-center gap-3">
           <span className="block h-[18px] w-[18px] rounded border border-accent" />
@@ -171,6 +177,7 @@ function LoginScreen({ license }: { license: LicenseStatus }) {
           video, nội dung dự án, mật khẩu hay API key.
         </p>
       </form>
+      </div>
     </div>
   )
 }
