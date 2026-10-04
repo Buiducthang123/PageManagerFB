@@ -105,7 +105,76 @@ export default function GuidePage() {
         </p>
       </Section>
 
-      <Section title="3. Làm 1 video (các bước trong dự án)" subtitle="Nếu không bật chế độ tự động, bạn bấm từng bước theo thứ tự.">
+      <Section
+        title="3. Kiểm tra hệ thống ⭐ (làm TRƯỚC khi chạy video)"
+        subtitle="Mục này cho biết máy đã đủ điều kiện chạy chưa — mở trang Kiểm tra hệ thống trong menu."
+      >
+        <p className="text-sm text-neutral-400">Mỗi dòng có một dấu trạng thái:</p>
+        <ul className="space-y-1.5 text-sm text-neutral-400">
+          <li><span className="font-medium text-green-400">✓ xanh</span> = ổn.</li>
+          <li><span className="font-medium text-amber-400">! vàng</span> = cảnh báo (vẫn chạy được, nên để ý).</li>
+          <li><span className="font-medium text-danger">✗ đỏ</span> = thiếu/lỗi, <b>phải sửa</b> thì chức năng liên quan mới chạy.</li>
+        </ul>
+        <p className="text-sm font-medium text-neutral-200">Các mục quan trọng nên là ✓:</p>
+        <ul className="space-y-1.5 text-sm text-neutral-400">
+          <li>
+            <b className="text-neutral-200">Dữ liệu AI</b> — ở khung <Ui>Dữ liệu AI</Ui> cuối trang, bấm tải trước (vài GB,
+            chỉ 1 lần). Chưa tải thì lần chạy video đầu sẽ tự tải nên rất lâu.
+          </li>
+          <li>
+            <b className="text-neutral-200">Gemini API key</b> — chưa nhập thì <b>bước Dịch không chạy</b>. Nhập ở trang Cài đặt (mục 4).
+          </li>
+          <li>
+            <b className="text-neutral-200">Thư mục draft CapCut</b> — cần nếu muốn <Ui>Dựng CapCut</Ui>. Chỉ xuất video trực tiếp thì không bắt buộc.
+          </li>
+          <li><b className="text-neutral-200">Card đồ hoạ · ffmpeg · Visual C++</b> — nền tảng xử lý video, nên ✓.</li>
+        </ul>
+        <p className="text-sm text-neutral-400">
+          Nút trên trang: <Ui>Kiểm tra lại</Ui> (quét lại), <Ui>Xem log</Ui>, và <Ui>Tải chẩn đoán</Ui> (tải 1 file zip
+          log — đã che key/mật khẩu — để gửi admin khi gặp lỗi).
+        </p>
+        <p className="rounded-md border border-divider bg-neutral-900/40 p-3 text-xs text-neutral-400">
+          Mẹo: thấy dòng ✗ đỏ thì đọc dòng gợi ý nhỏ ngay bên dưới để biết cách sửa. Không tự sửa được thì bấm{' '}
+          <Ui>Tải chẩn đoán</Ui> gửi admin.
+        </p>
+      </Section>
+
+      <Section
+        title="4. Cài đặt ⭐ (thiết lập 1 lần)"
+        subtitle="Mở trang Cài đặt trong menu, thiết lập các thứ app cần rồi bấm Lưu."
+      >
+        <ul className="space-y-2 text-sm text-neutral-400">
+          <li>
+            <b className="text-neutral-200">Gemini API key</b> — <b>bắt buộc cho bước Dịch</b>. Lấy miễn phí tại{' '}
+            <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-accent-300 underline-offset-2 hover:underline">
+              aistudio.google.com/apikey
+            </a>
+            , dán vào, bấm <Ui>Thử key</Ui> để chắc key dùng được.
+          </li>
+          <li>
+            <b className="text-neutral-200">Thư mục draft CapCut</b> — bấm dò tự động hoặc dán đường dẫn. Cần nếu bạn muốn dựng draft CapCut.
+          </li>
+          <li>
+            <b className="text-neutral-200">Độ chính xác nhận diện giọng nói</b> — cao hơn thì chính xác hơn nhưng chậm hơn.
+          </li>
+          <li>
+            <b className="text-neutral-200">Thiết bị AI</b> — để <Ui>Tự động</Ui> (khuyên dùng). Máy không có card NVIDIA thì chọn
+            “Không dùng card đồ hoạ”. <b>Đổi xong phải khởi động lại app</b> mới có tác dụng.
+          </li>
+          <li>
+            <b className="text-neutral-200">Giọng đọc & tốc độ dịch/đọc</b> — chọn giọng mặc định; cân bằng giữa “dịch đủ
+            nghĩa” và “đọc tự nhiên” cho video thoại dồn dập.
+          </li>
+          <li>
+            <b className="text-neutral-200">Thư mục dữ liệu AI / thư mục tạm</b> — đặt ở ổ còn nhiều chỗ (dữ liệu AI nặng vài GB).
+          </li>
+        </ul>
+        <p className="rounded-md border border-divider bg-neutral-900/40 p-3 text-xs text-neutral-400">
+          Nhớ bấm <Ui>Lưu</Ui> sau khi chỉnh. Thiết lập chỉ cần làm 1 lần, app nhớ cho các lần sau.
+        </p>
+      </Section>
+
+      <Section title="5. Làm 1 video (các bước trong dự án)" subtitle="Nếu không bật chế độ tự động, bạn bấm từng bước theo thứ tự.">
         <div className="space-y-4">
           <Step n={1} title="Tạo dự án">
             <p>
@@ -140,7 +209,7 @@ export default function GuidePage() {
         </div>
       </Section>
 
-      <Section title="4. Video quá dài? Chia thành nhiều đoạn" subtitle="CapCut có thể không load nổi video quá dài.">
+      <Section title="6. Video quá dài? Chia thành nhiều đoạn" subtitle="CapCut có thể không load nổi video quá dài.">
         <p className="text-sm text-neutral-400">
           Trong dự án có mục <Ui>Chia video thành nhiều đoạn</Ui>: cắt video dài thành nhiều đoạn nhỏ. Khi bật tự động,
           mỗi đoạn tự chạy hết và <b>tự xuất video riêng</b> (chạy lần lượt, đoạn sau bắt đầu khi đoạn trước xong). Mỗi
@@ -148,7 +217,7 @@ export default function GuidePage() {
         </p>
       </Section>
 
-      <Section title="5. Đăng lên TikTok / Facebook" subtitle="Nếu tài khoản của bạn được cấp quyền đăng.">
+      <Section title="7. Đăng lên TikTok / Facebook" subtitle="Nếu tài khoản của bạn được cấp quyền đăng.">
         <div className="space-y-4">
           <Step n={1} title="Kết nối tài khoản">
             <p>
@@ -162,7 +231,7 @@ export default function GuidePage() {
         </div>
       </Section>
 
-      <Section title="6. Các trang khác trong menu">
+      <Section title="8. Các trang khác trong menu">
         <ul className="space-y-2 text-sm text-neutral-400">
           <li><b className="text-neutral-200">Dự án tự động</b> — tự tìm video theo kênh/nguồn rồi xử lý và đăng, chạy nền không cần ngồi canh.</li>
           <li><b className="text-neutral-200">Làm sạch video</b> — xoá chữ/phụ đề cứng in sẵn trên video gốc.</li>
@@ -170,12 +239,11 @@ export default function GuidePage() {
           <li><b className="text-neutral-200">Tải video</b> — tải video từ link về máy.</li>
           <li><b className="text-neutral-200">Giám sát tiến trình</b> — xem các việc đang chạy.</li>
           <li><b className="text-neutral-200">Tự dọn ổ đĩa</b> — xoá file tạm cũ cho nhẹ máy.</li>
-          <li><b className="text-neutral-200">Cài đặt</b> — chọn giọng đọc, cách nhận diện, thư mục CapCut, API…</li>
-          <li><b className="text-neutral-200">Kiểm tra hệ thống</b> — xem máy đã đủ điều kiện chạy chưa (GPU, ffmpeg, dữ liệu AI…).</li>
         </ul>
+        <p className="text-xs text-neutral-500">(Cài đặt và Kiểm tra hệ thống đã có hướng dẫn riêng ở mục 3 và 4 phía trên.)</p>
       </Section>
 
-      <Section title="7. Gặp trục trặc?">
+      <Section title="9. Gặp trục trặc?">
         <ul className="space-y-2 text-sm text-neutral-400">
           <li>
             <b className="text-neutral-200">Thấy “Có bản mới”</b> → bấm <Ui>Cập nhật</Ui> rồi <Ui>Khởi động lại</Ui>. Luôn
