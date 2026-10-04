@@ -41,6 +41,12 @@ class Episode(BaseModel):
     stages: dict[str, StageRecord] = Field(
         default_factory=lambda: {name: StageRecord() for name in EPISODE_STAGE_ORDER}
     )
+    # "Xuất video trực tiếp" (ffmpeg, không qua CapCut) cho RIÊNG đoạn này —
+    # hành động PHỤ song song với "assemble"/CapCut, cố tình nằm NGOÀI `stages`/
+    # EPISODE_STAGE_ORDER giống `ProjectState.export` (nếu đưa vào stage order,
+    # `episode_current_stage()` sẽ coi đoạn đã xong CapCut nhưng chưa xuất trực
+    # tiếp là "chưa xong" — sai). Chỉ dùng cho dự án split.
+    export: StageRecord = Field(default_factory=StageRecord)
     created_at: datetime
 
 

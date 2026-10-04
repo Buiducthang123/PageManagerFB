@@ -16,7 +16,9 @@ export function useJobStatus(
     queryKey,
     queryFn: () =>
       episodeId
-        ? api.episodeJobStatus(projectId, episodeId, stage as EpisodeStageName)
+        ? stage === 'export'
+          ? api.episodeExportStatus(projectId, episodeId)
+          : api.episodeJobStatus(projectId, episodeId, stage as EpisodeStageName)
         : api.jobStatus(projectId, stage),
     refetchInterval: (q) => {
       const status = q.state.data?.status

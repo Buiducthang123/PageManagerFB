@@ -56,6 +56,8 @@ export interface Episode {
   video_relpath: string | null
   duration_sec: number | null
   stages: Record<EpisodeStageName, StageRecord>
+  // Xuất video trực tiếp (không qua CapCut) cho riêng đoạn này — chỉ dự án split.
+  export: StageRecord
   created_at: string
 }
 
@@ -900,6 +902,27 @@ export const api = {
     request<JobStatus>(`/api/projects/${id}/episodes/${episodeId}/jobs/${stage}`),
   cancelEpisodeJob: (id: string, episodeId: string, stage: EpisodeStageName) =>
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/jobs/${stage}/cancel`),
+  // Xuất video trực tiếp (không qua CapCut) cho RIÊNG 1 đoạn của dự án split.
+  startEpisodeExport: (
+    id: string,
+    episodeId: string,
+    audioMode: AudioMode,
+    minVideoSpeed: number,
+    originalAudioVolumeDb: number = DEFAULT_ORIGINAL_AUDIO_VOLUME_DB,
+  ) =>
+    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/export`, {
+      audio_mode: audioMode,
+      min_video_speed: minVideoSpeed,
+      original_audio_volume_db: originalAudioVolumeDb,
+    }),
+  episodeExportStatus: (id: string, episodeId: string) =>
+    request<JobStatus>(`/api/projects/${id}/episodes/${episodeId}/export/status`),
+  cancelEpisodeExport: (id: string, episodeId: string) =>
+    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/export/cancel`),
+  revealEpisodeExport: (id: string, episodeId: string) =>
+    postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/export/reveal`),
+  episodeExportVideoUrl: (id: string, episodeId: string) =>
+    `/api/projects/${id}/assets/episodes/${episodeId}/export/final.mp4`,
 
   // --- Ghép video (đứng riêng, không thuộc project nào) ---
   listMerges: () => request<MergeItem[]>('/api/merges'),

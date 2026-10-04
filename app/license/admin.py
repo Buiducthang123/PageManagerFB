@@ -82,8 +82,29 @@ def update_user(user_id: str, body: dict) -> None:
         patch["account_expires_at"] = raw or None
     if user_id == manager.current_user_id() and patch.get("enabled") is False:
         raise AdminError(400, "Không tự khoá tài khoản admin đang dùng")
+    # Khoá tài khoản (bỏ tick "Cho phép đăng nhập" / từ chối duyệt) phải có hiệu
+    # lực NGAY: (1) đặt account_expires_at=now() để verdict online chặn ở nhịp
+    # heartbeat kế (verdict ký offline chỉ mang ngày hết hạn, không mang cờ
+    # enabled); (2) xoá phiên server (force_logout) để user không refresh token/
+    # đăng nhập lại được. Lưu ý: máy đang OFFLINE sẵn vẫn còn cửa sổ offline-grace
+    # vì không nhận được thay đổi này — muốn chặt hơn thì hạ offline_grace_minutes.
+    disabling = patch.get("enabled") is False
+    if disabling:
+        patch["account_expires_at"] = datetime.now(timezone.utc).isoformat()
+    # Bật lại tài khoản: form gửi kèm account_expires_at hiện tại, có thể vẫn là
+    # marker khoá (ngày đã qua) → gỡ đi, nếu không user "được bật" mà online vẫn
+    # bị coi là account_expired. Hạn trong tương lai (admin cố ý đặt) thì giữ.
+    if patch.get("enabled") is True and patch.get("account_expires_at"):
+        try:
+            exp = datetime.fromisoformat(str(patch["account_expires_at"]).replace("Z", "+00:00"))
+            if exp <= datetime.now(timezone.utc):
+                patch["account_expires_at"] = None
+        except ValueError:
+            pass
     if patch:
         _call(manager.write, "PATCH", "profiles", {"id": f"eq.{user_id}"}, patch)
+    if disabling:
+        force_logout(user_id)  # xoá auth.sessions — chặn refresh/đăng nhập lại
     if "note" in body:
         # Dòng admin_notes đã có sẵn (trigger tạo cùng lúc với profile).
         _call(manager.write, "PATCH", "admin_notes", {"user_id": f"eq.{user_id}"},

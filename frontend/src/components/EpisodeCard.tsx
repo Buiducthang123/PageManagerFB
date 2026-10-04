@@ -66,12 +66,14 @@ export default function EpisodeCard({
   // khi job thật sự dừng, không chỉ trong lúc gửi request cancel.
   const [pendingCancel, setPendingCancel] = useState<Partial<Record<EpisodeStageName, boolean>>>({})
   const clearPendingCancel = (stage: EpisodeStageName) => setPendingCancel((prev) => ({ ...prev, [stage]: false }))
+  const [pendingCancelExport, setPendingCancelExport] = useState(false)
 
   const ingestJob = useJobStatus(projectId, 'ingest', episodeId, () => clearPendingCancel('ingest'))
   const transcribeJob = useJobStatus(projectId, 'transcribe', episodeId, () => clearPendingCancel('transcribe'))
   const translateJob = useJobStatus(projectId, 'translate', episodeId, () => clearPendingCancel('translate'))
   const ttsJob = useJobStatus(projectId, 'tts', episodeId, () => clearPendingCancel('tts'))
   const assembleJob = useJobStatus(projectId, 'assemble', episodeId, () => clearPendingCancel('assemble'))
+  const exportJob = useJobStatus(projectId, 'export', episodeId, () => setPendingCancelExport(false))
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['project', projectId] })
   const invalidateJob = (stage: EpisodeStageName) =>
@@ -127,6 +129,23 @@ export default function EpisodeCard({
     },
   })
 
+  const invalidateExportJob = () => queryClient.invalidateQueries({ queryKey: ['job', projectId, episodeId, 'export'] })
+  const exportMutation = useMutation({
+    mutationFn: () =>
+      api.startEpisodeExport(projectId, episodeId, audioMode ?? 'original', minVideoSpeed ?? 0.85, originalAudioVolumeDb ?? -13),
+    onSuccess: () => invalidateExportJob(),
+  })
+  const cancelExportMutation = useMutation({
+    mutationFn: () => api.cancelEpisodeExport(projectId, episodeId),
+    onSuccess: () => {
+      invalidateExportJob()
+      setPendingCancelExport(true)
+    },
+  })
+  const revealExportMutation = useMutation({
+    mutationFn: () => api.revealEpisodeExport(projectId, episodeId),
+  })
+
   const updateCueMutation = useMutation({
     mutationFn: ({ cueId, text }: { cueId: number; text: string }) => api.updateEpisodeCue(projectId, episodeId, cueId, text),
     onSuccess: () => {
@@ -151,7 +170,9 @@ export default function EpisodeCard({
   const busyGemini = translate.status === 'running' || translateJob.data?.status === 'running'
   const busyTTS = tts.status === 'running' || ttsJob.data?.status === 'running'
   const busyAssemble = assemble.status === 'running' || assembleJob.data?.status === 'running'
-  const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || (standaloneAssemble && busyAssemble)
+  const exportRec = episode.export
+  const busyExport = exportRec.status === 'running' || exportJob.data?.status === 'running'
+  const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || (standaloneAssemble && (busyAssemble || busyExport))
 
   return (
     <div className="card p-4">
@@ -383,6 +404,42 @@ export default function EpisodeCard({
             </div>
           )}
           {standaloneAssemble && assemble.error && <p className="text-sm text-danger">{assemble.error}</p>}
+
+          {standaloneAssemble && tts.status === 'done' && (
+            <div className="rounded-lg border border-neutral-800 p-3">
+              <p className="mb-2 text-xs font-medium text-neutral-400">Xuất video (không qua CapCut)</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <JobProgressBar job={exportJob.data} />
+                <button
+                  type="button"
+                  className={primaryButtonClass}
+                  disabled={busyAny || exportMutation.isPending}
+                  onClick={() => exportMutation.mutate()}
+                >
+                  {busyExport ? 'Đang xuất...' : exportRec.status === 'done' ? 'Xuất lại video' : 'Xuất video'}
+                </button>
+                {busyExport && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm text-danger"
+                    disabled={pendingCancelExport}
+                    onClick={() => cancelExportMutation.mutate()}
+                  >
+                    {pendingCancelExport ? 'Đang dừng...' : 'Dừng'}
+                  </button>
+                )}
+                {exportRec.status === 'done' && (
+                  <>
+                    <button type="button" className={secondaryButtonClass} disabled={busyAny} onClick={() => revealExportMutation.mutate()}>
+                      Mở thư mục
+                    </button>
+                    <span className="text-xs text-accent-300">Xong — final.mp4</span>
+                  </>
+                )}
+              </div>
+              {exportRec.error && <p className="mt-2 text-sm text-danger">{exportRec.error}</p>}
+            </div>
+          )}
 
           {detail.cues.length > 0 && (
             <div className="max-h-64 overflow-auto rounded-lg border border-neutral-800">

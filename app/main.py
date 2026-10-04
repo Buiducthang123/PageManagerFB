@@ -1503,6 +1503,261 @@ def _start_episode_assemble(
     return jobs.start_job(_episode_job_key(project_id, episode_id, "assemble"), 1, target)
 
 
+def _mark_episode_export_cancelled(project_id: str, episode_id: str, job: jobs.JobState) -> None:
+    """Như `_mark_export_cancelled` nhưng ghi vào `episode.export` (nằm ngoài
+    `stages` dict) cho dự án split."""
+    job.status = "cancelled"
+    for it in job.items:
+        if it.status == "running":
+            it.status = "failed"
+            it.error = "Đã dừng"
+    with pj.locked_project(project_id) as s:
+        ep = pj.find_episode(s, episode_id)
+        ep.export.status = StageStatus.failed
+        ep.export.error = "Đã dừng theo yêu cầu người dùng"
+    pj.append_log(project_id, "export", f"[{episode_id}] Đã dừng theo yêu cầu người dùng")
+
+
+def _start_episode_export(
+    project_id: str,
+    episode_id: str,
+    audio_mode: str,
+    min_video_speed: float,
+    original_audio_volume_db: float = -13.0,
+    subtitle_font_size: int = 6,
+) -> jobs.JobState | None:
+    """Xuất video trực tiếp (ffmpeg, KHÔNG qua CapCut) cho RIÊNG 1 đoạn của dự án
+    split. Tái dùng thẳng engine `export_direct_stage.render_video` trên artifact
+    cấp episode (video/manifest/sub_vi.srt trong episode_dir) — KHÔNG đụng vào
+    `_start_export` (cấp project) để tránh regression luồng đơn đang chạy tốt.
+    Vùng che phụ đề cũ: episode chưa lưu riêng nên luôn tự dò (dùng auto_ocr_crop
+    của project làm vùng tìm). Nhạc nền/logo: dùng chung file cấp project nếu có."""
+    state = pj.load_project(project_id)
+    episode = pj.find_episode(state, episode_id)
+    if not episode.video_relpath:
+        return None
+    root = pj.episode_dir(project_id, episode_id)
+    mute_original_audio = audio_mode == "mute"
+    bg_filename = "background.wav" if audio_mode == "separated" else "background_original.wav"
+
+    def target(job: jobs.JobState) -> None:
+        bg_label = (
+            "Tắt âm thanh gốc" if mute_original_audio
+            else "Tách nhạc nền" if audio_mode == "separated"
+            else "Trích audio gốc (giữ nguyên)"
+        )
+        job.items = [jobs.JobItem(id="background", label=bg_label), jobs.JobItem(id="render", label="Dựng video")]
+        job.current_label = job.items[0].label
+        with pj.locked_project(project_id) as s:
+            ep = pj.find_episode(s, episode_id)
+            ep.export.status = StageStatus.running
+            ep.export.error = None
+
+        video_path = root / episode.video_relpath
+        bg_path: Path | None = root / bg_filename
+
+        def on_bg_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
+            job.current_label = label
+
+        if mute_original_audio:
+            bg_path = None
+        elif not bg_path.exists():
+            job.items[0].status = "running"
+            try:
+                if audio_mode == "separated":
+                    dub_audio_stage.extract_background(video_path, bg_path, on_progress=on_bg_progress, job=job)
+                else:
+                    dub_audio_stage.extract_original_audio(video_path, bg_path, on_progress=on_bg_progress)
+            except jobs.JobCancelled:
+                _mark_episode_export_cancelled(project_id, episode_id, job)
+                return
+            except dub_audio_stage.DubAudioError as err:
+                job.items[0].status = "failed"
+                job.status = "failed"
+                job.error = str(err)
+                with pj.locked_project(project_id) as s:
+                    ep = pj.find_episode(s, episode_id)
+                    ep.export.status = StageStatus.failed
+                    ep.export.error = str(err)
+                pj.append_log(project_id, "export", f"[{episode_id}] {err}")
+                return
+        job.items[0].status = "done"
+
+        job.items[1].status = "running"
+        job.current_label = "Dựng video"
+
+        def on_render_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
+            job.done_count = done
+            job.total = max(tot, 1)
+            job.current_label = label
+
+        # Episode chưa lưu vùng che riêng → luôn tự dò (vùng tìm lấy từ project).
+        job.current_label = "Tự dò vùng phụ đề cũ"
+        search_region = tuple(state.auto_ocr_crop_region) if state.auto_ocr_crop_region else None
+
+        def on_ocr_progress(done: int, tot: int, label: str) -> None:
+            job.raise_if_cancelled()
+            job.done_count = done
+            job.total = max(tot, 1)
+            job.current_label = label
+
+        try:
+            blur_region, ranges = _detect_blur_region_and_ranges(
+                video_path, search_region=search_region, on_progress=on_ocr_progress
+            )
+        except jobs.JobCancelled:
+            _mark_episode_export_cancelled(project_id, episode_id, job)
+            return
+        blur_active_ranges_s = ranges or None
+
+        music_path = _export_asset_path(project_id, "music")  # dùng chung cho mọi đoạn
+        logo_path = _export_asset_path(project_id, "logo")
+        output_path = root / "export" / "final.mp4"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        background_volume_db = original_audio_volume_db if audio_mode == "original" else None
+        render_music_db = state.auto_music_volume_db
+
+        try:
+            manifest_path = root / "audio" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
+            vi_cues = load_srt(root / "sub_vi.srt")
+            export_direct_stage.render_video(
+                video_path=video_path,
+                background_path=bg_path,
+                manifest=manifest,
+                vi_cues=vi_cues,
+                audio_dir=root / "audio",
+                output_path=output_path,
+                blur_region=blur_region,
+                blur_active_ranges_s=blur_active_ranges_s,
+                music_path=music_path,
+                logo_path=logo_path,
+                min_video_speed=min_video_speed,
+                background_volume_db=background_volume_db,
+                music_volume_db=render_music_db,
+                subtitle_font_size=subtitle_font_size,
+                blur_strength=state.auto_blur_strength,
+                cover_image_path=None,
+                cover_end_s=None,
+                on_progress=on_render_progress,
+                job=job,
+            )
+        except jobs.JobCancelled:
+            _mark_episode_export_cancelled(project_id, episode_id, job)
+            return
+        except export_direct_stage.ExportDirectError as err:
+            job.items[1].status = "failed"
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                ep = pj.find_episode(s, episode_id)
+                ep.export.status = StageStatus.failed
+                ep.export.error = str(err)
+            pj.append_log(project_id, "export", f"[{episode_id}] {err}")
+            return
+        except Exception as err:
+            logger.exception("Xuất video trực tiếp (split) lỗi {} / {}", project_id, episode_id)
+            job.items[1].status = "failed"
+            job.items[1].error = str(err)
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                ep = pj.find_episode(s, episode_id)
+                ep.export.status = StageStatus.failed
+                ep.export.error = str(err)
+            pj.append_log(project_id, "export", f"[{episode_id}] Lỗi: {err}")
+            return
+
+        job.items[1].status = "done"
+        job.status = "done"
+        with pj.locked_project(project_id) as s:
+            ep = pj.find_episode(s, episode_id)
+            ep.export.status = StageStatus.done
+            ep.export.output = str(output_path)
+            _record_usage(project_id, "completed")
+            ep.export.progress = "final.mp4"
+            ep.export.error = None
+            ep.export.at = datetime.now()
+            s.auto_audio_mode = audio_mode
+            s.auto_min_video_speed = min_video_speed
+            s.auto_original_audio_volume_db = original_audio_volume_db
+            s.auto_subtitle_font_size = subtitle_font_size
+        pj.append_log(project_id, "export", f"[{episode_id}] video → {output_path}")
+
+    return jobs.start_job(_episode_job_key(project_id, episode_id, "export"), 1, target)
+
+
+@app.post("/api/projects/{project_id}/episodes/{episode_id}/export", status_code=202)
+def start_episode_export_route(project_id: str, episode_id: str, body: StartExportRequest | None = None):
+    state = pj.load_project(project_id)
+    if not state.split_mode:
+        raise HTTPException(status_code=409, detail="Xuất video theo đoạn chỉ dùng cho dự án chia đoạn")
+    episode = _get_episode_or_404(state, episode_id)
+    _require_episode_done(episode, "tts", "Chưa có audio TTS cho đoạn này — chạy TTS trước")
+    if not episode.video_relpath:
+        raise HTTPException(status_code=409, detail="Chưa có file video")
+    if _episode_busy(project_id, episode_id) or jobs.is_job_running(_episode_job_key(project_id, episode_id, "export")):
+        raise HTTPException(status_code=409, detail="Đang có job chạy cho đoạn này — đợi xong đã")
+    job = _start_episode_export(
+        project_id,
+        episode_id,
+        audio_mode=(body.audio_mode if body else state.auto_audio_mode),
+        min_video_speed=(body.min_video_speed if body else state.auto_min_video_speed),
+        original_audio_volume_db=(body.original_audio_volume_db if body else state.auto_original_audio_volume_db),
+        subtitle_font_size=(body.subtitle_font_size if body and body.subtitle_font_size else state.auto_subtitle_font_size),
+    )
+    if job is None:
+        raise HTTPException(status_code=409, detail="Không xuất được — thiếu file video")
+    return {"status": "started"}
+
+
+@app.get("/api/projects/{project_id}/episodes/{episode_id}/export/status", response_model=JobStatusResponse)
+def episode_export_status(project_id: str, episode_id: str):
+    key = _episode_job_key(project_id, episode_id, "export")
+    job = jobs.get_job(key)
+    if job is None:
+        state = pj.load_project(project_id)
+        episode = _get_episode_or_404(state, episode_id)
+        orphaned = episode.export.status == StageStatus.running
+        if orphaned:
+            with pj.locked_project(project_id) as s:
+                ep = pj.find_episode(s, episode_id)
+                if ep.export.status == StageStatus.running:
+                    ep.export.status = StageStatus.failed
+                    ep.export.error = "Phiên trước bị gián đoạn (server restart) — bấm chạy lại."
+            pj.append_log(project_id, "export", f"[{episode_id}] Phiên trước bị gián đoạn (server restart)")
+        return JobStatusResponse(registered=False, orphaned=orphaned)
+    return JobStatusResponse(
+        registered=True,
+        status=job.status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[JobItemResponse(id=it.id, label=it.label, status=it.status, error=it.error) for it in job.items],
+        error=job.error,
+        started_at=job.started_at,
+    )
+
+
+@app.post("/api/projects/{project_id}/episodes/{episode_id}/export/cancel")
+def cancel_episode_export_route(project_id: str, episode_id: str):
+    ok = jobs.request_cancel(_episode_job_key(project_id, episode_id, "export"))
+    if not ok:
+        raise HTTPException(status_code=409, detail="Không có job xuất nào đang chạy cho đoạn này")
+    return {"status": "cancelling"}
+
+
+@app.post("/api/projects/{project_id}/episodes/{episode_id}/export/reveal")
+def reveal_episode_export_route(project_id: str, episode_id: str):
+    video_path = pj.episode_dir(project_id, episode_id) / "export" / "final.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Chưa xuất video hoặc file không tồn tại trên đĩa")
+    _reveal_in_explorer(video_path)
+    return {"status": "ok"}
+
+
 @app.post("/api/projects/{project_id}/episodes/{episode_id}/assemble", status_code=202)
 def start_episode_assemble_route(project_id: str, episode_id: str, body: StartAssembleRequest | None = None):
     state = pj.load_project(project_id)
