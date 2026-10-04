@@ -41,14 +41,12 @@ def _suppress_subprocess_windows() -> None:
 
     class _NoWindowPopen(_OrigPopen):  # type: ignore[misc, valid-type]
         def __init__(self, *args, **kwargs):
-            # OR thêm cờ ẩn cửa sổ, giữ nguyên cờ caller đã truyền (vd.
-            # CREATE_NEW_PROCESS_GROUP dùng cho hủy tiến trình).
+            # CHỈ OR thêm CREATE_NO_WINDOW (giữ nguyên cờ caller đã truyền, vd.
+            # CREATE_NEW_PROCESS_GROUP dùng cho hủy tiến trình). Cờ này ẩn console
+            # của app console (ffmpeg/ffprobe/yt-dlp) nhưng BỊ BỎ QUA với app GUI
+            # -> KHÔNG được set startupinfo SW_HIDE ở đây, vì nó sẽ ẩn luôn cửa sổ
+            # explorer.exe (nút "Mở thư mục") và các app GUI khác.
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
-            if kwargs.get("startupinfo") is None:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = subprocess.SW_HIDE
-                kwargs["startupinfo"] = si
             super().__init__(*args, **kwargs)
 
     _NoWindowPopen._no_window_patched = True

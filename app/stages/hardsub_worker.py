@@ -51,12 +51,9 @@ def _suppress_subprocess_windows() -> None:
 
     class _NoWindowPopen(_OrigPopen):  # type: ignore[misc, valid-type]
         def __init__(self, *args, **kwargs):
+            # Chỉ OR CREATE_NO_WINDOW (xem giải thích ở app/config.py): KHÔNG set
+            # startupinfo SW_HIDE để không ẩn nhầm cửa sổ app GUI.
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
-            if kwargs.get("startupinfo") is None:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = subprocess.SW_HIDE
-                kwargs["startupinfo"] = si
             super().__init__(*args, **kwargs)
 
     _NoWindowPopen._no_window_patched = True
