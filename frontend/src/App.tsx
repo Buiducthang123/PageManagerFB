@@ -4,6 +4,7 @@ import ConnectionLostOverlay from './components/ConnectionLostOverlay'
 import LicenseGate from './components/LicenseGate'
 import ProjectList from './pages/ProjectList'
 import ProjectDetail from './pages/ProjectDetail'
+import GuidePage from './pages/GuidePage'
 import MergePage from './pages/MergePage'
 import CleanVideoPage from './pages/CleanVideoPage'
 import DownloadPage from './pages/DownloadPage'
@@ -27,6 +28,7 @@ export default function App() {
       <main className="min-w-0 flex-1 px-5 py-6 md:px-10 md:py-8">
         <Routes>
           <Route path="/" element={<ProjectList />} />
+          <Route path="/guide" element={<GuidePage />} />
           <Route path="/projects/:projectId" element={<ProjectDetail />} />
           <Route path="/merge" element={<MergePage />} />
           <Route path="/clean-video" element={<CleanVideoPage />} />

@@ -12,6 +12,16 @@ function navClass({ isActive }: { isActive: boolean }): string {
   ].join(' ')
 }
 
+function GuideIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
+      <path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H16v12.5H5.5A1.5 1.5 0 0 0 4 17z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+      <path d="M4 17a1.5 1.5 0 0 1 1.5-1.5H16" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M7 7h6M7 9.8h4.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function ProjectsIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0" aria-hidden>
@@ -135,6 +145,7 @@ type NavItem = { to: string; end: boolean; label: string; icon: ReactNode; featu
 
 const NAV_ITEMS: NavItem[] = [
   { to: '/', end: true, label: 'Dự án', icon: <ProjectsIcon />, features: ['projects'] },
+  { to: '/guide', end: false, label: 'Hướng dẫn sử dụng', icon: <GuideIcon />, features: [] },
   { to: '/merge', end: false, label: 'Ghép video', icon: <MergeIcon />, features: ['merge'] },
   { to: '/clean-video', end: false, label: 'Làm sạch video', icon: <CleanVideoIcon />, features: ['clean_video'] },
   { to: '/download', end: false, label: 'Tải video', icon: <DownloadIcon />, features: ['download'] },
