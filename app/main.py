@@ -232,27 +232,17 @@ def _maybe_chain(project_id: str, finished_stage: str) -> None:
     elif finished_stage == "translate":
         _start_tts(project_id, state.auto_voice, engine=state.auto_tts_engine)
     elif finished_stage == "tts":
-        if state.social_link is not None:
-            # Project do "Dự án tự động" sinh ra — bỏ hẳn bước ráp draft
-            # CapCut (không ai ngồi mở/duyệt draft đó cả) — xuất trực tiếp
-            # bằng ffmpeg (`export_direct.py`) chỉ cần audio/manifest.json +
-            # sub_vi.srt, HOÀN TOÀN không phụ thuộc draft CapCut, nên bỏ qua
-            # bước này không mất dữ liệu gì, chỉ đỡ tốn thời gian dựng draft
-            # vô ích. Project tạo TAY vẫn dừng ở assemble như cũ (dưới đây).
-            _start_export(
-                project_id,
-                audio_mode=state.auto_audio_mode,
-                min_video_speed=state.auto_min_video_speed,
-                original_audio_volume_db=state.auto_original_audio_volume_db,
-                subtitle_font_size=state.auto_subtitle_font_size,
-            )
-        else:
-            _start_assemble(
-                project_id,
-                audio_mode=state.auto_audio_mode,
-                min_video_speed=state.auto_min_video_speed,
-                original_audio_volume_db=state.auto_original_audio_volume_db,
-            )
+        # Auto-pipeline kết thúc bằng XUẤT TRỰC TIẾP (ffmpeg, không qua CapCut)
+        # cho MỌI dự án đơn — cả dự án tự động (social) lẫn dự án tạo tay. Xuất
+        # trực tiếp chỉ cần audio/manifest.json + sub_vi.srt, không phụ thuộc
+        # draft CapCut. Ai muốn draft CapCut thì bấm tay nút "Dựng CapCut".
+        _start_export(
+            project_id,
+            audio_mode=state.auto_audio_mode,
+            min_video_speed=state.auto_min_video_speed,
+            original_audio_volume_db=state.auto_original_audio_volume_db,
+            subtitle_font_size=state.auto_subtitle_font_size,
+        )
 
 
 def _maybe_chain_social(project_id: str, finished_stage: str) -> None:
@@ -414,14 +404,16 @@ def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) 
         _start_episode_tts(project_id, episode_id, state.auto_voice, engine=state.auto_tts_engine)
     elif finished_stage == "tts":
         if state.split_mode:
-            # Dự án "split": mỗi đoạn tự ráp draft RIÊNG ngay khi xong TTS,
-            # không chờ đoạn khác (khác hẳn "multi" ráp chung 1 draft).
-            _start_episode_assemble(
+            # Dự án "split": mỗi đoạn tự XUẤT TRỰC TIẾP (không qua CapCut) ngay
+            # khi xong TTS, không chờ đoạn khác (khác hẳn "multi" ráp chung 1
+            # draft). Muốn draft CapCut từng đoạn thì bấm tay nút "Dựng CapCut".
+            _start_episode_export(
                 project_id,
                 episode_id,
                 audio_mode=state.auto_audio_mode,
                 min_video_speed=state.auto_min_video_speed,
                 original_audio_volume_db=state.auto_original_audio_volume_db,
+                subtitle_font_size=state.auto_subtitle_font_size,
             )
         elif pj.all_episodes_stage_done(state, "tts"):
             _start_assemble(
@@ -430,9 +422,10 @@ def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) 
                 min_video_speed=state.auto_min_video_speed,
                 original_audio_volume_db=state.auto_original_audio_volume_db,
             )
-    elif finished_stage == "assemble" and state.split_mode:
-        # Đoạn này ráp draft xong — chỉ giờ mới bắt đầu đoạn KẾ TIẾP (tuần tự,
-        # không chạy song song như các tập của dự án "multi").
+    elif finished_stage in ("export", "assemble") and state.split_mode:
+        # Đoạn này xuất video xong (auto-pipeline) — hoặc ráp draft xong (nếu
+        # bấm tay) — chỉ giờ mới bắt đầu đoạn KẾ TIẾP (tuần tự, không chạy song
+        # song như các tập của dự án "multi").
         #
         # Chỉ tự chạy tập kế tiếp nếu nó THẬT SỰ chưa từng đụng tới
         # (transcribe còn "pending") — nếu không, chạy lại 1 tập bất kỳ ở
@@ -1685,6 +1678,8 @@ def _start_episode_export(
             s.auto_original_audio_volume_db = original_audio_volume_db
             s.auto_subtitle_font_size = subtitle_font_size
         pj.append_log(project_id, "export", f"[{episode_id}] video → {output_path}")
+        # Auto-pipeline split: xuất xong đoạn này mới sang đoạn kế (tuần tự).
+        _maybe_chain_episode(project_id, episode_id, "export")
 
     return jobs.start_job(_episode_job_key(project_id, episode_id, "export"), 1, target)
 

@@ -418,12 +418,12 @@ export default function ProjectDetail() {
           </label>
           <p className="mt-1 text-xs text-neutral-400">
             Bật thì sau khi có video gốc (upload/tải link), hệ thống tự chạy tiếp lần lượt {labels.stage.transcribe} →{' '}
-            {labels.stage.translate} → {labels.stage.tts} → {labels.stage.assemble} cho tới hết, dùng cách nhận diện/giọng
-            đang chọn bên dưới ({engineLabels[engine]}
+            {labels.stage.translate} → {labels.stage.tts} → xuất video (không qua CapCut) cho tới khi ra file final.mp4,
+            dùng cách nhận diện/giọng đang chọn bên dưới ({engineLabels[engine]}
             {' · '}
             {labels.tts[ttsEngine]}
             {selectedVoice ? ` · ${voiceOptions.find((v) => v.id === selectedVoice)?.label ?? selectedVoice}` : ''}).
-            Dừng lại ở draft CapCut — review + export vẫn phải làm tay.
+            Giữ nguyên âm thanh gốc (-13dB). Muốn draft CapCut thì bấm tay nút “Dựng CapCut”.
           </p>
         </div>
       </section>
@@ -793,8 +793,8 @@ export default function ProjectDetail() {
           <h2 className="text-lg">Chia video thành nhiều đoạn (tùy chọn)</h2>
           <p className="text-sm text-neutral-400">
             Video dài ráp xong 1 draft CapCut duy nhất có thể quá nặng, CapCut không load nổi — chia thành nhiều đoạn,
-            mỗi đoạn chạy hết pipeline rồi ráp thành 1 draft CapCut RIÊNG (chạy tuần tự, đoạn sau chỉ bắt đầu khi đoạn
-            trước ráp draft xong).
+            mỗi đoạn chạy hết pipeline rồi tự xuất video RIÊNG (không qua CapCut) khi bật “Tự động chạy hết pipeline”,
+            chạy tuần tự (đoạn sau chỉ bắt đầu khi đoạn trước xuất xong). Vẫn bấm tay “Dựng CapCut” từng đoạn nếu muốn.
           </p>
           <label className="block text-sm text-neutral-300">
             Chia thành mấy đoạn
