@@ -342,7 +342,7 @@ def _detect_subtitle_region_uncached(
                 # Quy đổi từ toạ độ TRONG VÙNG QUÉT (đã crop bởi ffmpeg) sang
                 # toạ độ FULL-FRAME thật — mọi nơi khác trong hàm (và giá trị
                 # trả về) đều tính theo full-frame.
-                boxes.append((sx + bx0 * sw, sx + bx1 * sw, sy + by0 * sh, sy + by1 * sh, text))
+                boxes.append((sx + bx0 * sw, sx + bx1 * sw, sy + by0 * sh, sy + by1 * sh, text, float(score) if score is not None else 1.0))
 
     if not boxes:
         return None
@@ -355,7 +355,7 @@ def _detect_subtitle_region_uncached(
     # cụm y-center (histogram 20 bin) thay vì hợp mù quáng mọi box.
     _NUM_BINS = 20
     bin_counts = [0] * _NUM_BINS
-    for bx0, bx1, by0, by1, text in boxes:
+    for bx0, bx1, by0, by1, text, _score in boxes:
         yc = (by0 + by1) / 2
         bin_idx = min(_NUM_BINS - 1, int(yc * _NUM_BINS))
         bin_counts[bin_idx] += 1
@@ -474,6 +474,26 @@ def _detect_subtitle_region_uncached(
     # hình; box phình bất thường không kéo giãn được nữa.
     # Đệm nhỏ 8% chiều cao chữ mỗi phía — đủ phủ viền/quầng mà không "quá rộng"
     # như đệm 15% cũ (mép mềm export_direct.BLUR_FEATHER_RATIO phủ nốt phần lệch).
+    # TÁCH phụ đề khỏi CHỮ TRONG CẢNH (chữ Hán in trong khung: trang sách, biển
+    # hiệu, bìa sản phẩm...). Đã gặp thật (video con thú đặt trên quyển sách):
+    # OCR đọc nguyên đoạn văn in trên sách (5-6 dòng, điểm 0.8-0.94) nằm NGAY
+    # DƯỚI phụ đề, tâm-x xấp xỉ giữa nên bộ lọc std-x không cắt sạch → kéo dải
+    # che xuống trùm cả chữ sách. Phụ đề hội thoại khác hẳn: luôn là dòng RÕ NÉT
+    # NHẤT (font chuẩn + viền → điểm OCR cao nhất) và CĂN GIỮA ỔN ĐỊNH. Neo vào
+    # box tin cậy CAO NHẤT rồi chỉ giữ các box sát nó theo CẢ y (cùng dòng) LẪN
+    # tâm-x (cùng căn lề) — loại các dòng đoạn văn khác dòng / tâm trôi.
+    anchor = max(matched, key=lambda b: b[5])
+    anchor_cy = (anchor[2] + anchor[3]) / 2
+    anchor_cx = (anchor[0] + anchor[1]) / 2
+    anchor_h = anchor[3] - anchor[2]
+    refined = [
+        b for b in matched
+        if abs((b[2] + b[3]) / 2 - anchor_cy) <= 0.7 * anchor_h
+        and abs((b[0] + b[1]) / 2 - anchor_cx) <= _OUTLIER_CENTER_DX
+    ]
+    if refined:
+        matched = refined
+
     _PAD_Y_TEXT_FRAC = 0.08
     heights = [b[3] - b[2] for b in matched]
     centers_y = [(b[2] + b[3]) / 2 for b in matched]
