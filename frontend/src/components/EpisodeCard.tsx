@@ -4,6 +4,7 @@ import { api, type AudioMode, type EpisodeDetail, type EpisodeStageName, type Tr
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from './StatusBadge'
 import JobProgressBar from './JobProgressBar'
+import { runDurationLabel } from './DirectExportPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
 import { USER_STAGE_LABELS, useLabels } from '../lib/labels'
 
@@ -433,7 +434,12 @@ export default function EpisodeCard({
                     <button type="button" className={secondaryButtonClass} disabled={busyAny} onClick={() => revealExportMutation.mutate()}>
                       Mở thư mục
                     </button>
-                    <span className="text-xs text-accent-300">Xong — final.mp4</span>
+                    <span className="text-xs text-accent-300">
+                      Xong — final.mp4
+                      {runDurationLabel(episode.stages.ingest?.at, exportRec.at) && (
+                        <span className="text-neutral-400"> · ⏱ {runDurationLabel(episode.stages.ingest?.at, exportRec.at)}</span>
+                      )}
+                    </span>
                   </>
                 )}
               </div>

@@ -10,6 +10,20 @@ const DEFAULT_MUSIC_VOLUME_DB = -13
 import { useLabels } from '../lib/labels'
 import { useJobStatus } from '../hooks/useJobStatus'
 
+// Thời gian "1 vòng" xử lý: từ lúc có video gốc (ingest xong) đến lúc xuất xong.
+// Dùng cho dự án chạy tự động (ingest → ... → export liền mạch) để user biết mỗi
+// video mất bao lâu. Trả null nếu thiếu mốc hoặc số vô lý (vd xuất lại sau nhiều
+// ngày, khi đó hiệu số tính cả thời gian để không — bỏ qua cho khỏi gây hiểu nhầm).
+export function runDurationLabel(ingestAt?: string | null, exportAt?: string | null): string | null {
+  if (!ingestAt || !exportAt) return null
+  const s = (new Date(exportAt).getTime() - new Date(ingestAt).getTime()) / 1000
+  if (!(s > 0) || s > 24 * 3600) return null
+  if (s < 60) return `${Math.round(s)} giây`
+  const m = Math.floor(s / 60)
+  const sec = Math.round(s % 60)
+  return sec === 0 ? `${m} phút` : `${m} phút ${sec} giây`
+}
+
 export default function DirectExportPanel({
   projectId,
   project,
@@ -308,6 +322,15 @@ export default function DirectExportPanel({
 
       {exportRecord.status === 'done' && (
         <div className="space-y-2">
+          {runDurationLabel(project.stages.ingest?.at, exportRecord.at) && (
+            <p className="text-xs text-neutral-400">
+              ⏱ Hoàn thành trong{' '}
+              <b className="text-accent-300">{runDurationLabel(project.stages.ingest?.at, exportRecord.at)}</b>{' '}
+              <span className="text-neutral-500" title="Tính từ khi có video gốc (tải/upload xong) đến khi xuất xong file final.mp4">
+                (từ lúc có video gốc đến khi xuất xong)
+              </span>
+            </p>
+          )}
           {/* Thêm mốc xuất xong vào URL: file luôn tên final.mp4, nếu URL không
               đổi thì trình duyệt giữ bản cũ trong cache — xuất lại xong vẫn
               xem video cũ tới khi tải lại trang. `key` ép thẻ video nạp lại. */}
