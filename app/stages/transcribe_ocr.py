@@ -274,7 +274,6 @@ def _detect_subtitle_region_uncached(
 
     engine = _load_region_engine()
     fps = config.OCR_DETECT_REGION_FPS
-    _PAD_FRAC = 0.015  # đệm thêm mỗi cạnh — box OCR đôi khi sát chữ hơi chặt
     # Ngưỡng chiều cao tối đa cho 1 box được tính vào vùng che — chặn 2 loại
     # không mong muốn: (1) box nhiễu méo mó chiếm gần hết khung (xem
     # _load_region_engine), (2) chữ cảm thán cỡ to kiểu hiệu ứng ("啊", "嘿"...)
@@ -465,13 +464,29 @@ def _detect_subtitle_region_uncached(
     # 0.718-0.774), cộng thêm đệm làm lõi dày gần gấp đôi dòng chữ; mép mềm
     # (export_direct.BLUR_FEATHER_RATIO) đã phủ phần lệch nhỏ còn lại. Người
     # dùng phản ánh vùng mờ "chiều cao lớn quá, muốn sát text".
-    _PAD_Y_TEXT_FRAC = 0.0
-    median_h = float(np.median([b[3] - b[2] for b in matched]))
-    pad_y = _PAD_Y_TEXT_FRAC * median_h
-    x0 = max(0.0, _percentile([b[0] for b in matched], 0.10) - _PAD_FRAC)
-    x1 = min(1.0, _percentile([b[1] for b in matched], 0.90) + _PAD_FRAC)
-    y0 = max(0.0, _percentile([b[2] for b in matched], 0.10) - pad_y)
-    y1 = min(1.0, _percentile([b[3] for b in matched], 0.90) + pad_y)
+    # CHIỀU CAO: canh theo DÒNG CHỮ TIÊU BIỂU (trung vị) thay vì phân vị 10-90%
+    # của mép trên/dưới MỌI box. Phụ đề chữ MÀU (vàng/cam, tương phản thấp + có
+    # quầng/viền trắng dày) làm bộ dò chữ RapidOCR trả box LỎNG, chiều cao dao
+    # động mạnh giữa các khung — lấy 10-90% thì chỉ vài box "phình" đã kéo dải
+    # che cao hơn hẳn dòng chữ thật (người dùng phản ánh "mờ quá rộng, không che
+    # sát"). Mọi dòng phụ đề nằm cùng 1 baseline nên canh giữa theo tâm-y trung
+    # vị + cao bằng chiều cao chữ trung vị là ÔM SÁT nhất mà vẫn phủ dòng điển
+    # hình; box phình bất thường không kéo giãn được nữa.
+    # Đệm nhỏ 8% chiều cao chữ mỗi phía — đủ phủ viền/quầng mà không "quá rộng"
+    # như đệm 15% cũ (mép mềm export_direct.BLUR_FEATHER_RATIO phủ nốt phần lệch).
+    _PAD_Y_TEXT_FRAC = 0.08
+    heights = [b[3] - b[2] for b in matched]
+    centers_y = [(b[2] + b[3]) / 2 for b in matched]
+    median_h = float(np.median(heights))
+    median_cy = float(np.median(centers_y))
+    half_h = median_h * (0.5 + _PAD_Y_TEXT_FRAC)
+    # CHIỀU NGANG: vẫn phủ theo câu dài (phân vị 10-90% mép trái/phải) — siết
+    # hẹp hơn thì câu dài nhất sẽ bị LÒI CHỮ ra 2 bên, tệ hơn là che hơi rộng.
+    # Bỏ đệm ngang thừa (_PAD_FRAC) cho sát 2 mép hơn một chút.
+    x0 = max(0.0, _percentile([b[0] for b in matched], 0.10))
+    x1 = min(1.0, _percentile([b[1] for b in matched], 0.90))
+    y0 = max(0.0, median_cy - half_h)
+    y1 = min(1.0, median_cy + half_h)
     return (x0, y0, x1 - x0, y1 - y0)
 
 
