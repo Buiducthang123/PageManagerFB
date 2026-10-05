@@ -24,8 +24,10 @@ import JobProgressBar from '../components/JobProgressBar'
 import EpisodeCard from '../components/EpisodeCard'
 import ConfirmDialog from '../components/ConfirmDialog'
 import SplitTimeline from '../components/SplitTimeline'
+import { NumberInput } from '../components/NumberInput'
 import OcrCropSelector, { type CropRegion } from '../components/OcrCropSelector'
 import ProjectSidebar from '../components/ProjectSidebar'
+import SegmentRail from '../components/SegmentRail'
 import { useLabels } from '../lib/labels'
 import LogViewer from '../components/LogViewer'
 import { useIsAdmin } from '../lib/license'
@@ -126,6 +128,8 @@ export default function ProjectDetail() {
   const [splitCount, setSplitCount] = useState(1)
   const [splitPoints, setSplitPoints] = useState<number[]>([])
   const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null)
+  // Gộp đoạn (dự án split): id các đoạn đã tích để nối thành 1 video.
+  const [selectedForMerge, setSelectedForMerge] = useState<string[]>([])
   // "Đang dừng..." phải hiện xuyên suốt tới khi job THẬT SỰ dừng (không chỉ
   // trong lúc request cancel đang gửi) — nếu không, nút quay lại "Dừng" ngay
   // sau khi request xong dù job vẫn chạy tiếp vài chục giây, trông như bấm
@@ -140,6 +144,32 @@ export default function ProjectDetail() {
   })
 
   const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: api.getSettings })
+
+  // Trạng thái job "gộp đoạn" (dự án split) — poll khi đang chạy; xong/lỗi thì
+  // nạp lại project để lấy kết quả (project.segments_merge).
+  const mergeStatusQuery = useQuery({
+    queryKey: ['segments-merge', projectId],
+    queryFn: () => api.segmentsMergeStatus(projectId),
+    enabled: Boolean(projectId) && Boolean(detailQuery.data?.project.split_mode),
+    refetchInterval: (q) => (q.state.data?.status === 'running' ? 1200 : false),
+  })
+  useEffect(() => {
+    const st = mergeStatusQuery.data?.status
+    if (st === 'done' || st === 'failed') queryClient.invalidateQueries({ queryKey: ['project', projectId] })
+  }, [mergeStatusQuery.data?.status, projectId, queryClient])
+
+  const mergeMutation = useMutation({
+    mutationFn: (ids: string[]) => api.mergeSegments(projectId, ids),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['segments-merge', projectId] }),
+  })
+  const cancelMergeMutation = useMutation({
+    mutationFn: () => api.cancelSegmentsMerge(projectId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['segments-merge', projectId] }),
+  })
+  const revealMergeMutation = useMutation({ mutationFn: () => api.revealSegmentsMerge(projectId) })
+  const revealSegmentMutation = useMutation({
+    mutationFn: (episodeId: string) => api.revealEpisodeExport(projectId, episodeId),
+  })
 
   // Nhớ giọng đọc/engine/audio_mode đã dùng lần trước cho dự án này — không
   // reset về mặc định mỗi lần vào lại trang (project.auto_voice/auto_engine/
@@ -390,19 +420,50 @@ export default function ProjectDetail() {
       </div>
 
       <div className="flex items-start gap-6">
-      {(isMulti || isSplit) && orderedEpisodes.length > 0 && (
+      {isMulti && orderedEpisodes.length > 0 && (
         <ProjectSidebar
           mode="episodes"
-          title={isMulti ? 'Các tập' : 'Các đoạn'}
+          title="Các tập"
           episodes={orderedEpisodes.map((e, i) => ({
             id: e.episode.episode_id,
-            label: e.episode.title || `${isMulti ? 'Tập' : 'Đoạn'} ${i + 1}`,
+            label: e.episode.title || `Tập ${i + 1}`,
             overallStatus: episodeOverallStatus(e),
           }))}
           selectedId={activeEpisodeId}
           onSelect={setSelectedEpisodeId}
         />
       )}
+      {isSplit && orderedEpisodes.length > 0 && (() => {
+        const exportedIds = orderedEpisodes.filter((e) => e.episode.export.status === 'done').map((e) => e.episode.episode_id)
+        return (
+          <SegmentRail
+            items={orderedEpisodes.map((e, i) => ({
+              id: e.episode.episode_id,
+              index: i,
+              title: e.episode.title,
+              stages: e.episode.stages,
+              exportStatus: e.episode.export.status,
+              durationSec: e.episode.duration_sec,
+            }))}
+            selectedId={activeEpisodeId}
+            onSelect={setSelectedEpisodeId}
+            selectedForMerge={selectedForMerge}
+            onToggleMerge={(id) =>
+              setSelectedForMerge((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+            }
+            onToggleAll={() =>
+              setSelectedForMerge((prev) => (exportedIds.every((id) => prev.includes(id)) ? [] : exportedIds))
+            }
+            mergeBusy={mergeMutation.isPending || mergeStatusQuery.data?.status === 'running'}
+            mergeStatus={mergeStatusQuery.data}
+            mergeResult={project.segments_merge}
+            onMerge={() => mergeMutation.mutate(selectedForMerge.filter((id) => exportedIds.includes(id)))}
+            onCancelMerge={() => cancelMergeMutation.mutate()}
+            onRevealMerge={() => revealMergeMutation.mutate()}
+            onRevealSegment={(id) => revealSegmentMutation.mutate(id)}
+          />
+        )
+      })()}
       <div className="min-w-0 flex-1 space-y-6">
 
       <section className="card flex flex-wrap items-center justify-between gap-3 p-4">
@@ -432,40 +493,40 @@ export default function ProjectDetail() {
         <section className="card space-y-4 p-5">
           <h2 className="text-lg">Các tập</h2>
 
-          <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
-            <label className="flex-1 text-sm text-neutral-300">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] items-start gap-x-4 gap-y-4 rounded-lg border border-neutral-800 p-4">
+            <label className="min-w-0 text-sm text-neutral-300">
               Cách nhận diện
-              <div className="mt-1 flex gap-4">
-                <label className="flex items-center gap-1.5">
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
                   {engineLabels.whisper}
                 </label>
                 {isAdmin && (
-                  <label className="flex items-center gap-1.5">
+                  <label className="flex items-center gap-1.5 whitespace-nowrap">
                     <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                     {engineLabels.sensevoice}
                   </label>
                 )}
-                <label className="flex items-center gap-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
                   {engineLabels.ocr}
                 </label>
               </div>
             </label>
-            <label className="flex-1 text-sm text-neutral-300">
+            <label className="min-w-0 text-sm text-neutral-300">
               Loại giọng đọc
-              <div className="mt-1 flex gap-4">
-                <label className="flex items-center gap-1.5">
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
                   {labels.tts.capcut}
                 </label>
-                <label className="flex items-center gap-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
                   {labels.tts.vieneu}
                 </label>
               </div>
             </label>
-            <label className="min-w-64 flex-1 text-sm text-neutral-300">
+            <label className="col-span-full min-w-0 text-sm text-neutral-300 lg:col-span-2">
               Giọng đọc mặc định (áp dụng khi tạo giọng đọc cho tập bất kỳ)
               <div className="mt-1 flex gap-2">
                 <select className={`${inputClass} mt-0 flex-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
@@ -552,55 +613,53 @@ export default function ProjectDetail() {
         <section className="card space-y-4 p-5">
           <h2 className="text-lg">Các đoạn (đã chia từ video gốc — chạy tuần tự, mỗi đoạn 1 draft riêng)</h2>
 
-          <div className="flex flex-wrap items-end gap-3 rounded-lg border border-neutral-800 p-3">
-            <label className="flex-1 text-sm text-neutral-300">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] items-start gap-x-4 gap-y-4 rounded-lg border border-neutral-800 p-4">
+            <label className="min-w-0 text-sm text-neutral-300">
               Cách nhận diện
-              <div className="mt-1 flex gap-4">
-                <label className="flex items-center gap-1.5">
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={engine === 'whisper'} onChange={() => setEngine('whisper')} />
                   {engineLabels.whisper}
                 </label>
                 {isAdmin && (
-                  <label className="flex items-center gap-1.5">
+                  <label className="flex items-center gap-1.5 whitespace-nowrap">
                     <input type="radio" checked={engine === 'sensevoice'} onChange={() => setEngine('sensevoice')} />
                     {engineLabels.sensevoice}
                   </label>
                 )}
-                <label className="flex items-center gap-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={engine === 'ocr'} onChange={() => setEngine('ocr')} />
                   {engineLabels.ocr}
                 </label>
               </div>
             </label>
-            <label className="flex-1 text-sm text-neutral-300">
+            <label className="min-w-0 text-sm text-neutral-300">
               Loại giọng đọc
-              <div className="mt-1 flex gap-4">
-                <label className="flex items-center gap-1.5">
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={ttsEngine === 'capcut'} onChange={() => changeTtsEngine('capcut')} />
                   {labels.tts.capcut}
                 </label>
-                <label className="flex items-center gap-1.5">
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
                   <input type="radio" checked={ttsEngine === 'vieneu'} onChange={() => changeTtsEngine('vieneu')} />
                   {labels.tts.vieneu}
                 </label>
               </div>
             </label>
-            <label className="min-w-64 flex-1 text-sm text-neutral-300">
+            <label className="min-w-0 text-sm text-neutral-300">
               Giọng đọc mặc định
-              <div className="mt-1 flex gap-2">
-                <select className={`${inputClass} mt-0 flex-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
-                  {voiceOptions.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <select className={`${inputClass} mt-1`} value={selectedVoice} onChange={(e) => setVoice(e.target.value)}>
+                {voiceOptions.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
             </label>
-            <label className="min-w-48 flex-1 text-sm text-neutral-300">
+            <label className="min-w-0 text-sm text-neutral-300">
               Âm thanh gốc
               <select
-                className={`${inputClass} mt-0`}
+                className={`${inputClass} mt-1`}
                 value={audioMode}
                 onChange={(e) => setAudioMode(e.target.value as AudioMode)}
               >
@@ -610,21 +669,21 @@ export default function ProjectDetail() {
               </select>
             </label>
             {audioMode === 'original' && (
-              <label className="min-w-48 flex-1 text-sm text-neutral-300">
+              <label className="min-w-0 text-sm text-neutral-300">
                 Âm lượng âm thanh gốc (dB)
-                <input
-                  type="number"
+                <NumberInput
                   step={1}
-                  className={`${inputClass} mt-0`}
+                  fallback={DEFAULT_ORIGINAL_AUDIO_VOLUME_DB}
+                  className={`${inputClass} mt-1`}
                   value={originalAudioVolumeDb}
-                  onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+                  onChange={setOriginalAudioVolumeDb}
                 />
               </label>
             )}
-            <label className="min-w-48 flex-1 text-sm text-neutral-300">
+            <label className="min-w-0 text-sm text-neutral-300">
               Video chậm tối đa
               <select
-                className={`${inputClass} mt-0`}
+                className={`${inputClass} mt-1`}
                 value={minVideoSpeed}
                 onChange={(e) => setMinVideoSpeed(Number(e.target.value))}
               >
@@ -798,13 +857,13 @@ export default function ProjectDetail() {
           </p>
           <label className="block text-sm text-neutral-300">
             Chia thành mấy đoạn
-            <input
-              type="number"
+            <NumberInput
               min={1}
               max={20}
+              fallback={1}
               className={`${inputClass} max-w-32`}
               value={splitCount}
-              onChange={(e) => setSplitCountAndReset(Math.min(20, Math.max(1, Number(e.target.value) || 1)), project.duration_sec ?? 0)}
+              onChange={(n) => setSplitCountAndReset(n, project.duration_sec ?? 0)}
             />
           </label>
           {splitCount > 1 && (
@@ -1140,13 +1199,13 @@ export default function ProjectDetail() {
               {audioMode === 'original' && (
                 <label className="mt-3 mb-3 block text-sm text-neutral-300">
                   Âm lượng âm thanh gốc (dB)
-                  <input
-                    type="number"
+                  <NumberInput
                     step={1}
+                    fallback={DEFAULT_ORIGINAL_AUDIO_VOLUME_DB}
                     className={`${inputClass} max-w-sm`}
                     value={originalAudioVolumeDb}
                     disabled={busyAny}
-                    onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+                    onChange={setOriginalAudioVolumeDb}
                   />
                 </label>
               )}

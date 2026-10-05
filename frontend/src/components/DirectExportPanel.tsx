@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, DEFAULT_ORIGINAL_AUDIO_VOLUME_DB, DEFAULT_SUBTITLE_FONT_SIZE, type AudioMode, type ProjectState } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import JobProgressBar from './JobProgressBar'
+import { NumberInput } from './NumberInput'
 import OcrCropSelector, { type CropRegion } from './OcrCropSelector'
 import BlurStrengthControl, { DEFAULT_BLUR_STRENGTH } from './BlurStrengthControl'
 
@@ -208,15 +209,15 @@ export default function DirectExportPanel({
           />
           <label className="mt-2 block text-xs text-neutral-400">
             Âm lượng nhạc nền (dB) — nhạc tự lặp lại hết video, nhỏ dần ở cuối
-            <input
-              type="number"
+            <NumberInput
               step={1}
               min={-60}
               max={12}
+              fallback={DEFAULT_MUSIC_VOLUME_DB}
               className={`${inputClass} mt-1 max-w-[8rem]`}
               value={musicVolumeDb}
               disabled={busyAny}
-              onChange={(e) => setMusicVolumeDb(Number(e.target.value))}
+              onChange={setMusicVolumeDb}
             />
           </label>
         </div>
@@ -252,26 +253,26 @@ export default function DirectExportPanel({
         {audioMode === 'original' && (
           <label className="mt-3 mb-3 block text-sm text-neutral-300">
             Âm lượng âm thanh gốc (dB)
-            <input
-              type="number"
+            <NumberInput
               step={1}
+              fallback={DEFAULT_ORIGINAL_AUDIO_VOLUME_DB}
               className={`${inputClass} max-w-sm`}
               value={originalAudioVolumeDb}
               disabled={busyAny}
-              onChange={(e) => setOriginalAudioVolumeDb(Number(e.target.value))}
+              onChange={setOriginalAudioVolumeDb}
             />
           </label>
         )}
         <label className="mt-3 mb-3 block text-sm text-neutral-300">
           Cỡ chữ phụ đề mới
-          <input
-            type="number"
+          <NumberInput
             step={1}
             min={1}
+            fallback={DEFAULT_SUBTITLE_FONT_SIZE}
             className={`${inputClass} max-w-sm`}
             value={subtitleFontSize}
             disabled={busyAny}
-            onChange={(e) => setSubtitleFontSize(Number(e.target.value))}
+            onChange={setSubtitleFontSize}
           />
         </label>
         <label className="block text-sm text-neutral-300">

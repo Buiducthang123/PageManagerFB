@@ -95,6 +95,10 @@ class ProjectState(BaseModel):
     # `current_stage()` sẽ coi mọi project đã xong CapCut nhưng chưa xuất
     # trực tiếp là "chưa xong" — sai, vì đây là lựa chọn không bắt buộc.
     export: StageRecord = Field(default_factory=StageRecord)
+    # "Gộp đoạn" — nối final.mp4 của các đoạn ĐÃ XUẤT (dự án split) thành 1 video
+    # duy nhất tại export/merged.mp4. Hành động PHỤ, nằm NGOÀI `stages` như
+    # `export`. `output` = đường dẫn merged.mp4, `progress` = danh sách đoạn đã gộp.
+    segments_merge: StageRecord = Field(default_factory=StageRecord)
     export_blur_region: Optional[list[float]] = None  # [x,y,w,h] phân số, lưu lại giữa các lần xuất
     # Danh sách [start_s, end_s] (giây, THEO TIMELINE VIDEO GỐC) mà phụ đề cứng
     # thật sự hiện trong `export_blur_region` — xem

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type SocialProjectSummary } from '../lib/api'
 import { inputClass, primaryButtonClass } from '../lib/ui'
+import { NumberInput } from '../components/NumberInput'
 import ConfirmDialog from '../components/ConfirmDialog'
 
 function relativeTime(iso: string): string {
@@ -72,13 +73,13 @@ export default function AutomatedPage() {
             value={douyinUrl}
             onChange={(e) => setDouyinUrl(e.target.value)}
           />
-          <input
-            type="number"
+          <NumberInput
             min={1}
             max={3}
+            fallback={1}
             className={`${inputClass} mt-0 w-24`}
             value={postsPerDay}
-            onChange={(e) => setPostsPerDay(Math.min(3, Math.max(1, Number(e.target.value) || 1)))}
+            onChange={setPostsPerDay}
             title="Số video đăng mỗi ngày (tối đa 3)"
           />
           <button

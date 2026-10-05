@@ -85,6 +85,8 @@ export interface ProjectState {
   // "Xuất video trực tiếp" (ffmpeg, không qua CapCut) — hành động PHỤ, tách
   // riêng khỏi `stages`/STAGE_ORDER (xem app/models.py::ProjectState.export).
   export: StageRecord
+  // "Gộp đoạn" — nối final.mp4 các đoạn đã xuất thành 1 video (export/merged.mp4).
+  segments_merge?: StageRecord
   export_blur_region: number[] | null
   tiktok_caption?: string
   tiktok_posts?: { account_id: string; username: string; caption: string; posted_at: string }[]
@@ -923,6 +925,17 @@ export const api = {
     postJson<{ status: string }>(`/api/projects/${id}/episodes/${episodeId}/export/reveal`),
   episodeExportVideoUrl: (id: string, episodeId: string) =>
     `/api/projects/${id}/assets/episodes/${episodeId}/export/final.mp4`,
+  // Audio TTS của 1 câu trong 1 đoạn (filename lấy từ tts_manifest[].path).
+  episodeCueAudioUrl: (id: string, episodeId: string, filename: string) =>
+    `/api/projects/${id}/assets/episodes/${episodeId}/audio/${filename}`,
+
+  // --- Gộp đoạn: nối final.mp4 các đoạn đã xuất thành 1 video (dự án split) ---
+  mergeSegments: (id: string, episodeIds: string[]) =>
+    postJson<{ status: string }>(`/api/projects/${id}/segments/merge`, { episode_ids: episodeIds }),
+  segmentsMergeStatus: (id: string) => request<JobStatus>(`/api/projects/${id}/segments/merge/status`),
+  cancelSegmentsMerge: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/segments/merge/cancel`),
+  revealSegmentsMerge: (id: string) => postJson<{ status: string }>(`/api/projects/${id}/segments/merge/reveal`),
+  segmentsMergeVideoUrl: (id: string) => `/api/projects/${id}/assets/export/merged.mp4`,
 
   // --- Ghép video (đứng riêng, không thuộc project nào) ---
   listMerges: () => request<MergeItem[]>('/api/merges'),

@@ -45,6 +45,7 @@ from .schemas import (
     JobItemResponse,
     JobStatusResponse,
     LogEntry,
+    MergeSegmentsRequest,
     ProjectDetailResponse,
     ProjectSummary,
     RenameProjectRequest,
@@ -1249,6 +1250,19 @@ def start_episode_translate_route(project_id: str, episode_id: str):
     return {"status": "started"}
 
 
+def _tts_total_failure_error(manifest: list[dict]) -> str | None:
+    """Thông báo lỗi khi TTS KHÔNG tạo được giọng đọc nào dù có câu cần đọc
+    (ok==0 nhưng có câu text khác rỗng) — dùng để đánh dấu stage 'failed' thay
+    vì 'done' im lặng (trước đây chạy VieNeu lỗi hết vẫn hiện "xong 0 câu",
+    rất khó hiểu). None = không phải lỗi toàn phần."""
+    has_text = any((m.get("text") or "").strip() for m in manifest)
+    any_ok = any(m.get("path") for m in manifest)
+    if has_text and not any_ok:
+        first_err = next((m.get("error") for m in manifest if m.get("error")), None)
+        return first_err or "Không tạo được giọng đọc nào — kiểm tra lại engine giọng đọc."
+    return None
+
+
 def _start_episode_tts(
     project_id: str, episode_id: str, voice: str, retry_only: bool = False, engine: str = "capcut"
 ) -> jobs.JobState | None:
@@ -1320,6 +1334,18 @@ def _start_episode_tts(
 
         ok = sum(1 for m in manifest if m.get("path"))
         failed = sum(1 for m in manifest if m.get("error"))
+        total_fail = _tts_total_failure_error(manifest)
+        if total_fail is not None:
+            job.items[0].status = "failed"
+            job.status = "failed"
+            job.error = total_fail
+            with pj.locked_project(project_id) as s:
+                ep = pj.find_episode(s, episode_id)
+                ep.stages["tts"].status = StageStatus.failed
+                ep.stages["tts"].error = total_fail
+                ep.stages["tts"].engine = engine
+            pj.append_log(project_id, "tts", f"[{episode_id}] Tạo giọng đọc thất bại: {total_fail}")
+            return
         job.items[0].status = "done"
         job.done_count = job.total
         job.status = "done"
@@ -1749,6 +1775,153 @@ def reveal_episode_export_route(project_id: str, episode_id: str):
     video_path = pj.episode_dir(project_id, episode_id) / "export" / "final.mp4"
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="Chưa xuất video hoặc file không tồn tại trên đĩa")
+    _reveal_in_explorer(video_path)
+    return {"status": "ok"}
+
+
+# ── Gộp đoạn: nối final.mp4 các đoạn ĐÃ XUẤT thành 1 video ──────────────────
+def _segments_merge_job_key(project_id: str) -> str:
+    return f"{project_id}:segmerge"
+
+
+def _collect_exported_segments(
+    state: ProjectState, episode_ids: list[str] | None
+) -> list[tuple[str, Path]]:
+    """Trả về [(nhãn đoạn, đường dẫn final.mp4)] theo ĐÚNG thứ tự đoạn (order),
+    chỉ gồm đoạn đã xuất xong và file còn trên đĩa. `episode_ids` lọc theo id
+    (giữ thứ tự đoạn, không theo thứ tự chọn); None = mọi đoạn đã xuất."""
+    id_filter = set(episode_ids) if episode_ids else None
+    out: list[tuple[str, Path]] = []
+    ordered = sorted(state.episodes, key=lambda e: e.order)
+    for i, ep in enumerate(ordered):
+        if id_filter is not None and ep.episode_id not in id_filter:
+            continue
+        p = pj.episode_dir(state.project_id, ep.episode_id) / "export" / "final.mp4"
+        if ep.export.status == StageStatus.done and p.exists():
+            out.append((ep.title or f"Đoạn {i + 1}", p))
+    return out
+
+
+def _start_segments_merge(project_id: str, episode_ids: list[str] | None) -> jobs.JobState | None:
+    state = pj.load_project(project_id)
+    if not state.split_mode:
+        return None
+    segments = _collect_exported_segments(state, episode_ids)
+    if len(segments) < 2:
+        return None
+    input_paths = [p for _, p in segments]
+    labels = [lbl for lbl, _ in segments]
+    output_path = pj.project_dir(project_id) / "export" / "merged.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def target(job: jobs.JobState) -> None:
+        job.items = [jobs.JobItem(id="merge", label=f"Gộp {len(input_paths)} đoạn")]
+        job.items[0].status = "running"
+        job.current_label = "Đang gộp đoạn..."
+        with pj.locked_project(project_id) as s:
+            s.segments_merge.status = StageStatus.running
+            s.segments_merge.error = None
+
+        try:
+            video_merge_stage.merge_videos(input_paths, output_path, job=job)
+        except jobs.JobCancelled:
+            job.status = "cancelled"
+            job.items[0].status = "failed"
+            job.items[0].error = "Đã dừng"
+            with pj.locked_project(project_id) as s:
+                s.segments_merge.status = StageStatus.failed
+                s.segments_merge.error = "Đã dừng theo yêu cầu người dùng"
+            return
+        except video_merge_stage.VideoMergeError as err:
+            job.items[0].status = "failed"
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.segments_merge.status = StageStatus.failed
+                s.segments_merge.error = str(err)
+            pj.append_log(project_id, "export", f"Gộp đoạn lỗi: {err}")
+            return
+        except Exception as err:
+            logger.exception("Gộp đoạn lỗi {}", project_id)
+            job.items[0].status = "failed"
+            job.items[0].error = str(err)
+            job.status = "failed"
+            job.error = str(err)
+            with pj.locked_project(project_id) as s:
+                s.segments_merge.status = StageStatus.failed
+                s.segments_merge.error = str(err)
+            pj.append_log(project_id, "export", f"Gộp đoạn lỗi: {err}")
+            return
+
+        job.items[0].status = "done"
+        job.done_count = 1
+        job.status = "done"
+        with pj.locked_project(project_id) as s:
+            s.segments_merge.status = StageStatus.done
+            s.segments_merge.output = str(output_path)
+            s.segments_merge.progress = f"{len(input_paths)} đoạn · " + " + ".join(labels)
+            s.segments_merge.error = None
+            s.segments_merge.at = datetime.now()
+        pj.append_log(project_id, "export", f"Gộp {len(input_paths)} đoạn → {output_path}")
+
+    return jobs.start_job(_segments_merge_job_key(project_id), 1, target)
+
+
+@app.post("/api/projects/{project_id}/segments/merge", status_code=202)
+def start_segments_merge_route(project_id: str, body: MergeSegmentsRequest | None = None):
+    state = pj.load_project(project_id)
+    if not state.split_mode:
+        raise HTTPException(status_code=409, detail="Gộp đoạn chỉ dùng cho dự án chia đoạn")
+    if jobs.is_job_running(_segments_merge_job_key(project_id)):
+        raise HTTPException(status_code=409, detail="Đang gộp đoạn — đợi xong hoặc bấm Dừng trước")
+    episode_ids = body.episode_ids if body else None
+    segments = _collect_exported_segments(state, episode_ids)
+    if len(segments) < 2:
+        raise HTTPException(status_code=409, detail="Cần ít nhất 2 đoạn đã xuất video để gộp")
+    job = _start_segments_merge(project_id, episode_ids)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Không gộp được — thiếu đoạn đã xuất")
+    return {"status": "started"}
+
+
+@app.get("/api/projects/{project_id}/segments/merge/status", response_model=JobStatusResponse)
+def segments_merge_status_route(project_id: str):
+    key = _segments_merge_job_key(project_id)
+    job = jobs.get_job(key)
+    if job is None:
+        state = pj.load_project(project_id)
+        orphaned = state.segments_merge.status == StageStatus.running
+        if orphaned:
+            with pj.locked_project(project_id) as s:
+                if s.segments_merge.status == StageStatus.running:
+                    s.segments_merge.status = StageStatus.failed
+                    s.segments_merge.error = "Phiên trước bị gián đoạn (server restart) — bấm gộp lại."
+        return JobStatusResponse(registered=False, orphaned=orphaned)
+    return JobStatusResponse(
+        registered=True,
+        status=job.status,
+        total=job.total,
+        done_count=job.done_count,
+        current_label=job.current_label,
+        items=[JobItemResponse(id=it.id, label=it.label, status=it.status, error=it.error) for it in job.items],
+        error=job.error,
+        started_at=job.started_at,
+    )
+
+
+@app.post("/api/projects/{project_id}/segments/merge/cancel")
+def cancel_segments_merge_route(project_id: str):
+    ok = jobs.request_cancel(_segments_merge_job_key(project_id))
+    if not ok:
+        raise HTTPException(status_code=409, detail="Không có job gộp đoạn nào đang chạy")
+    return {"status": "cancelling"}
+
+
+@app.post("/api/projects/{project_id}/segments/merge/reveal")
+def reveal_segments_merge_route(project_id: str):
+    video_path = pj.project_dir(project_id) / "export" / "merged.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Chưa gộp video hoặc file không tồn tại trên đĩa")
     _reveal_in_explorer(video_path)
     return {"status": "ok"}
 
@@ -2366,6 +2539,18 @@ def _start_tts(project_id: str, voice: str, retry_only: bool = False, engine: st
 
         ok = sum(1 for m in manifest if m.get("path"))
         failed = sum(1 for m in manifest if m.get("error"))
+        total_fail = _tts_total_failure_error(manifest)
+        if total_fail is not None:
+            job.items[0].status = "failed"
+            job.status = "failed"
+            job.error = total_fail
+            with pj.locked_project(project_id) as s:
+                s.stages["tts"].status = StageStatus.failed
+                s.stages["tts"].error = total_fail
+                s.stages["tts"].engine = engine
+            pj.append_log(project_id, "tts", f"Tạo giọng đọc thất bại: {total_fail}")
+            _maybe_fail_social(project_id, "tts", total_fail)
+            return
         job.items[0].status = "done"
         job.done_count = job.total
         job.status = "done"

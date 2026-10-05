@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type DownloadItem, type DownloadMode, type DownloadVideoInfo } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
+import { NumberInput } from '../components/NumberInput'
 import ConfirmDialog from '../components/ConfirmDialog'
 import JobProgressBar from '../components/JobProgressBar'
 
@@ -409,12 +410,12 @@ export default function DownloadPage() {
             </div>
             <label className="block max-w-48 text-sm text-neutral-300">
               Số lượng giới hạn (0 = không giới hạn)
-              <input
-                type="number"
+              <NumberInput
                 min={0}
+                fallback={0}
                 className={inputClass}
                 value={profileLimit}
-                onChange={(e) => setProfileLimit(Math.max(0, Number(e.target.value) || 0))}
+                onChange={setProfileLimit}
               />
             </label>
           </>
@@ -449,12 +450,12 @@ export default function DownloadPage() {
             </div>
             <label className="block max-w-48 text-sm text-neutral-300">
               Số lượng giới hạn (0 = toàn bộ, khuyến nghị ≤100)
-              <input
-                type="number"
+              <NumberInput
                 min={0}
+                fallback={0}
                 className={inputClass}
                 value={profileLimit}
-                onChange={(e) => setProfileLimit(Math.max(0, Number(e.target.value) || 0))}
+                onChange={setProfileLimit}
               />
             </label>
           </>
@@ -468,13 +469,13 @@ export default function DownloadPage() {
             </label>
             <label className="block max-w-48 text-sm text-neutral-300">
               Số lượng tối đa
-              <input
-                type="number"
+              <NumberInput
                 min={1}
                 max={100}
+                fallback={1}
                 className={inputClass}
                 value={searchMax}
-                onChange={(e) => setSearchMax(Math.min(100, Math.max(1, Number(e.target.value) || 1)))}
+                onChange={setSearchMax}
               />
             </label>
           </>

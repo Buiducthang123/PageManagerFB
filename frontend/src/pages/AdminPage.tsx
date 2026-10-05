@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type AdminConfig, type AdminUser, type AdminUserPatch } from '../lib/api'
 import { useLicense } from '../lib/license'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
+import { NumberInput } from '../components/NumberInput'
 
 export const FEATURES: { id: string; label: string }[] = [
   { id: 'projects', label: 'Dự án' },
@@ -79,12 +80,12 @@ export function TtlSelect({ value, onChange }: { value: number | null; onChange:
         <option value="custom">Tuỳ chỉnh (giờ)</option>
       </select>
       {preset === 'custom' && (
-        <input
+        <NumberInput
           className={`${inputClass} mt-0 w-24`}
-          type="number"
           min={1}
-          value={value ?? ''}
-          onChange={(e) => onChange(Math.max(1, Number(e.target.value) || 1))}
+          fallback={1}
+          value={value ?? 1}
+          onChange={onChange}
         />
       )}
     </div>
@@ -450,23 +451,23 @@ function ConfigPanel() {
           </label>
           <label className="block">
             Ân hạn offline (phút)
-            <input
+            <NumberInput
               className={inputClass}
-              type="number"
               min={0}
-              value={form.offline_grace_minutes ?? ''}
-              onChange={(e) => setForm({ ...form, offline_grace_minutes: Number(e.target.value) })}
+              fallback={0}
+              value={form.offline_grace_minutes ?? 0}
+              onChange={(n) => setForm({ ...form, offline_grace_minutes: n })}
             />
           </label>
           <label className="block">
             Heartbeat (giây)
-            <input
+            <NumberInput
               className={inputClass}
-              type="number"
               min={60}
               max={3600}
-              value={form.heartbeat_seconds ?? ''}
-              onChange={(e) => setForm({ ...form, heartbeat_seconds: Number(e.target.value) })}
+              fallback={60}
+              value={form.heartbeat_seconds ?? 60}
+              onChange={(n) => setForm({ ...form, heartbeat_seconds: n })}
             />
           </label>
         </div>

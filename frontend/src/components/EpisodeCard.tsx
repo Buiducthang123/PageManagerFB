@@ -4,6 +4,8 @@ import { api, type AudioMode, type EpisodeDetail, type EpisodeStageName, type Tr
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
 import StatusBadge from './StatusBadge'
 import JobProgressBar from './JobProgressBar'
+import HorizontalStepper from './HorizontalStepper'
+import MiniAudioPlayer from './MiniAudioPlayer'
 import { runDurationLabel } from './DirectExportPanel'
 import { useJobStatus } from '../hooks/useJobStatus'
 import { USER_STAGE_LABELS, useLabels } from '../lib/labels'
@@ -174,6 +176,10 @@ export default function EpisodeCard({
   const exportRec = episode.export
   const busyExport = exportRec.status === 'running' || exportJob.data?.status === 'running'
   const busyAny = busyIngest || busyWhisper || busyGemini || busyTTS || (standaloneAssemble && (busyAssemble || busyExport))
+  // Ghép từng câu phụ đề với audio TTS đã tạo (manifest keyed theo id cue) để
+  // hiện trình nghe ngay trong bảng — trước đây tạo giọng xong không thấy audio
+  // đâu vì FE không nối manifest → URL asset.
+  const manifestById = new Map((detail.tts_manifest ?? []).map((m) => [m.id, m]))
 
   return (
     <div className="card p-4">
@@ -187,20 +193,19 @@ export default function EpisodeCard({
           {episode.original_filename && <span className="text-xs text-neutral-500">({episode.original_filename})</span>}
         </button>
         <div className="flex flex-wrap items-center gap-1.5">
-          {(
-            [
-              'ingest',
-              'transcribe',
-              'translate',
-              'tts',
-              ...(standaloneAssemble ? (['assemble'] as EpisodeStageName[]) : []),
-            ] as EpisodeStageName[]
-          ).map((s) => (
-            <span key={s} className="flex items-center gap-1 text-[10px] text-neutral-500">
-              {(labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS)[s]}
-              <StatusBadge status={episode.stages[s].status} />
-            </span>
-          ))}
+          {/* Dự án split: rail + stepper (trong body) đã thể hiện đủ trạng thái
+              từng bước → không lặp lại dãy badge ở header cho đỡ rối. Chỉ hiện
+              badge tổng gọn. Dự án multi giữ dãy badge chi tiết như cũ. */}
+          {standaloneAssemble ? (
+            <StatusBadge status={exportRec.status === 'done' ? 'done' : episode.stages.tts.status} />
+          ) : (
+            (['ingest', 'transcribe', 'translate', 'tts'] as EpisodeStageName[]).map((s) => (
+              <span key={s} className="flex items-center gap-1 text-[10px] text-neutral-500">
+                {(labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS)[s]}
+                <StatusBadge status={episode.stages[s].status} />
+              </span>
+            ))
+          )}
           {movable && (
             <>
               <button
@@ -237,6 +242,17 @@ export default function EpisodeCard({
 
       {expanded && (
         <div className="mt-4 space-y-4 border-t border-neutral-800 pt-4">
+          {standaloneAssemble && (
+            <HorizontalStepper
+              steps={[
+                { id: 'ingest', label: (labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS).ingest, status: ingest.status },
+                { id: 'transcribe', label: (labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS).transcribe, status: transcribe.status },
+                { id: 'translate', label: (labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS).translate, status: translate.status },
+                { id: 'tts', label: (labels.isAdmin ? ADMIN_EPISODE_STAGE_LABELS : USER_STAGE_LABELS).tts, status: tts.status },
+                { id: 'export', label: 'Xuất', status: exportRec.status },
+              ]}
+            />
+          )}
           {detail.video_url && (
             <video className="max-h-56 w-full rounded-lg bg-black" src={detail.video_url} controls preload="metadata" />
           )}
@@ -303,7 +319,7 @@ export default function EpisodeCard({
               <JobProgressBar job={transcribeJob.data} />
               <button
                 type="button"
-                className={primaryButtonClass}
+                className={transcribe.status === 'done' ? secondaryButtonClass : primaryButtonClass}
                 disabled={busyAny || transcribeMutation.isPending}
                 onClick={() => transcribeMutation.mutate()}
               >
@@ -329,7 +345,7 @@ export default function EpisodeCard({
               <JobProgressBar job={translateJob.data} />
               <button
                 type="button"
-                className={primaryButtonClass}
+                className={translate.status === 'done' ? secondaryButtonClass : primaryButtonClass}
                 disabled={busyAny || translateMutation.isPending}
                 onClick={() => translateMutation.mutate()}
               >
@@ -353,7 +369,7 @@ export default function EpisodeCard({
           {translate.status === 'done' && (
             <div className="flex flex-wrap items-center gap-2">
               <JobProgressBar job={ttsJob.data} />
-              <button type="button" className={primaryButtonClass} disabled={busyAny || ttsMutation.isPending} onClick={() => ttsMutation.mutate()}>
+              <button type="button" className={tts.status === 'done' ? secondaryButtonClass : primaryButtonClass} disabled={busyAny || ttsMutation.isPending} onClick={() => ttsMutation.mutate()}>
                 {busyTTS ? 'Đang đọc...' : labels.isAdmin ? (tts.status === 'done' ? 'Chạy lại TTS' : 'Chạy TTS') : tts.status === 'done' ? 'Đọc lại' : 'Tạo giọng đọc'}
               </button>
               {tts.status === 'done' && tts.progress?.includes('lỗi') && (
@@ -381,7 +397,7 @@ export default function EpisodeCard({
               <JobProgressBar job={assembleJob.data} />
               <button
                 type="button"
-                className={primaryButtonClass}
+                className={secondaryButtonClass}
                 disabled={busyAny || assembleMutation.isPending}
                 onClick={() => assembleMutation.mutate()}
               >
@@ -413,7 +429,7 @@ export default function EpisodeCard({
                 <JobProgressBar job={exportJob.data} />
                 <button
                   type="button"
-                  className={primaryButtonClass}
+                  className={exportRec.status === 'done' ? secondaryButtonClass : primaryButtonClass}
                   disabled={busyAny || exportMutation.isPending}
                   onClick={() => exportMutation.mutate()}
                 >
@@ -455,6 +471,7 @@ export default function EpisodeCard({
                     <th>#</th>
                     <th>中文</th>
                     <th>Tiếng Việt</th>
+                    <th>Giọng đọc</th>
                     <th>Thao tác</th>
                   </tr>
                 </thead>
@@ -466,6 +483,8 @@ export default function EpisodeCard({
                       (ttsCueMutation.isPending && ttsCueMutation.variables === c.id) ||
                       (updateCueMutation.isPending && updateCueMutation.variables?.cueId === c.id)
                     const actionsDisabled = busyAny || rowBusy
+                    const entry = manifestById.get(c.id)
+                    const hasVi = Boolean((c.text_vi ?? '').trim())
                     return (
                       <tr key={c.id}>
                         <td className="mono text-xs text-neutral-500">{c.id}</td>
@@ -495,6 +514,32 @@ export default function EpisodeCard({
                             </div>
                           ) : (
                             (c.text_vi ?? '—')
+                          )}
+                        </td>
+                        <td>
+                          {entry?.path ? (
+                            <MiniAudioPlayer src={api.episodeCueAudioUrl(projectId, episodeId, entry.path)} />
+                          ) : entry?.error ? (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm text-danger"
+                              disabled={actionsDisabled}
+                              title={entry.error}
+                              onClick={() => ttsCueMutation.mutate(c.id)}
+                            >
+                              lỗi · tạo lại
+                            </button>
+                          ) : hasVi ? (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm text-danger"
+                              disabled={actionsDisabled}
+                              onClick={() => ttsCueMutation.mutate(c.id)}
+                            >
+                              chưa có · tạo
+                            </button>
+                          ) : (
+                            <span className="text-xs text-neutral-600">—</span>
                           )}
                         </td>
                         <td>

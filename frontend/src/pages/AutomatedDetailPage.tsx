@@ -10,6 +10,7 @@ import {
   type TTSEngine,
 } from '../lib/api'
 import { inputClass, primaryButtonClass, secondaryButtonClass } from '../lib/ui'
+import { NumberInput } from '../components/NumberInput'
 import JobProgressBar from '../components/JobProgressBar'
 import OcrCropSelector, { type CropRegion } from '../components/OcrCropSelector'
 import DouyinBrowserPanel from '../components/DouyinBrowserPanel'
@@ -487,12 +488,12 @@ export default function AutomatedDetailPage() {
           {!crawlAll && (
             <label className="flex items-center gap-1.5 text-sm text-neutral-300">
               số video mới nhất
-              <input
-                type="number"
+              <NumberInput
                 min={1}
+                fallback={1}
                 className={`${inputClass} mt-0 w-20`}
                 value={crawlLimit}
-                onChange={(e) => setCrawlLimit(Math.max(1, Number(e.target.value) || 1))}
+                onChange={setCrawlLimit}
               />
             </label>
           )}
@@ -861,23 +862,23 @@ export default function AutomatedDetailPage() {
           {audioMode === 'original' && (
             <label className="text-sm text-neutral-300">
               Âm lượng âm thanh gốc (dB)
-              <input
-                type="number"
+              <NumberInput
                 step={1}
+                fallback={-13}
                 className={`${inputClass} mt-1`}
                 value={originalVolumeDb}
-                onChange={(e) => setOriginalVolumeDb(Number(e.target.value))}
+                onChange={setOriginalVolumeDb}
               />
             </label>
           )}
           <label className="text-sm text-neutral-300">
             Âm lượng nhạc nền tự thêm (dB)
-            <input
-              type="number"
+            <NumberInput
               step={1}
+              fallback={-13}
               className={`${inputClass} mt-1`}
               value={musicVolumeDb}
-              onChange={(e) => setMusicVolumeDb(Number(e.target.value))}
+              onChange={setMusicVolumeDb}
             />
           </label>
           <BlurStrengthControl value={blurStrength} onChange={setBlurStrength} />
@@ -922,13 +923,13 @@ export default function AutomatedDetailPage() {
           </label>
           <label className="text-sm text-neutral-300">
             Cỡ chữ phụ đề mới
-            <input
-              type="number"
+            <NumberInput
               step={1}
               min={1}
+              fallback={6}
               className={`${inputClass} mt-1`}
               value={subtitleFontSize}
-              onChange={(e) => setSubtitleFontSize(Number(e.target.value))}
+              onChange={setSubtitleFontSize}
             />
           </label>
           <label className="text-sm text-neutral-300">

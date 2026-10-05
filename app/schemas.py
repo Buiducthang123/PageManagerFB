@@ -148,6 +148,12 @@ class StartExportRequest(BaseModel):
     music_volume_db: Optional[float] = Field(None, ge=-60, le=12)
 
 
+class MergeSegmentsRequest(BaseModel):
+    # id các đoạn cần gộp (theo thứ tự đoạn, không theo thứ tự chọn). None/rỗng
+    # = gộp TẤT CẢ các đoạn đã xuất xong.
+    episode_ids: Optional[list[str]] = None
+
+
 class UpdateExportBlurRegionRequest(BaseModel):
     region: Optional[list[float]] = None  # [x,y,w,h] phân số 0-1, None = bỏ khoanh vùng
 
