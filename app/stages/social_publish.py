@@ -396,6 +396,66 @@ def _set_video_file(page: Page, video_path: Path) -> None:
     # CÔNG — trang chuyển hẳn sang màn chỉnh sửa thật (thấy "Duration:
     # 0m32s", % tiến độ upload, ô Description/Hashtags/Cover). Đổi hẳn sang
     # cách này, không dùng input.files nữa.
+    if not _load_file_by_reference(page, video_path):
+        _load_file_by_chunks(page, video_path)
+    for attempt in range(3):
+        result = page.evaluate(_DROP_FILE_JS, [video_path.name, "video/mp4"])
+        if result.get("ok"):
+            logger.info("social_publish: đã kéo-thả file video vào khung upload (lần thử {})", attempt + 1)
+            return
+        logger.warning("social_publish: kéo-thả file lần {} không thành công ({}), thử lại", attempt + 1, result)
+        page.wait_for_timeout(2000)
+    raise SocialPublishError("Không kéo-thả được file video vào khung upload của TikTok sau 3 lần thử")
+
+
+# Ô chọn file RIÊNG của app (không phải input của TikTok — TikTok không đọc
+# input.files của nó). set_input_files gán file qua cơ chế chọn file thật của
+# trình duyệt → `File` chỉ THAM CHIẾU tới file trên đĩa, không nạp nội dung vào
+# RAM. Cách bơm base64 từng phần cũ dựng lại cả file trong bộ nhớ trang (~3x
+# dung lượng): video 1,13GB làm tab sập vì hết RAM (gặp thật 2026-10-08).
+_OWN_INPUT_ID = "__reup_file_input"
+_MAKE_OWN_INPUT_JS = f"""
+() => {{
+    let el = document.getElementById('{_OWN_INPUT_ID}');
+    if (!el) {{
+        el = document.createElement('input');
+        el.type = 'file';
+        el.id = '{_OWN_INPUT_ID}';
+        el.style.display = 'none';
+        document.body.appendChild(el);
+    }}
+    window.__reupFile = null;
+}}
+"""
+_TAKE_OWN_INPUT_FILE_JS = f"""
+() => {{
+    const el = document.getElementById('{_OWN_INPUT_ID}');
+    const f = el && el.files && el.files[0];
+    if (!f) return 0;
+    window.__reupFile = f;
+    return f.size;
+}}
+"""
+
+
+def _load_file_by_reference(page: Page, video_path: Path) -> bool:
+    try:
+        page.evaluate(_MAKE_OWN_INPUT_JS)
+        page.set_input_files(f"#{_OWN_INPUT_ID}", str(video_path))
+        size = page.evaluate(_TAKE_OWN_INPUT_FILE_JS)
+    except Exception as err:  # noqa: BLE001 — không được thì quay về cách bơm từng phần
+        logger.warning("social_publish: gán file qua ô chọn file riêng lỗi ({}) — dùng cách nạp từng phần", err)
+        return False
+    total = video_path.stat().st_size
+    if size != total:
+        logger.warning("social_publish: ô chọn file riêng nhận {} / {} byte — dùng cách nạp từng phần", size, total)
+        return False
+    logger.info("social_publish: đã gán file {} ({:.1f}MB) theo tham chiếu, không nạp vào RAM",
+                video_path.name, total / 1e6)
+    return True
+
+
+def _load_file_by_chunks(page: Page, video_path: Path) -> None:
     page.evaluate(_INIT_CHUNKS_JS)
     total = video_path.stat().st_size
     sent = 0
@@ -409,14 +469,6 @@ def _set_video_file(page: Page, video_path: Path) -> None:
     logger.info("social_publish: đã nạp file {} ({:.1f}MB) vào trang theo từng phần", video_path.name, total / 1e6)
     if sent != total:
         raise SocialPublishError(f"Nạp file vào trang thiếu dữ liệu ({sent}/{total} byte)")
-    for attempt in range(3):
-        result = page.evaluate(_DROP_FILE_JS, [video_path.name, "video/mp4"])
-        if result.get("ok"):
-            logger.info("social_publish: đã kéo-thả file video vào khung upload (lần thử {})", attempt + 1)
-            return
-        logger.warning("social_publish: kéo-thả file lần {} không thành công ({}), thử lại", attempt + 1, result)
-        page.wait_for_timeout(2000)
-    raise SocialPublishError("Không kéo-thả được file video vào khung upload của TikTok sau 3 lần thử")
 
 
 _CAPTION_SELECTORS = ['div[contenteditable="true"]', 'textarea[placeholder*="caption" i]', "textarea"]
