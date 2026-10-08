@@ -348,6 +348,11 @@ def _detect_blur_region_and_ranges(
     return region, ranges
 
 
+# project_id → Event của lượt dò sớm đang chạy (set khi xong, kể cả lỗi) — để
+# `_start_export` chờ thay vì dò lại song song.
+_early_blur_running: dict[str, threading.Event] = {}
+
+
 def _start_early_blur_detect(project_id: str) -> None:
     """Dò vùng che + thời điểm hiện chữ bằng OCR NGAY SAU KHI TẢI XONG video
     — chạy nền song song với transcribe/translate/tts (chỉ cần file video
@@ -382,7 +387,21 @@ def _start_early_blur_detect(project_id: str) -> None:
         except FileNotFoundError:
             pass
 
-    threading.Thread(target=run, daemon=True).start()
+    if project_id in _early_blur_running:
+        return  # đã có lượt dò sớm đang chạy cho project này
+    done = threading.Event()
+    _early_blur_running[project_id] = done
+
+    def run_tracked() -> None:
+        try:
+            run()
+        except Exception:  # noqa: BLE001 — lượt dò nền, lỗi chỉ log; export vẫn tự dò lại được
+            logger.exception("Dò vùng phụ đề sớm lỗi cho '{}'", project_id)
+        finally:
+            _early_blur_running.pop(project_id, None)
+            done.set()
+
+    threading.Thread(target=run_tracked, daemon=True).start()
 
 
 def _maybe_chain_episode(project_id: str, episode_id: str, finished_stage: str) -> None:
@@ -3148,13 +3167,27 @@ def _start_export(
             job.current_label = label
 
         blur_active_ranges_s: list[tuple[float, float]] | None = None
-        if state.export_blur_region:
-            blur_region = tuple(state.export_blur_region)
+        # Lượt dò SỚM còn đang chạy nền → CHỜ nó xong rồi dùng kết quả, không
+        # tự dò lại song song (2 lượt OCR cùng video tranh CPU, mỗi lượt chậm
+        # hẳn đi — đo thật: bước xuất dò lại ~20 phút dù lượt sớm xong ngay sau).
+        early = _early_blur_running.get(project_id)
+        if early is not None and not state.export_blur_region:
+            job.current_label = "Chờ dò vùng phụ đề cũ (đang chạy nền)..."
+            try:
+                while not early.wait(1.0):
+                    job.raise_if_cancelled()
+            except jobs.JobCancelled:
+                _mark_export_cancelled(project_id, job)
+                return
+        # Đọc lại: `state` nạp lúc bấm xuất, có thể chưa có kết quả lượt dò sớm vừa ghi.
+        blur_state = pj.load_project(project_id)
+        if blur_state.export_blur_region:
+            blur_region = tuple(blur_state.export_blur_region)
             # Có sẵn từ lượt dò SỚM (`_start_early_blur_detect`, chạy ngay
             # sau ingest) — tái dùng luôn, không dò lại. [] nghĩa là lượt dò
             # sớm không tìm được khoảng nào → che suốt video (None).
-            if state.export_blur_active_ranges:
-                blur_active_ranges_s = [tuple(r) for r in state.export_blur_active_ranges]
+            if blur_state.export_blur_active_ranges:
+                blur_active_ranges_s = [tuple(r) for r in blur_state.export_blur_active_ranges]
         else:
             # Mặc định tự động dò vùng phụ đề cũ bằng OCR khi chưa khoanh tay
             # — người dùng chốt: bật mặc định cho hầu hết video có phụ đề

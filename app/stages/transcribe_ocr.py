@@ -53,14 +53,39 @@ def _load_engine():
     # với baseline 736 không thấy mất nội dung câu nào — khác biệt chỉ là biến
     # thể phồn thể/giản thể vốn có sẵn của OCR (đã thấy hiện tượng này độc lập
     # với thay đổi này, giữa các khung giống hệt nhau ở config cũ).
-    _engine = RapidOCR(
-        params={
-            "EngineConfig.onnxruntime.intra_op_num_threads": 4,
-            "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-            "Det.limit_side_len": 224,
-        }
-    )
+    _engine = RapidOCR(params=_FAST_PARAMS)
     return _engine
+
+
+# Cấu hình nhanh cho ảnh ĐÃ CROP sát dải phụ đề (xem chú thích trong _load_engine).
+_FAST_PARAMS = {
+    "EngineConfig.onnxruntime.intra_op_num_threads": 4,
+    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+    "Det.limit_side_len": 224,
+}
+
+_visibility_engine = None
+_visibility_engine_lock = threading.Lock()
+
+
+def _load_visibility_engine():
+    """Engine cho `detect_subtitle_visibility` — cùng cấu hình nhanh với
+    `_engine` (ảnh vào cũng là dải phụ đề đã crop sát) nhưng là INSTANCE RIÊNG:
+    lượt dò sớm sau ingest chạy song song với transcribe, RapidOCR không an
+    toàn khi 2 thread gọi chung 1 engine.
+
+    Trước đây dùng `_region_engine` (limit_side_len 736, dành cho khung hình
+    đầy đủ): dải phụ đề dẹt (~600x90px) bị phóng cạnh ngắn lên 736 → ngang
+    ~5000px/khung. Đo thật video 12 phút: 920 → 95 ms/khung (19,8 → 2,5 phút
+    cả video); khoảng che gần như y hệt (544s vs 547s / 718s), soi từng đoạn
+    lệch thấy bản nhanh còn bắt thêm 2 câu phụ đề thật bản cũ bỏ sót."""
+    global _visibility_engine
+    if _visibility_engine is not None:
+        return _visibility_engine
+    from rapidocr import RapidOCR
+
+    _visibility_engine = RapidOCR(params=_FAST_PARAMS)
+    return _visibility_engine
 
 
 _region_engine = None
@@ -529,7 +554,7 @@ def detect_subtitle_visibility(
     if not video_path.exists():
         raise TranscribeOCRError(f"Không thấy video: {video_path}")
 
-    engine = _load_region_engine()
+    engine = _load_visibility_engine()
     fps = config.OCR_SAMPLE_FPS
     frame_dur = 1.0 / fps
     _MIN_CONFIDENCE = 0.7
@@ -550,7 +575,7 @@ def detect_subtitle_visibility(
             if img is None:
                 presence.append(False)
                 continue
-            with _region_engine_lock:
+            with _visibility_engine_lock:
                 result = engine(str(frame))
             has_text = False
             if result.txts:
